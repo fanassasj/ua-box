@@ -1,0 +1,6 @@
+logs/
+backups/
+*.log
+*.bak
+limit-shutdown.sh
+.DS_Store

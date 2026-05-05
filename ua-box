@@ -1,0 +1,3088 @@
+#!/usr/bin/env bash
+
+UA_BOX_VERSION="0.4.0"
+UA_BOX_NAME="UA Box"
+UA_BOX_HOME="${UA_BOX_HOME:-/root/ua-box}"
+UA_BOX_CONFIG="${UA_BOX_CONFIG:-$UA_BOX_HOME/config}"
+UA_BOX_LOG_DIR="${UA_BOX_LOG_DIR:-$UA_BOX_HOME/logs}"
+UA_BOX_LOG_FILE="${UA_BOX_LOG_FILE:-$UA_BOX_LOG_DIR/ua-box.log}"
+UA_BOX_BACKUP_DIR="${UA_BOX_BACKUP_DIR:-$UA_BOX_HOME/backups}"
+
+gl_hui='\e[37m'
+gl_hong='\033[31m'
+gl_lv='\033[32m'
+gl_huang='\033[33m'
+gl_lan='\033[34m'
+gl_bai='\033[0m'
+gl_zi='\033[35m'
+gl_kjlan='\033[96m'
+
+NEZHA_SCRIPT_CN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh"
+NEZHA_SCRIPT_EN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install_en.sh"
+WARP_MANAGER_SCRIPT="https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh"
+V2BX_SCRIPT="https://raw.githubusercontent.com/wyx2685/V2bX-script/master/install.sh"
+V2BX_MANAGER="https://raw.githubusercontent.com/wyx2685/V2bX-script/master/V2bX.sh"
+DOCKER_INSTALL_SCRIPT="https://get.docker.com"
+DOCKER_INSTALL_SCRIPTS="https://get.docker.com https://raw.githubusercontent.com/docker/docker-install/master/install.sh https://github.com/docker/docker-install/raw/master/install.sh https://linuxmirrors.cn/docker.sh"
+RCLONE_INSTALL_SCRIPT="https://rclone.org/install.sh"
+YABS_SCRIPT="https://raw.githubusercontent.com/masonr/yet-another-bench-script/master/yabs.sh"
+BENCH_SCRIPT="https://bench.sh"
+OPENAI_CHECK_SCRIPT="https://cdn.jsdelivr.net/gh/missuo/OpenAI-Checker/openai.sh"
+REGION_UNLOCK_SCRIPT="https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh"
+YEAHWU_UNLOCK_SCRIPT="https://github.com/yeahwu/check/raw/main/check.sh"
+MTR_TRACE_SCRIPT="https://raw.githubusercontent.com/zhucaidan/mtr_trace/main/mtr_trace.sh"
+IABC_SPEEDTEST_SCRIPT="https://raw.githubusercontent.com/i-abc/Speedtest/main/speedtest.sh"
+FUSION_TEST_SCRIPT="https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh"
+GB5_SCRIPT="https://raw.githubusercontent.com/i-abc/GB5/main/gb5-test.sh"
+REINSTALL_SCRIPT="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+LIMIT_SHUTDOWN_SCRIPT="/root/ua-box/limit-shutdown.sh"
+DEFAULT_WORKSPACE_PREFIX="work"
+DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
+UA_BOX_UPDATE_URL=""
+
+init_ua_box() {
+  mkdir -p "$UA_BOX_HOME" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR"
+  if [ ! -f "$UA_BOX_CONFIG" ]; then
+    cat > "$UA_BOX_CONFIG" <<EOF
+# UA Box 配置文件
+# 修改后重新运行 ua 生效。
+
+DEFAULT_WORKSPACE_PREFIX="work"
+DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
+UA_BOX_UPDATE_URL=""
+
+NEZHA_SCRIPT_CN="$NEZHA_SCRIPT_CN"
+NEZHA_SCRIPT_EN="$NEZHA_SCRIPT_EN"
+WARP_MANAGER_SCRIPT="$WARP_MANAGER_SCRIPT"
+V2BX_SCRIPT="$V2BX_SCRIPT"
+V2BX_MANAGER="$V2BX_MANAGER"
+DOCKER_INSTALL_SCRIPT="$DOCKER_INSTALL_SCRIPT"
+DOCKER_INSTALL_SCRIPTS="$DOCKER_INSTALL_SCRIPTS"
+RCLONE_INSTALL_SCRIPT="$RCLONE_INSTALL_SCRIPT"
+YABS_SCRIPT="$YABS_SCRIPT"
+BENCH_SCRIPT="$BENCH_SCRIPT"
+OPENAI_CHECK_SCRIPT="$OPENAI_CHECK_SCRIPT"
+REGION_UNLOCK_SCRIPT="$REGION_UNLOCK_SCRIPT"
+YEAHWU_UNLOCK_SCRIPT="$YEAHWU_UNLOCK_SCRIPT"
+MTR_TRACE_SCRIPT="$MTR_TRACE_SCRIPT"
+IABC_SPEEDTEST_SCRIPT="$IABC_SPEEDTEST_SCRIPT"
+FUSION_TEST_SCRIPT="$FUSION_TEST_SCRIPT"
+GB5_SCRIPT="$GB5_SCRIPT"
+REINSTALL_SCRIPT="$REINSTALL_SCRIPT"
+LIMIT_SHUTDOWN_SCRIPT="$LIMIT_SHUTDOWN_SCRIPT"
+EOF
+  fi
+
+  # shellcheck disable=SC1090
+  . "$UA_BOX_CONFIG"
+}
+
+log_action() {
+  local message="$*"
+  mkdir -p "$UA_BOX_LOG_DIR"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$message" >> "$UA_BOX_LOG_FILE"
+}
+
+confirm_danger() {
+  local message="$1"
+  local target="$2"
+
+  echo -e "${gl_hong}危险操作:${gl_bai} $message"
+  echo "影响范围: 可能修改系统配置、服务状态、数据或网络访问策略。"
+  [ -n "$target" ] && echo "对象/命令: $target"
+  read -r -p "请输入 yes/y 确认继续，输入 n 取消: " answer
+  case "$answer" in
+    yes|y|Y) return 0 ;;
+    n|N|no|No|NO|"") echo "已取消。"; return 1 ;;
+    *) echo "输入未确认，已取消。"; return 1 ;;
+  esac
+}
+
+backup_self() {
+  local src
+  local dst
+
+  src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  dst="$UA_BOX_BACKUP_DIR/ua-box-$(date '+%Y%m%d-%H%M%S').bak"
+  cp "$src" "$dst"
+  log_action "backup_self $dst"
+  echo "已备份到: $dst"
+}
+
+update_self() {
+  local src
+  local tmp
+
+  if [ -z "$UA_BOX_UPDATE_URL" ]; then
+    echo "未配置 UA_BOX_UPDATE_URL。"
+    echo "可运行 ua config，在配置文件里设置你的脚本更新地址后再执行 ua update。"
+    return 1
+  fi
+
+  src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  tmp="/tmp/ua-box-update.$$"
+  backup_self || return 1
+  download_to "$UA_BOX_UPDATE_URL" "$tmp" || return 1
+  bash -n "$tmp" || {
+    echo "下载的新脚本语法校验失败，已取消更新。"
+    rm -f "$tmp"
+    return 1
+  }
+  cp "$tmp" "$src"
+  chmod +x "$src"
+  rm -f "$tmp"
+  log_action "update_self from $UA_BOX_UPDATE_URL"
+  echo "UA Box 已更新。"
+}
+
+init_ua_box
+
+pause() {
+  echo ""
+  echo -e "${gl_lv}操作完成${gl_bai}"
+  read -n 1 -s -r -p "按任意键继续..." || return 0
+  echo ""
+}
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${gl_hong}错误:${gl_bai} 此操作需要 root 权限。"
+    echo "请使用 root 用户或 sudo 运行。"
+    return 1
+  fi
+}
+
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+pkg_manager() {
+  if has_cmd apt; then
+    echo "apt"
+  elif has_cmd dnf; then
+    echo "dnf"
+  elif has_cmd yum; then
+    echo "yum"
+  elif has_cmd apk; then
+    echo "apk"
+  elif has_cmd pacman; then
+    echo "pacman"
+  elif has_cmd zypper; then
+    echo "zypper"
+  elif has_cmd opkg; then
+    echo "opkg"
+  else
+    echo ""
+  fi
+}
+
+install_pkg() {
+  if [ "$#" -eq 0 ]; then
+    echo "未提供软件包参数。"
+    return 1
+  fi
+
+  need_root || return 1
+  log_action "install_pkg $*"
+
+  local pm orphans
+  pm="$(pkg_manager)"
+  if [ -z "$pm" ]; then
+    echo -e "${gl_hong}未知包管理器，无法安装。${gl_bai}"
+    return 1
+  fi
+
+  case "$pm" in
+    apt)
+      apt update -y
+      apt install -y "$@"
+      ;;
+    dnf)
+      dnf install -y "$@"
+      ;;
+    yum)
+      yum install -y epel-release
+      yum install -y "$@"
+      ;;
+    apk)
+      apk update
+      apk add "$@"
+      ;;
+    pacman)
+      pacman -Syu --noconfirm
+      pacman -S --noconfirm "$@"
+      ;;
+    zypper)
+      zypper refresh
+      zypper install -y "$@"
+      ;;
+    opkg)
+      opkg update
+      opkg install "$@"
+      ;;
+  esac
+}
+
+remove_pkg() {
+  if [ "$#" -eq 0 ]; then
+    echo "未提供软件包参数。"
+    return 1
+  fi
+
+  need_root || return 1
+  log_action "remove_pkg $*"
+
+  local pm orphans
+  pm="$(pkg_manager)"
+  case "$pm" in
+    apt) apt purge -y "$@" ;;
+    dnf) dnf remove -y "$@" ;;
+    yum) yum remove -y "$@" ;;
+    apk) apk del "$@" ;;
+    pacman) pacman -Rns --noconfirm "$@" ;;
+    zypper) zypper remove -y "$@" ;;
+    opkg) opkg remove "$@" ;;
+    *) echo -e "${gl_hong}未知包管理器，无法卸载。${gl_bai}"; return 1 ;;
+  esac
+}
+
+svc() {
+  local action="$1"
+  local name="$2"
+
+  if [ -z "$name" ]; then
+    echo "未提供服务名。"
+    return 1
+  fi
+
+  if has_cmd systemctl; then
+    systemctl "$action" "$name"
+  elif has_cmd service; then
+    service "$name" "$action"
+  else
+    echo "当前系统未找到 systemctl/service。"
+    return 1
+  fi
+}
+
+svc_status_short() {
+  local name="$1"
+
+  if has_cmd systemctl; then
+    if systemctl is-active --quiet "$name" 2>/dev/null; then
+      echo -e "${gl_lv}运行中${gl_bai}"
+    elif systemctl status "$name" >/dev/null 2>&1; then
+      echo -e "${gl_huang}未运行${gl_bai}"
+    else
+      echo -e "${gl_hui}未安装${gl_bai}"
+    fi
+  elif has_cmd service; then
+    if service "$name" status >/dev/null 2>&1; then
+      echo -e "${gl_lv}运行中${gl_bai}"
+    else
+      echo -e "${gl_huang}未知/未运行${gl_bai}"
+    fi
+  else
+    echo -e "${gl_hui}无法检测${gl_bai}"
+  fi
+}
+
+download_to() {
+  local url="$1"
+  local output="$2"
+
+  log_action "download $url -> $output"
+
+  if has_cmd curl; then
+    curl -fsSL "$url" -o "$output"
+  elif has_cmd wget; then
+    wget -qO "$output" "$url"
+  else
+    echo "未找到 curl/wget，先安装基础下载工具。"
+    install_pkg curl wget || return 1
+    curl -fsSL "$url" -o "$output"
+  fi
+}
+
+download_first_to() {
+  local output="$1"
+  shift
+
+  local url
+  for url in "$@"; do
+    [ -z "$url" ] && continue
+    echo "尝试下载: $url"
+    if download_to "$url" "$output"; then
+      echo "$url" > "${output}.source"
+      return 0
+    fi
+    echo "下载失败，切换备用源。"
+  done
+
+  echo "所有下载源都不可用。"
+  return 1
+}
+
+country_code() {
+  if has_cmd curl; then
+    curl -fsS --max-time 3 https://ipinfo.io/country 2>/dev/null
+  elif has_cmd wget; then
+    wget -qO- --timeout=3 https://ipinfo.io/country 2>/dev/null
+  fi
+}
+
+human_uptime() {
+  awk -F. '{
+    d=int($1/86400);
+    h=int(($1%86400)/3600);
+    m=int(($1%3600)/60);
+    if (d>0) printf "%d天 ", d;
+    if (h>0) printf "%d时 ", h;
+    printf "%d分\n", m
+  }' /proc/uptime 2>/dev/null
+}
+
+public_ip() {
+  if has_cmd curl; then
+    curl -fsS --max-time 3 https://ipinfo.io/ip 2>/dev/null
+  elif has_cmd wget; then
+    wget -qO- --timeout=3 https://ipinfo.io/ip 2>/dev/null
+  fi
+}
+
+local_ip() {
+  ip route get 8.8.8.8 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
+}
+
+net_total() {
+  awk '
+    $1 ~ /^[a-zA-Z0-9_.:-]+:$/ && $1 !~ /^lo:/ {
+      rx += $2;
+      tx += $10
+    }
+    END {
+      printf "%.2fG / %.2fG", rx/1024/1024/1024, tx/1024/1024/1024
+    }
+  ' /proc/net/dev 2>/dev/null
+}
+
+cpu_usage() {
+  awk '/^cpu / {u=$2+$4; t=$2+$4+$5; print u, t}' /proc/stat | {
+    read -r u1 t1
+    sleep 1
+    awk '/^cpu / {u=$2+$4; t=$2+$4+$5; print u, t}' /proc/stat | {
+      read -r u2 t2
+      awk -v u1="$u1" -v t1="$t1" -v u2="$u2" -v t2="$t2" 'BEGIN {
+        if (t2 == t1) print "0";
+        else printf "%.0f", (u2-u1)*100/(t2-t1)
+      }'
+    }
+  }
+}
+
+system_info() {
+  clear
+  local hostname os kernel arch cpu_model cores cpu_freq cpu_percent load mem swap disk uptime dns ipv4 wan_ip tcp_cc qdisc net_io now
+
+  hostname="$(hostname 2>/dev/null)"
+  os="$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+  kernel="$(uname -r)"
+  arch="$(uname -m)"
+  cpu_model="$(awk -F': ' '/model name|Hardware/ {print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+  cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null)"
+  cpu_freq="$(awk -F': ' '/cpu MHz/ {printf "%.1f GHz", $2/1000; exit}' /proc/cpuinfo 2>/dev/null)"
+  cpu_percent="$(cpu_usage)"
+  load="$(awk '{print $1" "$2" "$3}' /proc/loadavg 2>/dev/null)"
+  mem="$(free -m | awk '/^Mem:/ {printf "%dM/%dM (%d%%)", $3, $2, $3*100/$2}')"
+  swap="$(free -m | awk '/^Swap:/ {if ($2==0) printf "0M/0M (0%%)"; else printf "%dM/%dM (%d%%)", $3, $2, $3*100/$2}')"
+  disk="$(df -h / | awk 'NR==2 {print $3"/"$2" ("$5")"}')"
+  uptime="$(human_uptime)"
+  dns="$(awk '/^nameserver/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)"
+  ipv4="$(local_ip)"
+  wan_ip="$(public_ip)"
+  tcp_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  net_io="$(net_total)"
+  now="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+  echo -e "${gl_kjlan}系统信息显示${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}主机名:       ${gl_bai}${hostname:-未知}"
+  echo -e "${gl_kjlan}系统版本:     ${gl_bai}${os:-未知}"
+  echo -e "${gl_kjlan}Linux版本:    ${gl_bai}${kernel}"
+  echo -e "${gl_kjlan}CPU架构:      ${gl_bai}${arch}"
+  echo -e "${gl_kjlan}CPU型号:      ${gl_bai}${cpu_model:-未知}"
+  echo -e "${gl_kjlan}CPU核心数:    ${gl_bai}${cores:-未知}"
+  echo -e "${gl_kjlan}CPU频率:      ${gl_bai}${cpu_freq:-未知}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}CPU占用:      ${gl_bai}${cpu_percent}%"
+  echo -e "${gl_kjlan}系统负载:     ${gl_bai}${load:-未知}"
+  echo -e "${gl_kjlan}物理内存:     ${gl_bai}${mem:-未知}"
+  echo -e "${gl_kjlan}虚拟内存:     ${gl_bai}${swap:-未知}"
+  echo -e "${gl_kjlan}硬盘占用:     ${gl_bai}${disk:-未知}"
+  echo -e "${gl_kjlan}总收/发:      ${gl_bai}${net_io:-未知}"
+  echo -e "${gl_kjlan}网络算法:     ${gl_bai}${tcp_cc:-未知} ${qdisc:-未知}"
+  echo -e "${gl_kjlan}内网IPv4:     ${gl_bai}${ipv4:-未知}"
+  echo -e "${gl_kjlan}公网IP:       ${gl_bai}${wan_ip:-未知}"
+  echo -e "${gl_kjlan}DNS地址:      ${gl_bai}${dns:-未知}"
+  echo -e "${gl_kjlan}系统时间:     ${gl_bai}${now}"
+  echo -e "${gl_kjlan}运行时长:     ${gl_bai}${uptime:-未知}"
+  pause
+}
+
+common_tools_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}常用工具安装${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}curl 下载工具                 ${gl_kjlan}2.   ${gl_bai}wget 下载工具"
+    echo -e "${gl_kjlan}3.   ${gl_bai}unzip 解压工具                ${gl_kjlan}4.   ${gl_bai}socat 通信工具"
+    echo -e "${gl_kjlan}5.   ${gl_bai}htop 监控工具                 ${gl_kjlan}6.   ${gl_bai}btop 现代监控"
+    echo -e "${gl_kjlan}7.   ${gl_bai}iftop 流量监控                ${gl_kjlan}8.   ${gl_bai}sudo 权限工具"
+    echo -e "${gl_kjlan}9.   ${gl_bai}tar 打包工具                  ${gl_kjlan}10.  ${gl_bai}tmux 后台会话"
+    echo -e "${gl_kjlan}11.  ${gl_bai}vim 编辑器                    ${gl_kjlan}12.  ${gl_bai}nano 编辑器"
+    echo -e "${gl_kjlan}13.  ${gl_bai}git 版本控制                  ${gl_kjlan}14.  ${gl_bai}jq JSON工具"
+    echo -e "${gl_kjlan}15.  ${gl_bai}ncdu 磁盘分析                 ${gl_kjlan}16.  ${gl_bai}fzf 搜索工具"
+    echo -e "${gl_kjlan}17.  ${gl_bai}lsof 端口/文件查看            ${gl_kjlan}18.  ${gl_bai}net-tools 网络工具"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}31.  ${gl_bai}安装全部工具"
+    echo -e "${gl_kjlan}41.  ${gl_bai}安装指定工具"
+    echo -e "${gl_kjlan}42.  ${gl_bai}卸载指定工具"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) install_pkg curl; pause ;;
+      2) install_pkg wget; pause ;;
+      3) install_pkg unzip; pause ;;
+      4) install_pkg socat; pause ;;
+      5) install_pkg htop; pause ;;
+      6) install_pkg btop; pause ;;
+      7) install_pkg iftop; pause ;;
+      8) install_pkg sudo; pause ;;
+      9) install_pkg tar; pause ;;
+      10) install_pkg tmux; pause ;;
+      11) install_pkg vim; pause ;;
+      12) install_pkg nano; pause ;;
+      13) install_pkg git; pause ;;
+      14) install_pkg jq; pause ;;
+      15) install_pkg ncdu; pause ;;
+      16) install_pkg fzf; pause ;;
+      17) install_pkg lsof; pause ;;
+      18) install_pkg net-tools; pause ;;
+      31) install_pkg curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lsof net-tools ca-certificates; pause ;;
+      41)
+        read -r -e -p "请输入要安装的工具名，多个用空格分隔: " names
+        # shellcheck disable=SC2086
+        install_pkg $names
+        pause
+        ;;
+      42)
+        read -r -e -p "请输入要卸载的工具名，多个用空格分隔: " names
+        # shellcheck disable=SC2086
+        remove_pkg $names
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+docker_container_exists() {
+  local name="$1"
+  has_cmd docker && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"
+}
+
+docker_container_running() {
+  local name="$1"
+  has_cmd docker && docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"
+}
+
+docker_container_status() {
+  local name="$1"
+  if ! has_cmd docker; then
+    echo -e "${gl_hui}未安装 Docker${gl_bai}"
+    return
+  fi
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"; then
+    echo -e "${gl_lv}运行中${gl_bai}"
+  elif docker_container_exists "$name"; then
+    echo -e "${gl_huang}已停止${gl_bai}"
+  else
+    echo -e "${gl_hui}未安装${gl_bai}"
+  fi
+}
+
+docker_daemon_status() {
+  if ! has_cmd docker; then
+    echo -e "${gl_hui}未安装${gl_bai}"
+  elif docker info >/dev/null 2>&1; then
+    echo -e "${gl_lv}运行中${gl_bai}"
+  elif has_cmd systemctl && systemctl status docker >/dev/null 2>&1; then
+    svc_status_short docker
+  else
+    echo -e "${gl_huang}未运行/不可检测${gl_bai}"
+  fi
+}
+
+run_nezha_script() {
+  local url="$1"
+  local target="/tmp/nezha.sh"
+
+  need_root || return 1
+  download_to "$url" "$target" || return 1
+  chmod +x "$target"
+  "$target"
+}
+
+nezha_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}哪吒探针管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "Dashboard: $(docker_container_status nezha-dashboard)"
+    echo -e "Agent:     $(svc_status_short nezha-agent)"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}运行官方中文管理脚本"
+    echo -e "${gl_kjlan}2.   ${gl_bai}运行官方英文管理脚本"
+    echo -e "${gl_kjlan}3.   ${gl_bai}查看 Agent 状态"
+    echo -e "${gl_kjlan}4.   ${gl_bai}启动 Agent"
+    echo -e "${gl_kjlan}5.   ${gl_bai}重启 Agent"
+    echo -e "${gl_kjlan}6.   ${gl_bai}停止 Agent"
+    echo -e "${gl_kjlan}7.   ${gl_bai}查看 Dashboard 容器日志"
+    echo -e "${gl_kjlan}8.   ${gl_bai}重启 Dashboard 容器"
+    echo -e "${gl_kjlan}9.   ${gl_bai}停止 Dashboard 容器"
+    echo -e "${gl_kjlan}10.  ${gl_bai}删除 Dashboard 容器"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) run_nezha_script "$NEZHA_SCRIPT_CN"; pause ;;
+      2) run_nezha_script "$NEZHA_SCRIPT_EN"; pause ;;
+      3) svc status nezha-agent; pause ;;
+      4) need_root && svc start nezha-agent; pause ;;
+      5) need_root && svc restart nezha-agent; pause ;;
+      6) need_root && svc stop nezha-agent; pause ;;
+      7)
+        if has_cmd docker && docker_container_exists nezha-dashboard; then
+          docker logs --tail 120 nezha-dashboard
+        else
+          echo "未找到 nezha-dashboard 容器。"
+        fi
+        pause
+        ;;
+      8)
+        need_root || { pause; continue; }
+        if has_cmd docker && docker_container_exists nezha-dashboard; then
+          docker restart nezha-dashboard
+        else
+          echo "未找到 nezha-dashboard 容器。"
+        fi
+        pause
+        ;;
+      9)
+        need_root || { pause; continue; }
+        if has_cmd docker && docker_container_exists nezha-dashboard; then
+          docker stop nezha-dashboard
+        else
+          echo "未找到 nezha-dashboard 容器。"
+        fi
+        pause
+        ;;
+      10)
+        need_root || { pause; continue; }
+        if confirm_danger "删除 nezha-dashboard 容器" "docker rm -f nezha-dashboard"; then
+          log_action "delete nezha-dashboard container"
+          docker rm -f nezha-dashboard
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+install_v2bx_manager() {
+  need_root || return 1
+  download_to "$V2BX_MANAGER" /usr/bin/V2bX || return 1
+  chmod +x /usr/bin/V2bX
+  echo "V2bX 管理脚本已安装到 /usr/bin/V2bX"
+}
+
+install_v2bx() {
+  need_root || return 1
+  local target="/tmp/V2bX-install.sh"
+  download_to "$V2BX_SCRIPT" "$target" || return 1
+  bash "$target"
+}
+
+v2bx_status_line() {
+  if [ -x /usr/local/V2bX/V2bX ]; then
+    echo -n "服务: "
+    svc_status_short V2bX
+    echo -n "版本: "
+    /usr/local/V2bX/V2bX version 2>/dev/null || echo "未知"
+  else
+    echo -e "服务: ${gl_hui}未安装${gl_bai}"
+  fi
+}
+
+v2bx_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}V2bX 安装管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    v2bx_status_line
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}一键安装/更新 V2bX"
+    echo -e "${gl_kjlan}2.   ${gl_bai}安装/更新 V2bX 管理脚本"
+    echo -e "${gl_kjlan}3.   ${gl_bai}打开 V2bX 官方管理菜单"
+    echo -e "${gl_kjlan}4.   ${gl_bai}编辑配置 /etc/V2bX/config.json"
+    echo -e "${gl_kjlan}5.   ${gl_bai}查看服务状态"
+    echo -e "${gl_kjlan}6.   ${gl_bai}启动服务"
+    echo -e "${gl_kjlan}7.   ${gl_bai}重启服务"
+    echo -e "${gl_kjlan}8.   ${gl_bai}停止服务"
+    echo -e "${gl_kjlan}9.   ${gl_bai}查看实时日志"
+    echo -e "${gl_kjlan}10.  ${gl_bai}设置开机自启"
+    echo -e "${gl_kjlan}11.  ${gl_bai}取消开机自启"
+    echo -e "${gl_kjlan}12.  ${gl_bai}卸载 V2bX"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) install_v2bx; pause ;;
+      2) install_v2bx_manager; pause ;;
+      3)
+        if has_cmd V2bX; then
+          V2bX
+        else
+          echo "未找到 V2bX 管理脚本，先选择 2 安装。"
+        fi
+        pause
+        ;;
+      4)
+        need_root || { pause; continue; }
+        if [ -f /etc/V2bX/config.json ]; then
+          "${EDITOR:-vi}" /etc/V2bX/config.json
+        else
+          echo "未找到 /etc/V2bX/config.json。"
+        fi
+        pause
+        ;;
+      5) svc status V2bX; pause ;;
+      6) need_root && svc start V2bX; pause ;;
+      7) need_root && svc restart V2bX; pause ;;
+      8) need_root && svc stop V2bX; pause ;;
+      9)
+        if has_cmd journalctl; then
+          journalctl -u V2bX.service -e --no-pager -f
+        else
+          echo "当前系统未找到 journalctl。"
+        fi
+        pause
+        ;;
+      10) need_root && svc enable V2bX; pause ;;
+      11) need_root && svc disable V2bX; pause ;;
+      12)
+        need_root || { pause; continue; }
+        if confirm_danger "卸载 V2bX，并删除 /etc/V2bX 和 /usr/local/V2bX" "rm -rf /etc/V2bX /usr/local/V2bX"; then
+          log_action "uninstall V2bX"
+          svc stop V2bX >/dev/null 2>&1 || true
+          svc disable V2bX >/dev/null 2>&1 || true
+          rm -f /etc/systemd/system/V2bX.service /usr/bin/V2bX
+          rm -rf /etc/V2bX /usr/local/V2bX
+          has_cmd systemctl && systemctl daemon-reload
+          echo "V2bX 已卸载。"
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+run_warp_manager() {
+  need_root || return 1
+
+  local target="/root/ua-box/warp-menu.sh"
+  download_to "$WARP_MANAGER_SCRIPT" "$target" || return 1
+  chmod +x "$target"
+  log_action "run WARP manager"
+  bash "$target"
+}
+
+warp_status() {
+  echo -e "${gl_kjlan}WARP 状态${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  if has_cmd warp; then
+    echo "warp 快捷命令: 已安装"
+  else
+    echo "warp 快捷命令: 未安装"
+  fi
+  if has_cmd warp-cli; then
+    warp-cli --accept-tos status 2>/dev/null || true
+    warp-cli --accept-tos registration show 2>/dev/null || true
+  else
+    echo "warp-cli: 未安装"
+  fi
+  if has_cmd wg; then
+    wg show 2>/dev/null || true
+  fi
+  ip addr show CloudflareWARP 2>/dev/null || true
+  ip addr show warp 2>/dev/null || true
+}
+
+warp_tools_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}WARP 管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    warp_status
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}运行 fscarmen WARP 管理菜单"
+    echo -e "${gl_kjlan}2.   ${gl_bai}查看 WARP 状态"
+    echo -e "${gl_kjlan}3.   ${gl_bai}执行 warp 快捷命令"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) run_warp_manager; pause ;;
+      2) warp_status; pause ;;
+      3)
+        if has_cmd warp; then
+          read -r -e -p "请输入 warp 参数，回车打开菜单: " args
+          # shellcheck disable=SC2086
+          warp $args
+        else
+          echo "未找到 warp 快捷命令，先选择 1 安装/管理。"
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+caddy_status() {
+  echo -e "${gl_kjlan}Caddy 状态${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  if has_cmd caddy; then
+    caddy version 2>/dev/null || true
+    echo -n "服务状态: "
+    svc_status_short caddy
+  else
+    echo "Caddy: 未安装"
+  fi
+  [ -f /etc/caddy/Caddyfile ] && echo "配置文件: /etc/caddy/Caddyfile"
+}
+
+caddy_add_reverse_proxy() {
+  need_root || return 1
+
+  local domain upstream
+  read -r -e -p "请输入域名，如 example.com: " domain
+  read -r -e -p "请输入反代目标，如 http://127.0.0.1:3000: " upstream
+  if [ -z "$domain" ] || [ -z "$upstream" ]; then
+    echo "域名和反代目标不能为空。"
+    return 1
+  fi
+
+  mkdir -p /etc/caddy
+  touch /etc/caddy/Caddyfile
+  cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+  cat >> /etc/caddy/Caddyfile <<EOF
+
+$domain {
+    reverse_proxy $upstream
+}
+EOF
+  log_action "add caddy reverse proxy $domain -> $upstream"
+  if has_cmd caddy; then
+    caddy fmt --overwrite /etc/caddy/Caddyfile 2>/dev/null || true
+    caddy validate --config /etc/caddy/Caddyfile || return 1
+    svc reload caddy 2>/dev/null || svc restart caddy 2>/dev/null || true
+  fi
+  echo "已追加 Caddy 反代配置。"
+}
+
+caddy_tools_menu() {
+  while true; do
+    clear
+    caddy_status
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装/更新 Caddy"
+    echo -e "${gl_kjlan}2.   ${gl_bai}编辑 Caddyfile"
+    echo -e "${gl_kjlan}3.   ${gl_bai}新增反代站点"
+    echo -e "${gl_kjlan}4.   ${gl_bai}验证并重载配置"
+    echo -e "${gl_kjlan}5.   ${gl_bai}查看最近日志"
+    echo -e "${gl_kjlan}6.   ${gl_bai}启动 Caddy"
+    echo -e "${gl_kjlan}7.   ${gl_bai}重启 Caddy"
+    echo -e "${gl_kjlan}8.   ${gl_bai}停止 Caddy"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) install_pkg caddy; pause ;;
+      2) need_root && mkdir -p /etc/caddy && "${EDITOR:-nano}" /etc/caddy/Caddyfile; pause ;;
+      3) caddy_add_reverse_proxy; pause ;;
+      4)
+        if has_cmd caddy; then
+          caddy validate --config /etc/caddy/Caddyfile && (svc reload caddy 2>/dev/null || svc restart caddy)
+        else
+          echo "未安装 Caddy。"
+        fi
+        pause
+        ;;
+      5)
+        if has_cmd journalctl; then
+          journalctl -u caddy --no-pager -n 120
+        else
+          echo "当前系统未找到 journalctl。"
+        fi
+        pause
+        ;;
+      6) need_root && svc start caddy; pause ;;
+      7) need_root && svc restart caddy; pause ;;
+      8) need_root && svc stop caddy; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+npm_container_name() {
+  if docker_container_exists npm; then
+    echo "npm"
+  elif docker_container_exists nginx-proxy-manager; then
+    echo "nginx-proxy-manager"
+  else
+    echo "npm"
+  fi
+}
+
+panel_status_overview() {
+  local npm_name npm_status it_status caddy_line warp_line nezha_status npm_url it_url nezha_url
+
+  npm_name="$(npm_container_name)"
+  if has_cmd warp || has_cmd warp-cli || ip addr show CloudflareWARP >/dev/null 2>&1 || ip addr show warp >/dev/null 2>&1; then
+    warp_line="${gl_lv}已安装${gl_bai}"
+  else
+    warp_line="${gl_hui}未安装${gl_bai}"
+  fi
+
+  if has_cmd caddy; then
+    caddy_line="$(svc_status_short caddy)"
+  else
+    caddy_line="${gl_hui}未安装${gl_bai}"
+  fi
+
+  if has_cmd docker && docker_container_exists "$npm_name"; then
+    if docker_container_running "$npm_name"; then
+      npm_status="${gl_lv}运行中${gl_bai}"
+    else
+      npm_status="${gl_huang}已停止${gl_bai}"
+    fi
+    npm_url="http://服务器IP:81"
+  else
+    npm_status="${gl_hui}未安装${gl_bai}"
+    npm_url="-"
+  fi
+
+  if has_cmd docker && docker_container_exists it-tools; then
+    if docker_container_running it-tools; then
+      it_status="${gl_lv}运行中${gl_bai}"
+    else
+      it_status="${gl_huang}已停止${gl_bai}"
+    fi
+    it_url="$(docker port it-tools 80/tcp 2>/dev/null | head -n 1 | awk -F: '{print "http://服务器IP:"$NF}')"
+    [ -z "$it_url" ] && it_url="-"
+  else
+    it_status="${gl_hui}未安装${gl_bai}"
+    it_url="-"
+  fi
+
+  if has_cmd docker && docker_container_exists nezha-dashboard; then
+    if docker_container_running nezha-dashboard; then
+      nezha_status="${gl_lv}Dashboard 运行中${gl_bai}"
+    else
+      nezha_status="${gl_huang}Dashboard 已停止${gl_bai}"
+    fi
+    nezha_url="$(docker port nezha-dashboard 2>/dev/null | awk -F: 'NR==1 {print "http://服务器IP:"$NF}')"
+    [ -z "$nezha_url" ] && nezha_url="-"
+  else
+    nezha_status="$(svc_status_short nezha-agent)"
+    nezha_url="-"
+  fi
+
+  echo -e "${gl_kjlan}工具状态总览${gl_bai}"
+  printf "%-24s %-18b %-28s\n" "WARP" "$warp_line" "-"
+  printf "%-24s %-18b %-28s\n" "Caddy" "$caddy_line" "/etc/caddy/Caddyfile"
+  printf "%-24s %-18b %-28s\n" "Nginx Proxy Manager" "$npm_status" "$npm_url"
+  printf "%-24s %-18b %-28s\n" "it-tools" "$it_status" "$it_url"
+  printf "%-24s %-18b %-28s\n" "哪吒探针" "$nezha_status" "$nezha_url"
+  echo "NPM 识别到容器名: $npm_name"
+}
+
+npm_install() {
+  need_root || return 1
+  docker_require || install_docker || return 1
+
+  local name
+  name="$(npm_container_name)"
+  if docker_container_exists "$name"; then
+    docker start "$name"
+    echo "Nginx Proxy Manager 容器已存在并已启动: $name"
+    return 0
+  fi
+
+  mkdir -p /root/nginx-proxy-manager/data /root/nginx-proxy-manager/letsencrypt
+  log_action "install Nginx Proxy Manager"
+  docker run -d \
+    --name "$name" \
+    --restart unless-stopped \
+    -p 80:80 -p 81:81 -p 443:443 \
+    -v /root/nginx-proxy-manager/data:/data \
+    -v /root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt \
+    jc21/nginx-proxy-manager:latest
+  echo "Nginx Proxy Manager 已部署。访问: http://服务器IP:81"
+}
+
+npm_tools_menu() {
+  while true; do
+    clear
+    local name
+    name="$(npm_container_name)"
+    echo -e "${gl_kjlan}Nginx Proxy Manager${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo "识别到容器名: $name"
+    if has_cmd docker && docker_container_exists "$name"; then
+      docker ps -a --filter "name=^/${name}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    else
+      echo "容器: 未安装"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 NPM 面板"
+    echo -e "${gl_kjlan}2.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}3.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}4.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}5.   ${gl_bai}删除容器和数据"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) npm_install; pause ;;
+      2) docker_require && docker logs --tail 120 "$name"; pause ;;
+      3) docker_require && docker restart "$name"; pause ;;
+      4) docker_require && docker stop "$name"; pause ;;
+      5)
+        if confirm_danger "删除 Nginx Proxy Manager 容器和 /root/nginx-proxy-manager 数据" "$name"; then
+          docker rm -f "$name" 2>/dev/null || true
+          rm -rf /root/nginx-proxy-manager
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+it_tools_install() {
+  need_root || return 1
+  docker_require || install_docker || return 1
+
+  if docker_container_exists it-tools; then
+    docker start it-tools
+    echo "it-tools 容器已存在并已启动。"
+    return 0
+  fi
+
+  read -r -e -p "请输入 Web 端口，回车默认 8080: " port
+  port="${port:-8080}"
+  if ! printf '%s\n' "$port" | grep -Eq '^[0-9]+$'; then
+    echo "端口必须是数字。"
+    return 1
+  fi
+
+  log_action "install it-tools port=$port"
+  docker run -d \
+    --name it-tools \
+    --restart unless-stopped \
+    -p "$port":80 \
+    corentinth/it-tools:latest
+  echo "it-tools 已部署。访问: http://服务器IP:$port"
+}
+
+it_tools_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}it-tools 工具箱${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    if has_cmd docker && docker_container_exists it-tools; then
+      docker ps -a --filter "name=^/it-tools$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    else
+      echo "容器: 未安装"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 it-tools"
+    echo -e "${gl_kjlan}2.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}3.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}4.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}5.   ${gl_bai}删除容器"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) it_tools_install; pause ;;
+      2) docker_require && docker logs --tail 120 it-tools; pause ;;
+      3) docker_require && docker restart it-tools; pause ;;
+      4) docker_require && docker stop it-tools; pause ;;
+      5)
+        if confirm_danger "删除 it-tools 容器" "it-tools"; then
+          docker rm -f it-tools
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+panel_tools_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}面板工具${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    panel_status_overview
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}WARP 管理"
+    echo -e "${gl_kjlan}2.   ${gl_bai}Caddy 反代管理"
+    echo -e "${gl_kjlan}3.   ${gl_bai}Nginx Proxy Manager 可视化面板"
+    echo -e "${gl_kjlan}4.   ${gl_bai}it-tools 工具箱"
+    echo -e "${gl_kjlan}5.   ${gl_bai}哪吒探针管理"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) warp_tools_menu ;;
+      2) caddy_tools_menu ;;
+      3) npm_tools_menu ;;
+      4) it_tools_menu ;;
+      5) nezha_menu ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+install_docker() {
+  need_root || return 1
+
+  if has_cmd docker; then
+    echo "Docker 已安装。"
+    docker --version
+    return 0
+  fi
+
+  local target="/tmp/get-docker.sh"
+  local sources source args country
+
+  sources="${DOCKER_INSTALL_SCRIPTS:-$DOCKER_INSTALL_SCRIPT}"
+  # shellcheck disable=SC2086
+  download_first_to "$target" $sources || return 1
+  chmod +x "$target"
+  source="$(cat "${target}.source" 2>/dev/null)"
+  country="$(country_code)"
+
+  args=""
+  case "$source" in
+    *get.docker.com*|*docker/docker-install*)
+      [ "$country" = "CN" ] && args="--mirror Aliyun"
+      ;;
+  esac
+
+  log_action "install Docker from $source $args"
+  # shellcheck disable=SC2086
+  sh "$target" $args
+
+  if has_cmd systemctl; then
+    systemctl enable --now docker >/dev/null 2>&1 || true
+  fi
+
+  if command -v apt >/dev/null 2>&1; then
+    apt update >/dev/null 2>&1 && apt install -y docker-compose-plugin >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y docker-compose-plugin >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y docker-compose-plugin >/dev/null 2>&1 || true
+  fi
+
+  if has_cmd docker; then
+    echo "Docker 安装完成。"
+    docker --version
+    docker compose version 2>/dev/null || true
+  else
+    echo "Docker 安装后仍未检测到 docker 命令，请查看上方安装输出。"
+    return 1
+  fi
+}
+
+docker_require() {
+  if ! has_cmd docker; then
+    echo "未找到 Docker，请先安装 Docker。"
+    return 1
+  fi
+}
+
+docker_compose_run() {
+  local action="$1"
+  local compose_dir="$2"
+
+  if [ -z "$compose_dir" ]; then
+    compose_dir="."
+  fi
+
+  if [ ! -d "$compose_dir" ]; then
+    echo "目录不存在: $compose_dir"
+    return 1
+  fi
+
+  if docker compose version >/dev/null 2>&1; then
+    (cd "$compose_dir" && docker compose "$action" -d)
+  elif has_cmd docker-compose; then
+    (cd "$compose_dir" && docker-compose "$action" -d)
+  else
+    echo "未找到 docker compose 插件或 docker-compose。"
+    return 1
+  fi
+}
+
+docker_global_status() {
+  docker_require || return 1
+
+  local container_count image_count network_count volume_count
+  container_count="$(docker ps -a -q 2>/dev/null | wc -l)"
+  image_count="$(docker images -q 2>/dev/null | wc -l)"
+  network_count="$(docker network ls -q 2>/dev/null | wc -l)"
+  volume_count="$(docker volume ls -q 2>/dev/null | wc -l)"
+
+  echo "Docker 版本"
+  docker --version
+  docker compose version 2>/dev/null || true
+  echo ""
+  echo -e "Docker 镜像: ${gl_lv}${image_count}${gl_bai}"
+  docker image ls
+  echo ""
+  echo -e "Docker 容器: ${gl_lv}${container_count}${gl_bai}"
+  docker ps -a
+  echo ""
+  echo -e "Docker 卷: ${gl_lv}${volume_count}${gl_bai}"
+  docker volume ls
+  echo ""
+  echo -e "Docker 网络: ${gl_lv}${network_count}${gl_bai}"
+  docker network ls
+}
+
+docker_network_menu() {
+  while true; do
+    clear
+    docker_require || { pause; return; }
+    echo -e "${gl_kjlan}Docker 网络管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    docker network ls
+    echo ""
+    echo "运行容器网络信息"
+    printf "%-28s %-22s %-16s\n" "容器名称" "网络名称" "IP地址"
+    for cid in $(docker ps -q); do
+      docker inspect --format '{{.Name}}{{range $network, $config := .NetworkSettings.Networks}} {{$network}} {{$config.IPAddress}}{{end}}' "$cid" |
+        awk '{for (i=2; i<=NF; i+=2) printf "%-28s %-22s %-16s\n", substr($1,2), $i, $(i+1)}'
+    done
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}创建网络"
+    echo -e "${gl_kjlan}2.   ${gl_bai}容器加入网络"
+    echo -e "${gl_kjlan}3.   ${gl_bai}容器退出网络"
+    echo -e "${gl_kjlan}4.   ${gl_bai}删除网络"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1)
+        read -r -e -p "请输入新网络名: " network
+        [ -n "$network" ] && docker network create "$network"
+        pause
+        ;;
+      2)
+        read -r -e -p "请输入网络名: " network
+        read -r -e -p "请输入容器名，多个用空格分隔: " names
+        for name in $names; do docker network connect "$network" "$name"; done
+        pause
+        ;;
+      3)
+        read -r -e -p "请输入网络名: " network
+        read -r -e -p "请输入容器名，多个用空格分隔: " names
+        for name in $names; do docker network disconnect "$network" "$name"; done
+        pause
+        ;;
+      4)
+        read -r -e -p "请输入网络名: " network
+        [ -n "$network" ] && docker network rm "$network"
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+docker_volume_menu() {
+  while true; do
+    clear
+    docker_require || { pause; return; }
+    echo -e "${gl_kjlan}Docker 卷管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    docker volume ls
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}创建卷"
+    echo -e "${gl_kjlan}2.   ${gl_bai}删除指定卷"
+    echo -e "${gl_kjlan}3.   ${gl_bai}清理未使用卷"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1)
+        read -r -e -p "请输入新卷名: " volume
+        [ -n "$volume" ] && docker volume create "$volume"
+        pause
+        ;;
+      2)
+        read -r -e -p "请输入卷名，多个用空格分隔: " volumes
+        for volume in $volumes; do docker volume rm "$volume"; done
+        pause
+        ;;
+      3)
+        if confirm_danger "清理所有未使用 Docker 卷" "docker volume prune -f"; then
+          log_action "docker volume prune"
+          docker volume prune -f
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+docker_edit_daemon() {
+  need_root || return 1
+  mkdir -p /etc/docker
+  "${EDITOR:-nano}" /etc/docker/daemon.json
+  if has_cmd systemctl; then
+    systemctl restart docker
+  else
+    svc restart docker
+  fi
+}
+
+docker_uninstall() {
+  need_root || return 1
+  if confirm_danger "卸载 Docker，并清理容器、镜像、网络和卷" "docker rm/rmi/prune + remove docker packages"; then
+    log_action "uninstall Docker"
+    docker ps -a -q 2>/dev/null | xargs -r docker rm -f
+    docker images -q 2>/dev/null | xargs -r docker rmi -f
+    docker network prune -f 2>/dev/null || true
+    docker volume prune -f 2>/dev/null || true
+    remove_pkg docker docker.io docker-compose docker-ce docker-ce-cli containerd.io
+  fi
+}
+
+docker_container_list() {
+  docker ps -a --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}'
+}
+
+docker_container_network_overview() {
+  echo "容器网络"
+  echo "------------------------------------------------------------"
+  printf "%-25s %-25s %-20s\n" "容器名称" "网络名称" "IP地址"
+
+  local cid
+  for cid in $(docker ps -a -q); do
+    docker inspect --format '{{.Name}}{{range $network, $config := .NetworkSettings.Networks}} {{$network}} {{$config.IPAddress}}{{end}}' "$cid" |
+      awk '{
+        name=substr($1,2);
+        if (NF < 3) {
+          printf "%-25s %-25s %-20s\n", name, "-", "-";
+        } else {
+          for (i=2; i<=NF; i+=2) printf "%-25s %-25s %-20s\n", name, $i, $(i+1);
+        }
+      }'
+  done
+}
+
+docker_container_action() {
+  local action="$1"
+  local names="$2"
+
+  if [ -z "$names" ]; then
+    echo "未输入容器名/ID。"
+    return 1
+  fi
+
+  log_action "docker $action $names"
+  # shellcheck disable=SC2086
+  docker "$action" $names
+}
+
+docker_container_all_action() {
+  local action="$1"
+  local ids
+
+  case "$action" in
+    start|rm) ids="$(docker ps -a -q)" ;;
+    stop|restart) ids="$(docker ps -q)" ;;
+    *) return 1 ;;
+  esac
+
+  if [ -z "$ids" ]; then
+    echo "没有可操作的容器。"
+    return 0
+  fi
+
+  log_action "docker $action all containers"
+  if [ "$action" = "rm" ]; then
+    # shellcheck disable=SC2086
+    docker rm -f $ids
+  else
+    # shellcheck disable=SC2086
+    docker "$action" $ids
+  fi
+}
+
+docker_container_shell() {
+  local name="$1"
+
+  if [ -z "$name" ]; then
+    echo "未输入容器名/ID。"
+    return 1
+  fi
+
+  docker exec -it "$name" sh -lc 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'
+}
+
+docker_container_logs() {
+  local name="$1"
+  local tail_lines follow
+
+  if [ -z "$name" ]; then
+    echo "未输入容器名/ID。"
+    return 1
+  fi
+
+  read -r -e -p "显示最近多少行，回车默认 200: " tail_lines
+  read -r -e -p "是否持续跟随日志？输入 y 开启: " follow
+
+  if [ "$follow" = "y" ] || [ "$follow" = "Y" ]; then
+    docker logs -f --tail "${tail_lines:-200}" "$name"
+  else
+    docker logs --tail "${tail_lines:-200}" "$name"
+  fi
+}
+
+docker_container_create() {
+  local cmd
+
+  echo "示例: docker run -d --name nginx -p 8080:80 nginx"
+  read -r -e -p "请输入 docker run 命令或 docker run 后面的参数: " cmd
+  [ -z "$cmd" ] && return 1
+
+  log_action "create container: $cmd"
+  case "$cmd" in
+    docker\ run*) sh -c "$cmd" ;;
+    *) sh -c "docker run $cmd" ;;
+  esac
+}
+
+docker_container_stats_once() {
+  if [ -z "$(docker ps -q)" ]; then
+    echo "没有正在运行的容器。"
+    return 0
+  fi
+
+  docker stats --no-stream
+}
+
+docker_container_port_access() {
+  local mode="$1"
+  local proto port source_ip
+
+  need_root || return 1
+  if ! has_cmd iptables; then
+    echo "未找到 iptables，无法管理 Docker 容器端口访问规则。"
+    return 1
+  fi
+
+  echo "该功能通过 DOCKER-USER 链放行/阻断容器端口流量，不会为未发布的端口创建 Docker 映射。"
+  read -r -e -p "请输入容器端口: " port
+  read -r -e -p "请输入协议，回车默认 tcp: " proto
+  read -r -e -p "限制来源 IP/CIDR，回车表示所有来源: " source_ip
+  proto="${proto:-tcp}"
+
+  if [ -z "$port" ]; then
+    echo "未输入端口。"
+    return 1
+  fi
+
+  iptables -N DOCKER-USER 2>/dev/null || true
+
+  if [ "$mode" = "close" ]; then
+    if [ -n "$source_ip" ]; then
+      iptables -C DOCKER-USER -s "$source_ip" -p "$proto" --dport "$port" -j DROP 2>/dev/null ||
+        iptables -I DOCKER-USER 1 -s "$source_ip" -p "$proto" --dport "$port" -j DROP
+    else
+      iptables -C DOCKER-USER -p "$proto" --dport "$port" -j DROP 2>/dev/null ||
+        iptables -I DOCKER-USER 1 -p "$proto" --dport "$port" -j DROP
+    fi
+    log_action "close Docker container port $proto/$port ${source_ip:-all}"
+    echo "已关闭容器端口访问: $proto/$port ${source_ip:-所有来源}"
+  else
+    if [ -n "$source_ip" ]; then
+      while iptables -C DOCKER-USER -s "$source_ip" -p "$proto" --dport "$port" -j DROP 2>/dev/null; do
+        iptables -D DOCKER-USER -s "$source_ip" -p "$proto" --dport "$port" -j DROP
+      done
+    else
+      while iptables -C DOCKER-USER -p "$proto" --dport "$port" -j DROP 2>/dev/null; do
+        iptables -D DOCKER-USER -p "$proto" --dport "$port" -j DROP
+      done
+    fi
+    log_action "open Docker container port $proto/$port ${source_ip:-all}"
+    echo "已放行容器端口访问: $proto/$port ${source_ip:-所有来源}"
+  fi
+}
+
+docker_container_menu() {
+  while true; do
+    clear
+    docker_require || { pause; return; }
+    echo -e "${gl_kjlan}Docker容器列表${gl_bai}"
+    docker_container_list
+    echo ""
+    echo -e "${gl_kjlan}容器操作${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}创建新的容器"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}2.   ${gl_bai}启动指定容器             ${gl_kjlan}6.   ${gl_bai}启动所有容器"
+    echo -e "${gl_kjlan}3.   ${gl_bai}停止指定容器             ${gl_kjlan}7.   ${gl_bai}停止所有容器"
+    echo -e "${gl_kjlan}4.   ${gl_bai}删除指定容器             ${gl_kjlan}8.   ${gl_bai}删除所有容器"
+    echo -e "${gl_kjlan}5.   ${gl_bai}重启指定容器             ${gl_kjlan}9.   ${gl_bai}重启所有容器"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}11.  ${gl_bai}进入指定容器           ${gl_kjlan}12.  ${gl_bai}查看容器日志"
+    echo -e "${gl_kjlan}13.  ${gl_bai}查看容器网络           ${gl_kjlan}14.  ${gl_bai}查看容器占用"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}15.  ${gl_bai}开启容器端口访问       ${gl_kjlan}16.  ${gl_bai}关闭容器端口访问"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级选单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1) docker_container_create; pause ;;
+      2) read -r -e -p "请输入容器名/ID，多个用空格分隔: " names; docker_container_action start "$names"; pause ;;
+      3) read -r -e -p "请输入容器名/ID，多个用空格分隔: " names; docker_container_action stop "$names"; pause ;;
+      4)
+        read -r -e -p "请输入容器名/ID，多个用空格分隔: " names
+        if [ -z "$names" ]; then
+          echo "未输入容器名/ID。"
+        elif confirm_danger "删除指定 Docker 容器" "$names"; then
+          docker_container_action rm "-f $names"
+        fi
+        pause
+        ;;
+      5) read -r -e -p "请输入容器名/ID，多个用空格分隔: " names; docker_container_action restart "$names"; pause ;;
+      6) docker_container_all_action start; pause ;;
+      7) docker_container_all_action stop; pause ;;
+      8)
+        if confirm_danger "删除所有 Docker 容器" "docker rm -f \$(docker ps -a -q)"; then
+          docker_container_all_action rm
+        fi
+        pause
+        ;;
+      9) docker_container_all_action restart; pause ;;
+      11) read -r -e -p "请输入容器名/ID: " name; docker_container_shell "$name"; pause ;;
+      12) read -r -e -p "请输入容器名/ID: " name; docker_container_logs "$name"; pause ;;
+      13) docker_container_network_overview; pause ;;
+      14) docker_container_stats_once; pause ;;
+      15) docker_container_port_access open; pause ;;
+      16) docker_container_port_access close; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+docker_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}Docker 管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    if has_cmd docker; then
+      docker --version
+      echo -n "服务状态: "
+      docker_daemon_status
+    else
+      echo -e "Docker: ${gl_hui}未安装${gl_bai}"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装 Docker"
+    echo -e "${gl_kjlan}2.   ${gl_bai}查看 Docker 全局状态"
+    echo -e "${gl_kjlan}3.   ${gl_bai}Docker 容器管理"
+    echo -e "${gl_kjlan}4.   ${gl_bai}查看镜像"
+    echo -e "${gl_kjlan}5.   ${gl_bai}拉取镜像"
+    echo -e "${gl_kjlan}6.   ${gl_bai}Docker 网络管理"
+    echo -e "${gl_kjlan}7.   ${gl_bai}Docker 卷管理"
+    echo -e "${gl_kjlan}8.   ${gl_bai}Compose up"
+    echo -e "${gl_kjlan}9.   ${gl_bai}Compose down"
+    echo -e "${gl_kjlan}10.  ${gl_bai}清理无用资源"
+    echo -e "${gl_kjlan}11.  ${gl_bai}编辑 daemon.json 并重启"
+    echo -e "${gl_kjlan}20.  ${gl_bai}卸载 Docker"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1) install_docker; pause ;;
+      2) docker_global_status; pause ;;
+      3) docker_container_menu ;;
+      4) docker_require && docker images; pause ;;
+      5)
+        docker_require || { pause; continue; }
+        read -r -e -p "请输入镜像名: " image
+        docker pull "$image"
+        pause
+        ;;
+      6) docker_network_menu ;;
+      7) docker_volume_menu ;;
+      8)
+        docker_require || { pause; continue; }
+        read -r -e -p "请输入 compose 项目目录，回车为当前目录: " dir
+        docker_compose_run up "$dir"
+        pause
+        ;;
+      9)
+        docker_require || { pause; continue; }
+        read -r -e -p "请输入 compose 项目目录，回车为当前目录: " dir
+        if docker compose version >/dev/null 2>&1; then
+          (cd "${dir:-.}" && docker compose down)
+        elif has_cmd docker-compose; then
+          (cd "${dir:-.}" && docker-compose down)
+        else
+          echo "未找到 docker compose 插件或 docker-compose。"
+        fi
+        pause
+        ;;
+      10)
+        docker_require || { pause; continue; }
+        if confirm_danger "清理停止容器、无用镜像、网络、卷和构建缓存" "docker system prune -af --volumes"; then
+          log_action "docker system prune"
+          docker system prune -af --volumes
+          docker builder prune -af
+        fi
+        pause
+        ;;
+      11) docker_edit_daemon; pause ;;
+      20) docker_uninstall; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+tmux_require() {
+  if ! has_cmd tmux; then
+    echo "未找到 tmux，正在安装。"
+    install_pkg tmux || return 1
+  fi
+}
+
+tmux_open_session() {
+  local name="$1"
+  [ -z "$name" ] && name="ua"
+  tmux_require || return 1
+
+  if tmux has-session -t "$name" 2>/dev/null; then
+    tmux attach -t "$name"
+  else
+    tmux new -s "$name"
+  fi
+}
+
+tmux_ssh_persistent_menu() {
+  while true; do
+    clear
+    local status
+    if grep -q 'tmux attach-session -t sshd || tmux new-session -s sshd' ~/.bashrc 2>/dev/null; then
+      status="${gl_lv}开启${gl_bai}"
+    else
+      status="${gl_hui}关闭${gl_bai}"
+    fi
+
+    echo -e "${gl_kjlan}SSH 常驻模式 ${status}${gl_bai}"
+    echo "开启后，新的 SSH 登录会自动进入 sshd 工作区。"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}开启"
+    echo -e "${gl_kjlan}2.   ${gl_bai}关闭"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1)
+        tmux_require || { pause; continue; }
+        if ! grep -q 'tmux attach-session -t sshd || tmux new-session -s sshd' ~/.bashrc 2>/dev/null; then
+          {
+            echo ""
+            echo "# UA Box 自动进入 tmux 会话"
+            echo 'if [[ -z "$TMUX" ]]; then'
+            echo '  tmux attach-session -t sshd || tmux new-session -s sshd'
+            echo "fi"
+          } >> ~/.bashrc
+        fi
+        tmux_open_session sshd
+        pause
+        ;;
+      2)
+        sed -i '/# UA Box 自动进入 tmux 会话/,+4d' ~/.bashrc
+        tmux kill-session -t sshd 2>/dev/null || true
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+workspace_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}工作区模块${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    if has_cmd tmux; then
+      tmux ls 2>/dev/null || echo "暂无 tmux 工作区。"
+    else
+      echo -e "tmux: ${gl_hui}未安装${gl_bai}"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}1号工作区                     ${gl_kjlan}2.   ${gl_bai}2号工作区"
+    echo -e "${gl_kjlan}3.   ${gl_bai}3号工作区                     ${gl_kjlan}4.   ${gl_bai}4号工作区"
+    echo -e "${gl_kjlan}5.   ${gl_bai}5号工作区                     ${gl_kjlan}6.   ${gl_bai}6号工作区"
+    echo -e "${gl_kjlan}7.   ${gl_bai}7号工作区                     ${gl_kjlan}8.   ${gl_bai}8号工作区"
+    echo -e "${gl_kjlan}9.   ${gl_bai}9号工作区                     ${gl_kjlan}10.  ${gl_bai}10号工作区"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}21.  ${gl_bai}SSH 常驻模式"
+    echo -e "${gl_kjlan}22.  ${gl_bai}创建/进入自定义工作区"
+    echo -e "${gl_kjlan}23.  ${gl_bai}后台运行命令"
+    echo -e "${gl_kjlan}24.  ${gl_bai}删除工作区"
+    echo -e "${gl_kjlan}25.  ${gl_bai}重命名工作区"
+    echo -e "${gl_kjlan}26.  ${gl_bai}查看工作区列表"
+    echo -e "${gl_kjlan}31.  ${gl_bai}安装 tmux"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      [1-9]|10) tmux_open_session "${DEFAULT_WORKSPACE_PREFIX}${choice}"; pause ;;
+      21) tmux_ssh_persistent_menu ;;
+      22)
+        read -r -e -p "请输入工作区名称，如 1001 kj001 work1: " name
+        tmux_open_session "$name"
+        pause
+        ;;
+      23)
+        tmux_require || { pause; continue; }
+        read -r -e -p "请输入工作区名称: " name
+        read -r -e -p "请输入要后台执行的命令: " cmd
+        [ -z "$name" ] && name="ua-bg"
+        if [ -z "$cmd" ]; then
+          echo "命令不能为空。"
+        else
+          tmux new-session -d -s "$name" "$cmd; exec bash"
+          echo "已创建后台工作区: $name"
+        fi
+        pause
+        ;;
+      24)
+        tmux_require || { pause; continue; }
+        read -r -e -p "请输入要删除的工作区名称: " name
+        if confirm_danger "删除 tmux 工作区" "$name"; then
+          log_action "tmux kill-session $name"
+          tmux kill-session -t "$name"
+        fi
+        pause
+        ;;
+      25)
+        tmux_require || { pause; continue; }
+        read -r -e -p "请输入当前工作区名称: " old_name
+        read -r -e -p "请输入新工作区名称: " new_name
+        tmux rename-session -t "$old_name" "$new_name"
+        pause
+        ;;
+      26) tmux_require && tmux ls; pause ;;
+      31) install_pkg tmux; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+install_rclone() {
+  need_root || return 1
+  local target="/tmp/rclone-install.sh"
+  download_to "$RCLONE_INSTALL_SCRIPT" "$target" || return 1
+  bash "$target"
+}
+
+rclone_require() {
+  if ! has_cmd rclone; then
+    echo "未找到 rclone，请先安装 rclone。"
+    return 1
+  fi
+}
+
+rclone_config_file_path() {
+  rclone config file 2>/dev/null | awk 'NF {line=$0} END {print line}'
+}
+
+rclone_remote_summary() {
+  rclone_require || return 1
+
+  local config_file
+  config_file="$(rclone_config_file_path)"
+
+  echo -e "${gl_kjlan}当前 remotes${gl_bai}"
+  if [ -z "$config_file" ] || [ ! -r "$config_file" ]; then
+    echo "未找到可读取的 rclone 配置文件。"
+    return 0
+  fi
+
+  awk '
+    function flush() {
+      if (name != "") {
+        if (type == "") type = "-";
+        printf "%-20s %-14s\n", name, type;
+      }
+    }
+    /^\[[^]]+\]$/ {
+      flush();
+      name = substr($0, 2, length($0)-2);
+      type = "";
+      next;
+    }
+    /^[[:space:]]*type[[:space:]]*=/ {
+      type = $0;
+      sub(/^[^=]*=[[:space:]]*/, "", type);
+    }
+    END { flush(); }
+  ' "$config_file" | awk 'BEGIN {printf "%-20s %-14s\n%-20s %-14s\n", "Name", "Type", "====", "===="} {print}'
+}
+
+rclone_config_check() {
+  rclone_require || return 1
+
+  local config_file remote_count mount_count check_timeout result_file
+  config_file="$(rclone_config_file_path)"
+  remote_count="$(rclone listremotes 2>/dev/null | wc -l)"
+  mount_count="$(pgrep -af "rclone mount" 2>/dev/null | wc -l)"
+  check_timeout="${RCLONE_CHECK_TIMEOUT:-5}"
+  result_file="/tmp/ua-rclone-check.$$"
+
+  echo -e "${gl_kjlan}rclone 配置检测${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  rclone version | head -n 1
+  echo "配置文件: ${config_file:-未找到}"
+  echo "远程盘数量: $remote_count"
+  echo "挂载进程数: $mount_count"
+  echo "连接测试超时: ${check_timeout}s/remote"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+
+  if [ -z "$config_file" ] || [ ! -r "$config_file" ]; then
+    echo "配置文件不可读取。"
+    return 1
+  fi
+
+  echo "正在逐个测试 remote 连接..."
+  : > "$result_file"
+  while IFS= read -r remote; do
+    [ -z "$remote" ] && continue
+    printf "测试 %-20s ... " "$remote"
+    local output rc status
+    if has_cmd timeout; then
+      output="$(timeout "$check_timeout" rclone lsd "${remote}:" 2>&1 >/dev/null)"
+      rc=$?
+      [ "$rc" -eq 124 ] && status="timeout" || status="$([ "$rc" -eq 0 ] && echo ok || echo fail)"
+    else
+      output="$(rclone lsd "${remote}:" 2>&1 >/dev/null)"
+      rc=$?
+      status="$([ "$rc" -eq 0 ] && echo ok || echo fail)"
+    fi
+    printf "%s\n" "$status"
+    printf '%s\t%s\t%s\n' "$remote" "$status" "$(printf '%s' "$output" | tr '\t\r\n' '   ' | cut -c1-90)" >> "$result_file"
+  done <<EOF
+$(rclone listremotes 2>/dev/null | sed 's/:$//')
+EOF
+
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  printf "%-18s %-10s %-16s %-16s %-10s %-32s\n" "Name" "Type" "Auth" "Scope/Root" "Connect" "Message"
+  awk -v result_file="$result_file" '
+    BEGIN {
+      while ((getline line < result_file) > 0) {
+        split(line, parts, "\t");
+        connect[parts[1]] = parts[2];
+        message[parts[1]] = parts[3];
+      }
+    }
+    function flush() {
+      if (name == "") return;
+      if (type == "") type = "-";
+      auth = "-";
+      if (service_account_file != "" || service_account_file_path != "") auth = "service-account";
+      else if (token == "yes") auth = "oauth-token";
+      else if (user != "") auth = "user-pass";
+
+      scope_root = "-";
+      if (team_drive != "") scope_root = "team_drive";
+      else if (root_folder_id != "") scope_root = "root_folder";
+      else if (scope != "") scope_root = scope;
+
+      status = connect[name];
+      if (status == "") status = "not-tested";
+      msg = message[name];
+      if (type == "-") {
+        status = "no-type";
+        msg = "missing type";
+      }
+      printf "%-18s %-10s %-16s %-16s %-10s %-32s\n", name, type, auth, scope_root, status, msg;
+    }
+    /^\[[^]]+\]$/ {
+      flush();
+      name = substr($0, 2, length($0)-2);
+      type = scope = team_drive = root_folder_id = service_account_file = service_account_file_path = user = "";
+      token = "no";
+      next;
+    }
+    /^[[:space:]]*type[[:space:]]*=/ { type = $0; sub(/^[^=]*=[[:space:]]*/, "", type); next; }
+    /^[[:space:]]*scope[[:space:]]*=/ { scope = $0; sub(/^[^=]*=[[:space:]]*/, "", scope); next; }
+    /^[[:space:]]*team_drive[[:space:]]*=/ { team_drive = $0; sub(/^[^=]*=[[:space:]]*/, "", team_drive); next; }
+    /^[[:space:]]*root_folder_id[[:space:]]*=/ { root_folder_id = $0; sub(/^[^=]*=[[:space:]]*/, "", root_folder_id); next; }
+    /^[[:space:]]*service_account_file[[:space:]]*=/ { service_account_file = $0; sub(/^[^=]*=[[:space:]]*/, "", service_account_file); next; }
+    /^[[:space:]]*service_account_file_path[[:space:]]*=/ { service_account_file_path = $0; sub(/^[^=]*=[[:space:]]*/, "", service_account_file_path); next; }
+    /^[[:space:]]*user[[:space:]]*=/ { user = "yes"; next; }
+    /^[[:space:]]*token[[:space:]]*=/ { token = "yes"; next; }
+    END { flush(); }
+  ' "$config_file"
+  rm -f "$result_file"
+
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo "说明: 已先进行连接测试，再显示安全摘要；不显示 token、密码、client_secret。"
+}
+
+rclone_normalize_path() {
+  local path="$1"
+
+  if [ -z "$path" ]; then
+    return 1
+  fi
+
+  if printf '%s\n' "$path" | grep -q ':'; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+
+  if rclone listremotes 2>/dev/null | sed 's/:$//' | grep -Fxq "$path"; then
+    printf '%s:\n' "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+rclone_choose_remote_lsd() {
+  rclone_require || return 1
+
+  local remotes remote_path
+  remotes="$(rclone listremotes 2>/dev/null | sed 's/:$//')"
+
+  if [ -z "$remotes" ]; then
+    echo "当前没有配置 rclone remote。"
+    return 1
+  fi
+
+  rclone_remote_summary
+  echo ""
+  read -r -e -p "请输入要查看的远程盘 Name，回车只显示列表: " remote_path
+  [ -z "$remote_path" ] && return 0
+
+  remote_path="$(rclone_normalize_path "$remote_path")" || return 1
+  echo "正在列出: $remote_path"
+  rclone lsd "$remote_path"
+}
+
+rclone_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}rclone 管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    if has_cmd rclone; then
+      if has_cmd timeout; then
+        local rclone_ver
+        rclone_ver="$(timeout 2 rclone version 2>/dev/null | head -n 1)"
+        echo "${rclone_ver:-rclone 已安装，版本检测超时。}"
+      else
+        rclone version | head -n 1
+      fi
+    else
+      echo -e "rclone: ${gl_hui}未安装${gl_bai}"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    if has_cmd rclone; then
+      rclone_remote_summary
+      echo -e "${gl_kjlan}------------------------${gl_bai}"
+    fi
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装/更新 rclone"
+    echo -e "${gl_kjlan}2.   ${gl_bai}配置 rclone"
+    echo -e "${gl_kjlan}3.   ${gl_bai}查看远程盘"
+    echo -e "${gl_kjlan}4.   ${gl_bai}列出远程目录"
+    echo -e "${gl_kjlan}5.   ${gl_bai}复制 copy"
+    echo -e "${gl_kjlan}6.   ${gl_bai}同步 sync"
+    echo -e "${gl_kjlan}7.   ${gl_bai}挂载远程盘"
+    echo -e "${gl_kjlan}8.   ${gl_bai}卸载挂载点"
+    echo -e "${gl_kjlan}9.   ${gl_bai}查看 rclone mount 进程"
+    echo -e "${gl_kjlan}10.  ${gl_bai}打开 rclone ncdu"
+    echo -e "${gl_kjlan}11.  ${gl_bai}查看配置情况检测"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1) install_rclone; pause ;;
+      2) rclone_require && rclone config; pause ;;
+      3) rclone_choose_remote_lsd; pause ;;
+      4)
+        rclone_require || { pause; continue; }
+        read -r -e -p "请输入路径，如 googlexr: 或 googlexr:目录，若只输入 Name 会自动补冒号: " path
+        path="$(rclone_normalize_path "$path")" || { echo "路径不能为空。"; pause; continue; }
+        rclone lsd "$path"
+        pause
+        ;;
+      5)
+        rclone_require || { pause; continue; }
+        read -r -e -p "请输入源路径: " src
+        read -r -e -p "请输入目标路径: " dst
+        rclone copy "$src" "$dst" -P
+        pause
+        ;;
+      6)
+        rclone_require || { pause; continue; }
+        read -r -e -p "请输入源路径: " src
+        read -r -e -p "请输入目标路径: " dst
+        if confirm_danger "rclone sync 会让目标与源一致，可能删除目标多余文件" "$src -> $dst"; then
+          log_action "rclone sync $src $dst"
+          rclone sync "$src" "$dst" -P
+        fi
+        pause
+        ;;
+      7)
+        rclone_require || { pause; continue; }
+        read -r -e -p "请输入远程路径，如 remote:path : " remote_path
+        read -r -e -p "请输入本地挂载点: " mount_point
+        read -r -e -p "额外参数，回车使用默认: " extra
+        [ -z "$extra" ] && extra="$DEFAULT_RCLONE_MOUNT_ARGS"
+        mkdir -p "$mount_point"
+        log_action "rclone mount $remote_path $mount_point $extra"
+        # shellcheck disable=SC2086
+        rclone mount "$remote_path" "$mount_point" --daemon $extra
+        pause
+        ;;
+      8)
+        read -r -e -p "请输入本地挂载点: " mount_point
+        if has_cmd fusermount; then
+          fusermount -uz "$mount_point"
+        elif has_cmd fusermount3; then
+          fusermount3 -uz "$mount_point"
+        else
+          umount "$mount_point"
+        fi
+        pause
+        ;;
+      9) pgrep -af "rclone mount" || echo "未找到 rclone mount 进程。"; pause ;;
+      10)
+        rclone_require || { pause; continue; }
+        read -r -e -p "请输入路径，如 remote:path : " path
+        rclone ncdu "$path"
+        pause
+        ;;
+      11) rclone_config_check; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+run_downloaded_script() {
+  local url="$1"
+  local target="$2"
+  shift 2
+
+  download_to "$url" "$target" || return 1
+  chmod +x "$target"
+  bash "$target" "$@"
+}
+
+test_scripts_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}测试脚本合集${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}IP 及解锁状态检测${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}ChatGPT 解锁状态检测"
+    echo -e "${gl_kjlan}2.   ${gl_bai}Region 流媒体解锁测试"
+    echo -e "${gl_kjlan}3.   ${gl_bai}yeahwu 流媒体解锁检测"
+    echo -e "${gl_kjlan}4.   ${gl_bai}IP质量体检脚本"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}网络线路测速${gl_bai}"
+    echo -e "${gl_kjlan}11.  ${gl_bai}besttrace 三网回程延迟路由测试"
+    echo -e "${gl_kjlan}12.  ${gl_bai}mtr_trace 三网回程线路测试"
+    echo -e "${gl_kjlan}13.  ${gl_bai}Superspeed 三网测速"
+    echo -e "${gl_kjlan}14.  ${gl_bai}nxtrace 快速回程测试"
+    echo -e "${gl_kjlan}15.  ${gl_bai}nxtrace 指定IP回程测试"
+    echo -e "${gl_kjlan}16.  ${gl_bai}i-abc 多功能测速脚本"
+    echo -e "${gl_kjlan}17.  ${gl_bai}NetQuality 网络质量体检"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}硬件性能测试${gl_bai}"
+    echo -e "${gl_kjlan}21.  ${gl_bai}YABS 综合性能测试"
+    echo -e "${gl_kjlan}22.  ${gl_bai}YABS 跳过 iperf"
+    echo -e "${gl_kjlan}23.  ${gl_bai}icu/gb5 CPU 性能测试"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}常用基础测试${gl_bai}"
+    echo -e "${gl_kjlan}31.  ${gl_bai}bench.sh 基础性能测试"
+    echo -e "${gl_kjlan}32.  ${gl_bai}融合怪测评"
+    echo -e "${gl_kjlan}33.  ${gl_bai}安装 speedtest-cli"
+    echo -e "${gl_kjlan}34.  ${gl_bai}运行 speedtest-cli"
+    echo -e "${gl_kjlan}35.  ${gl_bai}安装 iperf3"
+    echo -e "${gl_kjlan}36.  ${gl_bai}iperf3 客户端测试"
+    echo -e "${gl_kjlan}37.  ${gl_bai}Ping 测试"
+    echo -e "${gl_kjlan}38.  ${gl_bai}路由追踪"
+    echo -e "${gl_kjlan}41.  ${gl_bai}运行自定义脚本 URL"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1) run_downloaded_script "$OPENAI_CHECK_SCRIPT" /tmp/openai-check.sh; pause ;;
+      2) run_downloaded_script "$REGION_UNLOCK_SCRIPT" /tmp/unlock-media.sh; pause ;;
+      3) run_downloaded_script "$YEAHWU_UNLOCK_SCRIPT" /tmp/yeahwu-unlock.sh; pause ;;
+      4) download_to "https://IP.Check.Place" /tmp/ip-check.sh && bash /tmp/ip-check.sh; pause ;;
+      11) download_to "https://git.io/besttrace" /tmp/besttrace.sh && bash /tmp/besttrace.sh; pause ;;
+      12) run_downloaded_script "$MTR_TRACE_SCRIPT" /tmp/mtr_trace.sh; pause ;;
+      13) download_to "https://git.io/superspeed_uxh" /tmp/superspeed.sh && bash /tmp/superspeed.sh; pause ;;
+      14) download_to "https://nxtrace.org/nt" /tmp/nxtrace.sh && bash /tmp/nxtrace.sh && nexttrace --fast-trace --tcp; pause ;;
+      15)
+        echo "可参考的 IP 列表"
+        echo "北京电信: 219.141.136.12     北京联通: 202.106.50.1      北京移动: 221.179.155.161"
+        echo "上海电信: 202.96.209.133     上海联通: 210.22.97.1       上海移动: 211.136.112.200"
+        echo "广州电信: 58.60.188.222      广州联通: 210.21.196.6      广州移动: 120.196.165.24"
+        read -r -e -p "请输入指定 IP: " test_ip
+        download_to "https://nxtrace.org/nt" /tmp/nxtrace.sh && bash /tmp/nxtrace.sh
+        nexttrace "$test_ip"
+        pause
+        ;;
+      16) run_downloaded_script "$IABC_SPEEDTEST_SCRIPT" /tmp/iabc-speedtest.sh; pause ;;
+      17) download_to "https://Net.Check.Place" /tmp/net-check.sh && bash /tmp/net-check.sh; pause ;;
+      21) run_downloaded_script "$YABS_SCRIPT" /tmp/yabs.sh; pause ;;
+      22) run_downloaded_script "$YABS_SCRIPT" /tmp/yabs.sh -i; pause ;;
+      23) run_downloaded_script "$GB5_SCRIPT" /tmp/gb5.sh; pause ;;
+      31) run_downloaded_script "$BENCH_SCRIPT" /tmp/bench.sh; pause ;;
+      32) run_downloaded_script "$FUSION_TEST_SCRIPT" /tmp/fusion-test.sh; pause ;;
+      33) install_pkg speedtest-cli; pause ;;
+      34)
+        if has_cmd speedtest-cli; then
+          speedtest-cli
+        else
+          echo "未找到 speedtest-cli，请先安装。"
+        fi
+        pause
+        ;;
+      35) install_pkg iperf3; pause ;;
+      36)
+        if ! has_cmd iperf3; then
+          echo "未找到 iperf3，请先安装。"
+          pause
+          continue
+        fi
+        read -r -e -p "请输入 iperf3 服务器地址: " host
+        read -r -e -p "请输入端口，回车默认 5201: " port
+        iperf3 -c "$host" -p "${port:-5201}"
+        pause
+        ;;
+      37)
+        read -r -e -p "请输入测试地址，回车默认 1.1.1.1: " host
+        ping -c 4 "${host:-1.1.1.1}"
+        pause
+        ;;
+      38)
+        read -r -e -p "请输入追踪地址，回车默认 1.1.1.1: " host
+        if has_cmd traceroute; then
+          traceroute "${host:-1.1.1.1}"
+        elif has_cmd tracepath; then
+          tracepath "${host:-1.1.1.1}"
+        else
+          echo "未找到 traceroute/tracepath，可先安装 traceroute。"
+        fi
+        pause
+        ;;
+      41)
+        read -r -e -p "请输入脚本 URL: " url
+        read -r -e -p "请输入脚本参数，回车跳过: " args
+        if [ -n "$url" ]; then
+          download_to "$url" /tmp/ua-box-custom-test.sh && chmod +x /tmp/ua-box-custom-test.sh
+          # shellcheck disable=SC2086
+          bash /tmp/ua-box-custom-test.sh $args
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+system_update() {
+  need_root || return 1
+  log_action "system update"
+
+  local pm
+  pm="$(pkg_manager)"
+  echo -e "${gl_huang}正在系统更新...${gl_bai}"
+
+  case "$pm" in
+    apt)
+      dpkg --configure -a 2>/dev/null || true
+      apt update -y
+      DEBIAN_FRONTEND=noninteractive apt full-upgrade -y
+      ;;
+    dnf) dnf -y update ;;
+    yum) yum -y update ;;
+    apk) apk update && apk upgrade ;;
+    pacman) pacman -Syu --noconfirm ;;
+    zypper) zypper refresh && zypper update -y ;;
+    opkg) opkg update && opkg upgrade ;;
+    *) echo "未知包管理器，无法系统更新。"; return 1 ;;
+  esac
+}
+
+system_clean() {
+  need_root || return 1
+  log_action "system clean"
+
+  local pm orphans
+  pm="$(pkg_manager)"
+  echo -e "${gl_huang}正在系统清理...${gl_bai}"
+
+  case "$pm" in
+    apt)
+      apt autoremove --purge -y
+      apt clean -y
+      apt autoclean -y
+      ;;
+    dnf)
+      dnf autoremove -y
+      dnf clean all
+      ;;
+    yum)
+      yum autoremove -y
+      yum clean all
+      ;;
+    apk)
+      apk cache clean
+      ;;
+    pacman)
+      orphans="$(pacman -Qdtq 2>/dev/null || true)"
+      if [ -n "$orphans" ]; then
+        # shellcheck disable=SC2086
+        pacman -Rns $orphans --noconfirm 2>/dev/null || true
+      fi
+      pacman -Scc --noconfirm
+      ;;
+    zypper)
+      zypper clean --all
+      ;;
+    opkg)
+      opkg clean
+      ;;
+    *) echo "未知包管理器，跳过包缓存清理。" ;;
+  esac
+
+  if has_cmd journalctl; then
+    journalctl --rotate 2>/dev/null || true
+    journalctl --vacuum-size=500M 2>/dev/null || true
+  fi
+}
+
+system_set_shortcut() {
+  local shortcut shell_rc target
+
+  read -r -e -p "请输入启动快捷键，例 u 或 ua，输入 0 取消: " shortcut
+  [ "$shortcut" = "0" ] || [ -z "$shortcut" ] && return 0
+
+  if ! printf '%s\n' "$shortcut" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$'; then
+    echo "快捷键只能使用字母、数字、下划线或中划线，且不能以数字开头。"
+    return 1
+  fi
+
+  shell_rc="$HOME/.bashrc"
+  [ -n "$ZSH_VERSION" ] && shell_rc="$HOME/.zshrc"
+  target="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+  sed -i "/# UA Box shortcut:/d" "$shell_rc" 2>/dev/null || true
+  sed -i "/alias ${shortcut}=/d" "$shell_rc" 2>/dev/null || true
+  printf "\n# UA Box shortcut: %s\nalias %s='%s'\n" "$shortcut" "$shortcut" "$target" >> "$shell_rc"
+  log_action "set shortcut $shortcut -> $target"
+  echo "快捷键已设置: $shortcut"
+  echo "重新登录 Shell 或执行 source $shell_rc 后生效。"
+}
+
+system_install_python_version() {
+  local version pm pkg
+
+  need_root || return 1
+  read -r -e -p "请输入 Python 版本，例 3.11 或 3.12: " version
+  [ -z "$version" ] && return 1
+
+  if ! printf '%s\n' "$version" | grep -Eq '^3\.[0-9]+([.][0-9]+)?$'; then
+    echo "版本格式不正确。"
+    return 1
+  fi
+
+  pm="$(pkg_manager)"
+  pkg="python${version}"
+  log_action "install Python $version"
+
+  case "$pm" in
+    apt)
+      apt update -y
+      apt install -y "$pkg" "${pkg}-venv" "${pkg}-dev" || {
+        echo "包管理器未提供 $pkg。若已安装 pyenv，可改用 pyenv 安装。"
+        if has_cmd pyenv; then
+          read -r -e -p "是否尝试 pyenv install $version ? 输入 yes 确认: " answer
+          [ "$answer" = "yes" ] && pyenv install -s "$version"
+        fi
+      }
+      ;;
+    dnf|yum) install_pkg "$pkg" ;;
+    apk) install_pkg python3 py3-pip ;;
+    pacman) install_pkg python ;;
+    zypper) install_pkg "$pkg" ;;
+    *) echo "未知包管理器，无法安装 Python。"; return 1 ;;
+  esac
+}
+
+system_root_password_login() {
+  need_root || return 1
+
+  echo "该功能会设置 root 密码登录，并调整 SSH 配置。"
+  if confirm_danger "开启 ROOT 密码登录模式" "/etc/ssh/sshd_config"; then
+    passwd root || return 1
+    if [ -f /etc/ssh/sshd_config ]; then
+      cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+      if grep -qE '^[#[:space:]]*PermitRootLogin' /etc/ssh/sshd_config; then
+        sed -i 's/^[#[:space:]]*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      else
+        echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+      fi
+      if grep -qE '^[#[:space:]]*PasswordAuthentication' /etc/ssh/sshd_config; then
+        sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+      else
+        echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+      fi
+      svc restart ssh 2>/dev/null || svc restart sshd 2>/dev/null || true
+      log_action "enable root password ssh login"
+      echo "ROOT 密码登录模式已开启。"
+    else
+      echo "未找到 /etc/ssh/sshd_config。"
+      return 1
+    fi
+  fi
+}
+
+system_reinstall_menu() {
+  need_root || return 1
+
+  echo -e "${gl_hong}一键重装系统会清空当前系统环境，请先备份数据。${gl_bai}"
+  echo "脚本来源: $REINSTALL_SCRIPT"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo "1. Debian 12"
+  echo "2. Debian 11"
+  echo "3. Ubuntu 22.04"
+  echo "4. Ubuntu 20.04"
+  echo "5. 自定义 reinstall.sh 参数"
+  echo "0. 取消"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  read -r -e -p "请输入你的选择: " choice
+
+  local args
+  case "$choice" in
+    1) args="debian 12" ;;
+    2) args="debian 11" ;;
+    3) args="ubuntu 22.04" ;;
+    4) args="ubuntu 20.04" ;;
+    5) read -r -e -p "请输入 reinstall.sh 参数: " args ;;
+    0) return 0 ;;
+    *) echo "无效输入"; return 1 ;;
+  esac
+
+  if confirm_danger "即将重装系统，当前系统数据可能丢失" "bash /tmp/reinstall.sh $args"; then
+    download_to "$REINSTALL_SCRIPT" /tmp/reinstall.sh || return 1
+    chmod +x /tmp/reinstall.sh
+    log_action "reinstall system $args"
+    # shellcheck disable=SC2086
+    bash /tmp/reinstall.sh $args
+  fi
+}
+
+system_port_status() {
+  echo -e "${gl_kjlan}端口占用状态${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  if has_cmd ss; then
+    ss -tulpen
+  elif has_cmd netstat; then
+    netstat -tulpen
+  else
+    echo "未找到 ss/netstat，可先安装 iproute2 或 net-tools。"
+    return 1
+  fi
+}
+
+system_open_all_ports() {
+  need_root || return 1
+
+  if confirm_danger "开放所有端口并清空常见防火墙规则" "iptables/ufw/firewalld allow all"; then
+    log_action "open all ports"
+    if has_cmd ufw; then
+      ufw --force disable || true
+    fi
+    if has_cmd firewall-cmd; then
+      systemctl stop firewalld 2>/dev/null || true
+      systemctl disable firewalld 2>/dev/null || true
+    fi
+    if has_cmd iptables; then
+      iptables -P INPUT ACCEPT
+      iptables -P FORWARD ACCEPT
+      iptables -P OUTPUT ACCEPT
+      iptables -F
+      iptables -X
+    fi
+    if has_cmd ip6tables; then
+      ip6tables -P INPUT ACCEPT
+      ip6tables -P FORWARD ACCEPT
+      ip6tables -P OUTPUT ACCEPT
+      ip6tables -F
+      ip6tables -X
+    fi
+    echo "已开放所有端口。"
+  fi
+}
+
+system_user_password_generator() {
+  local username password length
+
+  read -r -e -p "请输入用户名，回车自动生成: " username
+  read -r -e -p "请输入密码长度，回车默认 20: " length
+  length="${length:-20}"
+
+  if ! printf '%s\n' "$length" | grep -Eq '^[0-9]+$' || [ "$length" -lt 8 ]; then
+    echo "密码长度必须是大于等于 8 的数字。"
+    return 1
+  fi
+
+  username="${username:-user$(date +%m%d%H%M)}"
+  if has_cmd openssl; then
+    password="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9_@#%+=' | head -c "$length")"
+  else
+    password="$(tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c "$length")"
+  fi
+
+  echo "用户名: $username"
+  echo "密码:   $password"
+}
+
+system_timezone_menu() {
+  need_root || return 1
+
+  local tz
+  echo "当前时区: $(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo 未知)"
+  echo "1. Asia/Shanghai"
+  echo "2. UTC"
+  echo "3. America/New_York"
+  echo "4. Europe/London"
+  echo "5. 自定义"
+  echo "0. 取消"
+  read -r -e -p "请输入你的选择: " choice
+
+  case "$choice" in
+    1) tz="Asia/Shanghai" ;;
+    2) tz="UTC" ;;
+    3) tz="America/New_York" ;;
+    4) tz="Europe/London" ;;
+    5) read -r -e -p "请输入时区，如 Asia/Tokyo: " tz ;;
+    0) return 0 ;;
+    *) echo "无效输入"; return 1 ;;
+  esac
+
+  [ -z "$tz" ] && return 1
+  if has_cmd timedatectl; then
+    timedatectl set-timezone "$tz"
+  elif [ -f "/usr/share/zoneinfo/$tz" ]; then
+    ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
+    echo "$tz" > /etc/timezone
+  else
+    echo "未找到时区: $tz"
+    return 1
+  fi
+  log_action "set timezone $tz"
+  echo "时区已设置为: $tz"
+}
+
+system_change_mirror() {
+  need_root || return 1
+
+  echo "将调用 LinuxMirrors 换源脚本。"
+  echo "脚本来源: https://linuxmirrors.cn/main.sh"
+  if confirm_danger "切换系统更新源" "linuxmirrors.cn/main.sh"; then
+    download_to "https://linuxmirrors.cn/main.sh" /tmp/linuxmirrors-main.sh || return 1
+    chmod +x /tmp/linuxmirrors-main.sh
+    log_action "change system mirror via linuxmirrors"
+    bash /tmp/linuxmirrors-main.sh
+  fi
+}
+
+system_cron_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}定时任务管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    crontab -l 2>/dev/null || echo "当前用户暂无 crontab。"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo "1. 编辑定时任务"
+    echo "2. 查看定时任务"
+    echo "3. 清空当前用户定时任务"
+    echo "0. 返回"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1)
+        if has_cmd crontab; then
+          crontab -e
+        else
+          echo "未找到 crontab。"
+        fi
+        pause
+        ;;
+      2) crontab -l 2>/dev/null || echo "当前用户暂无 crontab。"; pause ;;
+      3)
+        if confirm_danger "清空当前用户定时任务" "$(whoami)"; then
+          crontab -r 2>/dev/null || true
+          echo "定时任务已清空。"
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+system_set_swap() {
+  need_root || return 1
+
+  local current new_swap
+  current="$(free -m | awk '/^Swap:/ {printf "%dMB/%dMB", $3, $2}')"
+  echo "当前虚拟内存: ${current:-未知}"
+  echo "1. 分配 1024MB"
+  echo "2. 分配 2048MB"
+  echo "3. 自定义大小"
+  echo "4. 关闭并删除 /swapfile"
+  echo "0. 取消"
+  read -r -e -p "请输入你的选择: " choice
+
+  case "$choice" in
+    1) new_swap=1024 ;;
+    2) new_swap=2048 ;;
+    3) read -r -e -p "请输入虚拟内存大小 MB: " new_swap ;;
+    4)
+      if confirm_danger "关闭并删除 /swapfile" "/swapfile"; then
+        swapoff /swapfile 2>/dev/null || true
+        sed -i '\|/swapfile swap swap|d' /etc/fstab
+        rm -f /swapfile
+        echo "已删除 /swapfile。"
+      fi
+      return 0
+      ;;
+    0) return 0 ;;
+    *) echo "无效输入"; return 1 ;;
+  esac
+
+  if ! printf '%s\n' "$new_swap" | grep -Eq '^[0-9]+$' || [ "$new_swap" -lt 128 ]; then
+    echo "虚拟内存大小必须是大于等于 128 的 MB 数值。"
+    return 1
+  fi
+
+  if confirm_danger "重建 /swapfile 并设置虚拟内存为 ${new_swap}MB" "/swapfile"; then
+    log_action "set swap ${new_swap}MB"
+    swapoff /swapfile 2>/dev/null || true
+    sed -i '\|/swapfile swap swap|d' /etc/fstab
+    rm -f /swapfile
+    if has_cmd fallocate; then
+      fallocate -l "${new_swap}M" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$new_swap"
+    else
+      dd if=/dev/zero of=/swapfile bs=1M count="$new_swap"
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+    echo "虚拟内存已设置为 ${new_swap}MB。"
+  fi
+}
+
+system_history_menu() {
+  local hist_file
+  hist_file="${HISTFILE:-$HOME/.bash_history}"
+
+  echo "命令行历史文件: $hist_file"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo "1. 查看最近 80 条"
+  echo "2. 搜索历史记录"
+  echo "3. 清空当前用户历史记录"
+  echo "0. 返回"
+  read -r -e -p "请输入你的选择: " choice
+
+  case "$choice" in
+    1) tail -n 80 "$hist_file" 2>/dev/null || echo "暂无历史记录。" ;;
+    2)
+      read -r -e -p "请输入关键词: " keyword
+      grep -n -- "$keyword" "$hist_file" 2>/dev/null | tail -n 80 || true
+      ;;
+    3)
+      if confirm_danger "清空当前用户命令行历史记录" "$hist_file"; then
+        : > "$hist_file"
+        history -c 2>/dev/null || true
+        echo "历史记录已清空。"
+      fi
+      ;;
+    0) return 0 ;;
+    *) echo "无效输入" ;;
+  esac
+}
+
+system_command_advanced_help() {
+  cat <<'EOF'
+命令高级用法
+------------------------
+ua ps/status                 查看系统和 UA 状态
+ua install curl wget jq      批量安装软件包
+ua remove nginx              卸载软件包
+ua docker / ua rclone        直接进入模块
+ua log                       查看 UA 最近日志
+ua backup                    备份当前 UA 脚本
+ua config                    编辑 UA 配置
+
+常用 Shell
+------------------------
+command > file               覆盖写入输出
+command >> file              追加输出
+command 2>&1                 合并错误输出
+command | less               分页查看输出
+nohup command &              后台运行命令
+tmux new -s name             创建持久会话
+journalctl -u name -f        跟随服务日志
+ss -tulpen                   查看端口监听
+du -sh * | sort -h           查看目录占用
+EOF
+}
+
+system_reboot() {
+  need_root || return 1
+  if confirm_danger "立即重启服务器" "reboot"; then
+    log_action "reboot server"
+    reboot
+  fi
+}
+
+system_uninstall_ua() {
+  need_root || return 1
+
+  local src
+  src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  if confirm_danger "卸载 UA Box，删除入口链接和脚本目录" "$UA_BOX_HOME"; then
+    log_action "uninstall UA Box"
+    rm -f /usr/local/bin/ua /usr/local/bin/ua-box
+    if [ "$src" = "$UA_BOX_HOME/ua-box" ]; then
+      rm -rf "$UA_BOX_HOME"
+    else
+      rm -f "$src"
+    fi
+    echo "UA Box 已卸载。"
+    exit 0
+  fi
+}
+
+system_limit_shutdown_status() {
+  if [ -f "$LIMIT_SHUTDOWN_SCRIPT" ]; then
+    echo -e "限流自动关机: ${gl_lv}已安装${gl_bai}"
+    grep -E '^(RX_LIMIT_GB|TX_LIMIT_GB|RESET_DAY)=' "$LIMIT_SHUTDOWN_SCRIPT" 2>/dev/null || true
+    crontab -l 2>/dev/null | grep -F "$LIMIT_SHUTDOWN_SCRIPT" || true
+  else
+    echo -e "限流自动关机: ${gl_hui}未启用${gl_bai}"
+  fi
+}
+
+system_limit_shutdown_menu() {
+  need_root || return 1
+
+  echo -e "${gl_kjlan}限流自动关机${gl_bai}"
+  echo "系统每分钟检测网卡总流量，达到阈值后执行 shutdown -h now。"
+  system_limit_shutdown_status
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo "1. 开启/更新限流自动关机"
+  echo "2. 停用限流自动关机"
+  echo "0. 返回"
+  read -r -e -p "请输入你的选择: " choice
+
+  case "$choice" in
+    1)
+      local rx_limit tx_limit reset_day
+      read -r -e -p "请输入进站流量阈值 GB: " rx_limit
+      read -r -e -p "请输入出站流量阈值 GB: " tx_limit
+      read -r -e -p "每月几号重置基准，回车默认 1: " reset_day
+      reset_day="${reset_day:-1}"
+      if ! printf '%s\n' "$rx_limit" | grep -Eq '^[0-9]+$' ||
+        ! printf '%s\n' "$tx_limit" | grep -Eq '^[0-9]+$' ||
+        ! printf '%s\n' "$reset_day" | grep -Eq '^[0-9]+$' ||
+        [ "$reset_day" -lt 1 ] || [ "$reset_day" -gt 31 ]; then
+        echo "阈值和日期必须是数字。"
+        return 1
+      fi
+      if confirm_danger "达到流量阈值后自动关机" "RX=${rx_limit}GB TX=${tx_limit}GB reset day=${reset_day}"; then
+        mkdir -p "$(dirname "$LIMIT_SHUTDOWN_SCRIPT")"
+        cat > "$LIMIT_SHUTDOWN_SCRIPT" <<EOF
+#!/usr/bin/env bash
+RX_LIMIT_GB=$rx_limit
+TX_LIMIT_GB=$tx_limit
+RESET_DAY=$reset_day
+STATE_FILE="/var/lib/ua-box-limit-shutdown.state"
+
+mkdir -p "\$(dirname "\$STATE_FILE")"
+today="\$(date +%d)"
+rx_now="\$(awk '\$1 ~ /^[a-zA-Z0-9_.:-]+:$/ && \$1 !~ /^lo:/ {rx += \$2} END {print rx+0}' /proc/net/dev)"
+tx_now="\$(awk '\$1 ~ /^[a-zA-Z0-9_.:-]+:$/ && \$1 !~ /^lo:/ {tx += \$10} END {print tx+0}' /proc/net/dev)"
+
+if [ ! -f "\$STATE_FILE" ] || [ "\$today" = "\$(printf "%02d" "\$RESET_DAY")" ]; then
+  printf 'RX_BASE=%s\nTX_BASE=%s\nLAST_RESET=%s\n' "\$rx_now" "\$tx_now" "\$(date +%Y-%m-%d)" > "\$STATE_FILE"
+fi
+
+. "\$STATE_FILE"
+rx_used_gb="\$(( (rx_now - RX_BASE) / 1024 / 1024 / 1024 ))"
+tx_used_gb="\$(( (tx_now - TX_BASE) / 1024 / 1024 / 1024 ))"
+
+if [ "\$rx_used_gb" -ge "\$RX_LIMIT_GB" ] || [ "\$tx_used_gb" -ge "\$TX_LIMIT_GB" ]; then
+  logger "UA Box limit shutdown: RX=\${rx_used_gb}GB TX=\${tx_used_gb}GB"
+  shutdown -h now
+fi
+EOF
+        chmod +x "$LIMIT_SHUTDOWN_SCRIPT"
+        (crontab -l 2>/dev/null | grep -vF "$LIMIT_SHUTDOWN_SCRIPT"; echo "* * * * * $LIMIT_SHUTDOWN_SCRIPT") | crontab -
+        log_action "enable limit shutdown rx=$rx_limit tx=$tx_limit reset=$reset_day"
+        echo "限流自动关机已启用。"
+      fi
+      ;;
+    2)
+      if confirm_danger "停用限流自动关机" "$LIMIT_SHUTDOWN_SCRIPT"; then
+        crontab -l 2>/dev/null | grep -vF "$LIMIT_SHUTDOWN_SCRIPT" | crontab - 2>/dev/null || true
+        rm -f "$LIMIT_SHUTDOWN_SCRIPT"
+        log_action "disable limit shutdown"
+        echo "限流自动关机已停用。"
+      fi
+      ;;
+    0) return 0 ;;
+    *) echo "无效输入" ;;
+  esac
+}
+
+system_tools_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}系统工具${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}设置脚本启动快捷键"
+    echo -e "${gl_kjlan}2.   ${gl_bai}系统更新"
+    echo -e "${gl_kjlan}3.   ${gl_bai}系统清理"
+    echo -e "${gl_kjlan}4.   ${gl_bai}安装 Python 指定版本"
+    echo -e "${gl_kjlan}5.   ${gl_bai}ROOT 密码登录模式"
+    echo -e "${gl_kjlan}6.   ${gl_bai}开放所有端口"
+    echo -e "${gl_kjlan}7.   ${gl_bai}查看端口占用状态"
+    echo -e "${gl_kjlan}8.   ${gl_bai}修改虚拟内存大小"
+    echo -e "${gl_kjlan}9.   ${gl_bai}命令行历史记录"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}10.  ${gl_bai}用户/密码生成器"
+    echo -e "${gl_kjlan}11.  ${gl_bai}一键重装系统"
+    echo -e "${gl_kjlan}12.  ${gl_bai}系统时区调整"
+    echo -e "${gl_kjlan}13.  ${gl_bai}切换系统更新源"
+    echo -e "${gl_kjlan}14.  ${gl_bai}定时任务管理"
+    echo -e "${gl_kjlan}15.  ${gl_bai}命令高级用法"
+    echo -e "${gl_kjlan}23.  ${gl_bai}限流自动关机"
+    echo -e "${gl_kjlan}99.  ${gl_bai}重启服务器"
+    echo -e "${gl_kjlan}101. ${gl_bai}卸载 UA Box 脚本"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) system_set_shortcut; pause ;;
+      2) system_update; pause ;;
+      3) system_clean; pause ;;
+      4) system_install_python_version; pause ;;
+      5) system_root_password_login; pause ;;
+      6) system_open_all_ports; pause ;;
+      7) system_port_status; pause ;;
+      8) system_set_swap; pause ;;
+      9) system_history_menu; pause ;;
+      10) system_user_password_generator; pause ;;
+      11) system_reinstall_menu; pause ;;
+      12) system_timezone_menu; pause ;;
+      13) system_change_mirror; pause ;;
+      14) system_cron_menu ;;
+      15) system_command_advanced_help; pause ;;
+      23) system_limit_shutdown_menu; pause ;;
+      99) system_reboot; pause ;;
+      101) system_uninstall_ua; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+installed_status() {
+  local cmd="$1"
+  if has_cmd "$cmd"; then
+    echo -e "${gl_lv}已安装${gl_bai}"
+  else
+    echo -e "${gl_hui}未安装${gl_bai}"
+  fi
+}
+
+ua_abnormal_summary() {
+  local found cpu_pct mem_pct disk_pct load_avg load_int cores bad_containers check_timeout failed_remotes remote rc output status svc
+
+  found=0
+  check_timeout="${RCLONE_STATUS_CHECK_TIMEOUT:-${RCLONE_CHECK_TIMEOUT:-5}}"
+
+  echo -e "${gl_kjlan}异常汇总${gl_bai}"
+
+  cpu_pct="$(cpu_usage 2>/dev/null || echo 0)"
+  mem_pct="$(free | awk '/^Mem:/ {printf "%.0f", $3*100/$2}' 2>/dev/null)"
+  disk_pct="$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}' 2>/dev/null)"
+  load_avg="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
+  cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
+
+  if printf '%s\n' "$cpu_pct" | grep -Eq '^[0-9]+$' && [ "$cpu_pct" -ge 80 ]; then
+    echo "- CPU 占用高: ${cpu_pct}%"
+    found=1
+  fi
+  if printf '%s\n' "$mem_pct" | grep -Eq '^[0-9]+$' && [ "$mem_pct" -ge 85 ]; then
+    echo "- 内存占用高: ${mem_pct}%"
+    found=1
+  fi
+  if printf '%s\n' "$disk_pct" | grep -Eq '^[0-9]+$' && [ "$disk_pct" -ge 85 ]; then
+    echo "- 根分区占用高: ${disk_pct}%"
+    found=1
+  fi
+  load_int="${load_avg%%.*}"
+  if printf '%s\n' "$load_int" | grep -Eq '^[0-9]+$' &&
+    printf '%s\n' "$cores" | grep -Eq '^[0-9]+$' &&
+    [ "$cores" -gt 0 ] && [ "$load_int" -ge "$cores" ]; then
+    echo "- 系统负载偏高: ${load_avg} / ${cores}核"
+    found=1
+  fi
+
+  if has_cmd docker; then
+    if docker info >/dev/null 2>&1; then
+      bad_containers="$(docker ps -a --format '{{.Names}}  {{.Status}}' 2>/dev/null | awk '$0 !~ / Up / {print}')"
+      if [ -n "$bad_containers" ]; then
+        echo "- Docker 异常容器:"
+        printf '%s\n' "$bad_containers" | sed 's/^/  /'
+        found=1
+      fi
+    else
+      echo "- Docker 服务未运行或不可访问"
+      found=1
+    fi
+  fi
+
+  if has_cmd systemctl; then
+    for svc in caddy nezha-agent V2bX; do
+      if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
+        ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo "- 服务未运行: $svc"
+        found=1
+      fi
+    done
+  fi
+
+  if has_cmd rclone; then
+    failed_remotes=""
+    while IFS= read -r remote; do
+      [ -z "$remote" ] && continue
+      if has_cmd timeout; then
+        output="$(timeout "$check_timeout" rclone lsd "${remote}:" 2>&1 >/dev/null)"
+        rc=$?
+        [ "$rc" -eq 124 ] && status="timeout" || status="fail"
+      else
+        output="$(rclone lsd "${remote}:" 2>&1 >/dev/null)"
+        rc=$?
+        status="fail"
+      fi
+      if [ "$rc" -ne 0 ]; then
+        failed_remotes="${failed_remotes}${remote}(${status}) "
+      fi
+    done <<EOF
+$(rclone listremotes 2>/dev/null | sed 's/:$//')
+EOF
+    if [ -n "$failed_remotes" ]; then
+      echo "- rclone remote 连接异常: $failed_remotes"
+      echo "  连接测试超时: ${check_timeout}s/remote"
+      found=1
+    fi
+  fi
+
+  [ "$found" -eq 0 ] && echo "- 暂无明显异常。"
+}
+
+ua_status() {
+  clear
+  echo -e "${gl_kjlan}UA Box 状态检查${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}版本:         ${gl_bai}${UA_BOX_VERSION}"
+  echo -e "${gl_kjlan}脚本路径:     ${gl_bai}$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  echo -e "${gl_kjlan}配置文件:     ${gl_bai}${UA_BOX_CONFIG}"
+  echo -e "${gl_kjlan}日志文件:     ${gl_bai}${UA_BOX_LOG_FILE}"
+  echo -e "${gl_kjlan}备份目录:     ${gl_bai}${UA_BOX_BACKUP_DIR}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}Docker:       ${gl_bai}$(installed_status docker)"
+  echo -n -e "${gl_kjlan}Docker服务:   ${gl_bai}"
+  docker_daemon_status
+  echo -e "${gl_kjlan}tmux:         ${gl_bai}$(installed_status tmux)"
+  echo -e "${gl_kjlan}rclone:       ${gl_bai}$(installed_status rclone)"
+  echo -e "${gl_kjlan}curl:         ${gl_bai}$(installed_status curl)"
+  echo -e "${gl_kjlan}wget:         ${gl_bai}$(installed_status wget)"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}Nezha Agent:  ${gl_bai}$(svc_status_short nezha-agent)"
+  echo -e "${gl_kjlan}V2bX:         ${gl_bai}$(svc_status_short V2bX)"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  ua_abnormal_summary
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo "最近日志:"
+  tail -n 8 "$UA_BOX_LOG_FILE" 2>/dev/null || echo "暂无日志。"
+}
+
+ua_settings_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}UA Box 设置${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}查看状态检查"
+    echo -e "${gl_kjlan}2.   ${gl_bai}编辑配置文件"
+    echo -e "${gl_kjlan}3.   ${gl_bai}查看最近日志"
+    echo -e "${gl_kjlan}4.   ${gl_bai}清空日志"
+    echo -e "${gl_kjlan}5.   ${gl_bai}备份当前脚本"
+    echo -e "${gl_kjlan}6.   ${gl_bai}查看备份列表"
+    echo -e "${gl_kjlan}7.   ${gl_bai}按配置 URL 更新脚本"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1) ua_status; pause ;;
+      2) "${EDITOR:-nano}" "$UA_BOX_CONFIG"; pause ;;
+      3) tail -n 80 "$UA_BOX_LOG_FILE" 2>/dev/null || echo "暂无日志。"; pause ;;
+      4)
+        if confirm_danger "清空 UA Box 日志" "$UA_BOX_LOG_FILE"; then
+          : > "$UA_BOX_LOG_FILE"
+          log_action "clear log"
+        fi
+        pause
+        ;;
+      5) backup_self; pause ;;
+      6) ls -lh "$UA_BOX_BACKUP_DIR" 2>/dev/null || echo "暂无备份。"; pause ;;
+      7) update_self; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+show_help() {
+  cat <<EOF
+${UA_BOX_NAME} v${UA_BOX_VERSION}
+
+用法:
+  ua                     打开交互面板
+  ua ps                  显示系统信息
+  ua sys                 打开系统工具
+  ua update-system       系统更新
+  ua clean               系统清理
+  ua tools               打开常用工具菜单
+  ua panel               打开面板工具
+  ua nezha               打开哪吒探针管理
+  ua v2bx                打开 V2bX 安装管理
+  ua docker              打开 Docker 管理
+  ua work                打开工作区模块
+  ua rclone              打开 rclone 管理
+  ua test                打开测试脚本菜单
+  ua status              显示状态检查
+  ua config              编辑配置文件
+  ua log                 查看最近日志
+  ua backup              备份当前脚本
+  ua update              按配置 URL 更新脚本
+  ua install <pkg>       安装指定软件包
+  ua remove <pkg>        卸载指定软件包
+  ua help                显示帮助
+EOF
+}
+
+main_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}"
+    echo "╦ ╦╔═╗   ╔╗ ╔═╗═╗ ╦"
+    echo "║ ║╠═╣───╠╩╗║ ║╔╩╦╝"
+    echo "╚═╝╩ ╩   ╚═╝╚═╝╩ ╚═"
+    echo -e "${UA_BOX_NAME} v${UA_BOX_VERSION}${gl_bai}"
+    echo -e "命令行输入 ${gl_huang}ua${gl_bai} 可快速启动脚本"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}系统信息显示"
+    echo -e "${gl_kjlan}2.   ${gl_bai}系统工具"
+    echo -e "${gl_kjlan}3.   ${gl_bai}常用工具安装"
+    echo -e "${gl_kjlan}4.   ${gl_bai}面板工具"
+    echo -e "${gl_kjlan}5.   ${gl_bai}V2bX 安装管理"
+    echo -e "${gl_kjlan}6.   ${gl_bai}Docker 管理"
+    echo -e "${gl_kjlan}7.   ${gl_bai}工作区模块"
+    echo -e "${gl_kjlan}8.   ${gl_bai}rclone 管理"
+    echo -e "${gl_kjlan}9.   ${gl_bai}测试脚本"
+    echo -e "${gl_kjlan}10.  ${gl_bai}UA Box 设置"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}0.   ${gl_bai}退出脚本"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1) system_info ;;
+      2) system_tools_menu ;;
+      3) common_tools_menu ;;
+      4) panel_tools_menu ;;
+      5) v2bx_menu ;;
+      6) docker_menu ;;
+      7) workspace_menu ;;
+      8) rclone_menu ;;
+      9) test_scripts_menu ;;
+      10) ua_settings_menu ;;
+      0) clear; exit 0 ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+case "${1:-}" in
+  "")
+    main_menu
+    ;;
+  ps|info|系统信息)
+    system_info
+    ;;
+  sys|system|系统工具)
+    system_tools_menu
+    ;;
+  update-system|upgrade|系统更新)
+    system_update
+    ;;
+  clean|cleanup|系统清理)
+    system_clean
+    ;;
+  tools|tool|工具)
+    common_tools_menu
+    ;;
+  panel|panels|面板|面板工具)
+    panel_tools_menu
+    ;;
+  nezha|nazha|哪吒)
+    nezha_menu
+    ;;
+  v2bx|V2bX|V2BX)
+    v2bx_menu
+    ;;
+  docker|dk|容器)
+    docker_menu
+    ;;
+  work|workspace|tmux|工作区)
+    workspace_menu
+    ;;
+  rclone|rc)
+    rclone_menu
+    ;;
+  test|bench|测试)
+    test_scripts_menu
+    ;;
+  status|状态)
+    ua_status
+    ;;
+  config|cfg|配置)
+    "${EDITOR:-nano}" "$UA_BOX_CONFIG"
+    ;;
+  log|logs|日志)
+    tail -n 80 "$UA_BOX_LOG_FILE" 2>/dev/null || echo "暂无日志。"
+    ;;
+  backup|备份)
+    backup_self
+    ;;
+  update|更新)
+    update_self
+    ;;
+  settings|setting|设置)
+    ua_settings_menu
+    ;;
+  install|add|安装)
+    shift
+    install_pkg "$@"
+    ;;
+  remove|del|uninstall|卸载)
+    shift
+    remove_pkg "$@"
+    ;;
+  help|-h|--help)
+    show_help
+    ;;
+  *)
+    show_help
+    ;;
+esac

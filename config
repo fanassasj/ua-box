@@ -1,0 +1,27 @@
+# UA Box 配置文件
+# 修改后重新运行 ua 生效。
+
+DEFAULT_WORKSPACE_PREFIX="work"
+DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
+
+NEZHA_SCRIPT_CN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh"
+NEZHA_SCRIPT_EN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install_en.sh"
+WARP_MANAGER_SCRIPT="https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh"
+V2BX_SCRIPT="https://raw.githubusercontent.com/wyx2685/V2bX-script/master/install.sh"
+V2BX_MANAGER="https://raw.githubusercontent.com/wyx2685/V2bX-script/master/V2bX.sh"
+DOCKER_INSTALL_SCRIPT="https://get.docker.com"
+DOCKER_INSTALL_SCRIPTS="https://get.docker.com https://raw.githubusercontent.com/docker/docker-install/master/install.sh https://github.com/docker/docker-install/raw/master/install.sh https://linuxmirrors.cn/docker.sh"
+RCLONE_INSTALL_SCRIPT="https://rclone.org/install.sh"
+YABS_SCRIPT="https://raw.githubusercontent.com/masonr/yet-another-bench-script/master/yabs.sh"
+BENCH_SCRIPT="https://bench.sh"
+
+UA_BOX_UPDATE_URL=""
+OPENAI_CHECK_SCRIPT="https://cdn.jsdelivr.net/gh/missuo/OpenAI-Checker/openai.sh"
+REGION_UNLOCK_SCRIPT="https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh"
+YEAHWU_UNLOCK_SCRIPT="https://github.com/yeahwu/check/raw/main/check.sh"
+MTR_TRACE_SCRIPT="https://raw.githubusercontent.com/zhucaidan/mtr_trace/main/mtr_trace.sh"
+IABC_SPEEDTEST_SCRIPT="https://raw.githubusercontent.com/i-abc/Speedtest/main/speedtest.sh"
+FUSION_TEST_SCRIPT="https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh"
+GB5_SCRIPT="https://raw.githubusercontent.com/i-abc/GB5/main/gb5-test.sh"
+REINSTALL_SCRIPT="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+LIMIT_SHUTDOWN_SCRIPT="/root/ua-box/limit-shutdown.sh"
