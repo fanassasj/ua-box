@@ -6,7 +6,19 @@ UA Box 是一个轻量 Linux 命令行运维面板，整合系统管理、Docker
 
 ## 快速安装
 
-推荐安装到 `/root/ua-box`：
+一键安装到 `/root/ua-box`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fanassasj/ua-box/main/install.sh | bash
+```
+
+如果没有 `curl`，可以使用：
+
+```bash
+wget -qO- https://raw.githubusercontent.com/fanassasj/ua-box/main/install.sh | bash
+```
+
+也可以用 Git 安装，适合需要本地修改或提交代码的场景：
 
 ```bash
 git clone https://github.com/fanassasj/ua-box.git /root/ua-box
