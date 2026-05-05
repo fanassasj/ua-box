@@ -2298,32 +2298,187 @@ system_install_python_version() {
   esac
 }
 
-system_root_password_login() {
+ssh_set_global_option() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local tmp
+
+  tmp="$(mktemp)" || return 1
+  awk -v key="$key" -v value="$value" '
+    BEGIN {
+      done = 0
+      in_match = 0
+      key_lc = tolower(key)
+    }
+    {
+      first = tolower($1)
+    }
+    first == "match" {
+      if (!done) {
+        print key " " value
+        done = 1
+      }
+      in_match = 1
+      print
+      next
+    }
+    !in_match && first == key_lc {
+      if (!done) {
+        print key " " value
+        done = 1
+      }
+      next
+    }
+    !in_match && $0 ~ "^[#[:space:]]*" key "[[:space:]]" {
+      if (!done) {
+        print key " " value
+        done = 1
+      }
+      next
+    }
+    {
+      print
+    }
+    END {
+      if (!done) {
+        print key " " value
+      }
+    }
+  ' "$file" > "$tmp" && cat "$tmp" > "$file"
+  local rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
+ssh_restart_service() {
+  svc restart ssh 2>/dev/null || svc restart sshd 2>/dev/null
+}
+
+ssh_apply_login_profile() {
+  local label="$1"
+  local root_login="$2"
+  local password_auth="$3"
+  local backup="/etc/ssh/sshd_config.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+
+  need_root || return 1
+  if [ ! -f /etc/ssh/sshd_config ]; then
+    echo "未找到 /etc/ssh/sshd_config。"
+    return 1
+  fi
+
+  cp /etc/ssh/sshd_config "$backup" || return 1
+  if ! ssh_set_global_option /etc/ssh/sshd_config PermitRootLogin "$root_login" ||
+     ! ssh_set_global_option /etc/ssh/sshd_config PasswordAuthentication "$password_auth" ||
+     ! ssh_set_global_option /etc/ssh/sshd_config PubkeyAuthentication yes; then
+    cp "$backup" /etc/ssh/sshd_config
+    echo "SSH 配置写入失败，已回滚到: $backup"
+    return 1
+  fi
+
+  if ! sshd -t; then
+    cp "$backup" /etc/ssh/sshd_config
+    echo "SSH 配置校验失败，已回滚到: $backup"
+    return 1
+  fi
+
+  if ! ssh_restart_service; then
+    cp "$backup" /etc/ssh/sshd_config
+    ssh_restart_service >/dev/null 2>&1 || true
+    echo "SSH 重启失败，已回滚到: $backup"
+    return 1
+  fi
+
+  log_action "$label"
+  echo "SSH 配置已更新并重启。备份: $backup"
+  if has_cmd sshd; then
+    echo "当前生效摘要:"
+    sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication)' || true
+  fi
+}
+
+system_enable_root_password_login() {
   need_root || return 1
 
-  echo "该功能会设置 root 密码登录，并调整 SSH 配置。"
-  if confirm_danger "开启 ROOT 密码登录模式" "/etc/ssh/sshd_config"; then
+  echo "该功能会临时开启 root 密码登录，并开启全局 SSH 密码认证。"
+  echo "建议只用于救援；确认 admin 密钥可登录后应关闭。"
+  if confirm_danger "临时开启 ROOT 密码登录" "/etc/ssh/sshd_config"; then
     passwd root || return 1
-    if [ -f /etc/ssh/sshd_config ]; then
-      cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.ua-box.$(date +%Y%m%d-%H%M%S).bak"
-      if grep -qE '^[#[:space:]]*PermitRootLogin' /etc/ssh/sshd_config; then
-        sed -i 's/^[#[:space:]]*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-      else
-        echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-      fi
-      if grep -qE '^[#[:space:]]*PasswordAuthentication' /etc/ssh/sshd_config; then
-        sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-      else
-        echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
-      fi
-      svc restart ssh 2>/dev/null || svc restart sshd 2>/dev/null || true
-      log_action "enable root password ssh login"
-      echo "ROOT 密码登录模式已开启。"
-    else
-      echo "未找到 /etc/ssh/sshd_config。"
-      return 1
-    fi
+    ssh_apply_login_profile "enable root password ssh login" yes yes
   fi
+}
+
+system_disable_root_password_login() {
+  need_root || return 1
+
+  echo "该功能会关闭 root 密码登录，并禁用全局 SSH 密码认证，保留公钥登录。"
+  if confirm_danger "关闭 ROOT 密码登录并禁用密码认证" "/etc/ssh/sshd_config"; then
+    ssh_apply_login_profile "disable root password ssh login" prohibit-password no
+  fi
+}
+
+system_check_admin_key_login() {
+  local user="${1:-admin}"
+  local home_dir
+  local key_file
+  local item
+
+  if ! getent passwd "$user" >/dev/null 2>&1; then
+    echo "用户不存在: $user"
+    return 1
+  fi
+
+  home_dir="$(getent passwd "$user" | cut -d: -f6)"
+  key_file="$home_dir/.ssh/authorized_keys"
+  echo "检查用户: $user"
+  echo "Home: $home_dir"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+
+  for item in "$home_dir" "$home_dir/.ssh" "$key_file"; do
+    if [ -e "$item" ]; then
+      stat -c '%n  %U:%G  %a' "$item"
+    else
+      echo "缺失: $item"
+    fi
+  done
+
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  if has_cmd sshd; then
+    sshd -T -C user="$user",host=localhost,addr=127.0.0.1 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|strictmodes|authorizedkeysfile)' || true
+  fi
+
+  echo ""
+  echo "建议权限:"
+  echo "  chown $user:$user $home_dir $home_dir/.ssh $key_file"
+  echo "  chmod 755 $home_dir"
+  echo "  chmod 700 $home_dir/.ssh"
+  echo "  chmod 600 $key_file"
+}
+
+system_ssh_login_security_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}SSH 登录安全${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo "1. 临时开启 ROOT 密码登录"
+    echo "2. 关闭 ROOT 密码登录并禁用密码认证"
+    echo "3. 检查 admin 密钥登录权限"
+    echo "0. 返回"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) system_enable_root_password_login; pause ;;
+      2) system_disable_root_password_login; pause ;;
+      3) system_check_admin_key_login admin; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+system_root_password_login() {
+  system_enable_root_password_login
 }
 
 system_reinstall_menu() {
@@ -2407,6 +2562,7 @@ system_open_all_ports() {
 system_user_password_generator() {
   local username password length
 
+  echo "仅生成随机账号密码文本，不创建系统用户，也不设置系统密码。"
   read -r -e -p "请输入用户名，回车自动生成: " username
   read -r -e -p "请输入密码长度，回车默认 20: " length
   length="${length:-20}"
@@ -2739,13 +2895,13 @@ system_tools_menu() {
     echo -e "${gl_kjlan}2.   ${gl_bai}系统更新"
     echo -e "${gl_kjlan}3.   ${gl_bai}系统清理"
     echo -e "${gl_kjlan}4.   ${gl_bai}安装 Python 指定版本"
-    echo -e "${gl_kjlan}5.   ${gl_bai}ROOT 密码登录模式"
+    echo -e "${gl_kjlan}5.   ${gl_bai}SSH 登录安全"
     echo -e "${gl_kjlan}6.   ${gl_bai}开放所有端口"
     echo -e "${gl_kjlan}7.   ${gl_bai}查看端口占用状态"
     echo -e "${gl_kjlan}8.   ${gl_bai}修改虚拟内存大小"
     echo -e "${gl_kjlan}9.   ${gl_bai}命令行历史记录"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}10.  ${gl_bai}用户/密码生成器"
+    echo -e "${gl_kjlan}10.  ${gl_bai}随机账号密码生成器"
     echo -e "${gl_kjlan}11.  ${gl_bai}一键重装系统"
     echo -e "${gl_kjlan}12.  ${gl_bai}系统时区调整"
     echo -e "${gl_kjlan}13.  ${gl_bai}切换系统更新源"
@@ -2763,7 +2919,7 @@ system_tools_menu() {
       2) system_update; pause ;;
       3) system_clean; pause ;;
       4) system_install_python_version; pause ;;
-      5) system_root_password_login; pause ;;
+      5) system_ssh_login_security_menu ;;
       6) system_open_all_ports; pause ;;
       7) system_port_status; pause ;;
       8) system_set_swap; pause ;;
@@ -2950,6 +3106,10 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua                     打开交互面板
   ua ps                  显示系统信息
   ua sys                 打开系统工具
+  ua ssh                 打开 SSH 登录安全菜单
+  ua disable-root-pass   关闭 root 密码登录并禁用密码认证
+  ua enable-root-pass    临时开启 root 密码登录
+  ua check-admin-key     检查 admin 密钥登录权限
   ua update-system       系统更新
   ua clean               系统清理
   ua tools               打开常用工具菜单
@@ -3022,6 +3182,18 @@ case "${1:-}" in
     ;;
   sys|system|系统工具)
     system_tools_menu
+    ;;
+  ssh|ssh-security|ssh安全)
+    system_ssh_login_security_menu
+    ;;
+  enable-root-pass|root-pass-on)
+    system_enable_root_password_login
+    ;;
+  disable-root-pass|root-pass-off)
+    system_disable_root_password_login
+    ;;
+  check-admin-key)
+    system_check_admin_key_login admin
     ;;
   update-system|upgrade|系统更新)
     system_update
