@@ -2411,9 +2411,18 @@ system_enable_root_password_login() {
 system_disable_root_password_login() {
   need_root || return 1
 
-  echo "该功能会关闭 root 密码登录，并禁用全局 SSH 密码认证，保留公钥登录。"
-  if confirm_danger "关闭 ROOT 密码登录并禁用密码认证" "/etc/ssh/sshd_config"; then
-    ssh_apply_login_profile "disable root password ssh login" prohibit-password no
+  echo "该功能会关闭 root 密码登录，保留普通用户 SSH 密码登录，并保留公钥登录。"
+  if confirm_danger "关闭 ROOT 密码登录，保留普通用户密码登录" "/etc/ssh/sshd_config"; then
+    ssh_apply_login_profile "disable root password ssh login" prohibit-password yes
+  fi
+}
+
+system_disable_all_password_login() {
+  need_root || return 1
+
+  echo "该功能会关闭 root 密码登录，并禁用所有用户的 SSH 密码认证，保留公钥登录。"
+  if confirm_danger "关闭 ROOT 密码登录并禁用所有密码认证" "/etc/ssh/sshd_config"; then
+    ssh_apply_login_profile "disable all ssh password login" prohibit-password no
   fi
 }
 
@@ -2461,8 +2470,9 @@ system_ssh_login_security_menu() {
     echo -e "${gl_kjlan}SSH 登录安全${gl_bai}"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo "1. 临时开启 ROOT 密码登录"
-    echo "2. 关闭 ROOT 密码登录并禁用密码认证"
+    echo "2. 关闭 ROOT 密码登录，保留普通用户密码登录"
     echo "3. 检查 admin 密钥登录权限"
+    echo "4. 关闭 ROOT 密码登录并禁用所有密码认证"
     echo "0. 返回"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
@@ -2471,6 +2481,7 @@ system_ssh_login_security_menu() {
       1) system_enable_root_password_login; pause ;;
       2) system_disable_root_password_login; pause ;;
       3) system_check_admin_key_login admin; pause ;;
+      4) system_disable_all_password_login; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -3107,7 +3118,8 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua ps                  显示系统信息
   ua sys                 打开系统工具
   ua ssh                 打开 SSH 登录安全菜单
-  ua disable-root-pass   关闭 root 密码登录并禁用密码认证
+  ua disable-root-pass   关闭 root 密码登录，保留普通用户密码登录
+  ua disable-password    禁用所有 SSH 密码认证
   ua enable-root-pass    临时开启 root 密码登录
   ua check-admin-key     检查 admin 密钥登录权限
   ua update-system       系统更新
@@ -3191,6 +3203,9 @@ case "${1:-}" in
     ;;
   disable-root-pass|root-pass-off)
     system_disable_root_password_login
+    ;;
+  disable-password|password-off|disable-password-auth)
+    system_disable_all_password_login
     ;;
   check-admin-key)
     system_check_admin_key_login admin
