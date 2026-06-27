@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-UA_BOX_VERSION="0.4.0"
+UA_BOX_VERSION="0.5.0"
 UA_BOX_NAME="UA Box"
 UA_BOX_HOME="${UA_BOX_HOME:-/root/ua-box}"
 UA_BOX_CONFIG="${UA_BOX_CONFIG:-$UA_BOX_HOME/config}"
@@ -39,6 +39,11 @@ LIMIT_SHUTDOWN_SCRIPT="/root/ua-box/limit-shutdown.sh"
 DEFAULT_WORKSPACE_PREFIX="work"
 DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
 UA_BOX_UPDATE_URL=""
+UA_IGNORE_CONTAINERS=""
+UA_IGNORE_SERVICES=""
+UA_IGNORE_RCLONE_REMOTES=""
+UA_STATUS_DISK_WARN=80
+UA_STATUS_DISK_CRIT=90
 
 init_ua_box() {
   mkdir -p "$UA_BOX_HOME" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR"
@@ -50,6 +55,11 @@ init_ua_box() {
 DEFAULT_WORKSPACE_PREFIX="work"
 DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
 UA_BOX_UPDATE_URL=""
+UA_IGNORE_CONTAINERS=""
+UA_IGNORE_SERVICES=""
+UA_IGNORE_RCLONE_REMOTES=""
+UA_STATUS_DISK_WARN=80
+UA_STATUS_DISK_CRIT=90
 
 NEZHA_SCRIPT_CN="$NEZHA_SCRIPT_CN"
 NEZHA_SCRIPT_EN="$NEZHA_SCRIPT_EN"
@@ -114,8 +124,12 @@ update_self() {
   local tmp
 
   if [ -z "$UA_BOX_UPDATE_URL" ]; then
-    echo "未配置 UA_BOX_UPDATE_URL。"
-    echo "可运行 ua config，在配置文件里设置你的脚本更新地址后再执行 ua update。"
+    echo -e "${gl_hong}未配置 UA_BOX_UPDATE_URL。${gl_bai}"
+    echo ""
+    echo "推荐设置（GitHub 官方源）:"
+    echo "  UA_BOX_UPDATE_URL=\"https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-box\""
+    echo ""
+    echo "请运行 ${gl_huang}ua config${gl_bai} 将上面的地址写入配置文件，然后重新执行 ua update。"
     return 1
   fi
 
@@ -154,6 +168,70 @@ need_root() {
 
 has_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+list_has_word() {
+  local needle="$1"
+  local list="$2"
+  local item
+
+  # shellcheck disable=SC2086
+  for item in $list; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+list_add_words() {
+  local list="$1"
+  shift
+
+  local item
+  for item in "$@"; do
+    [ -z "$item" ] && continue
+    list_has_word "$item" "$list" || list="${list:+$list }$item"
+  done
+  printf '%s\n' "$list"
+}
+
+list_remove_words() {
+  local list="$1"
+  shift
+
+  local result item remove word
+  result=""
+  # shellcheck disable=SC2086
+  for item in $list; do
+    remove=0
+    for word in "$@"; do
+      [ "$item" = "$word" ] && remove=1
+    done
+    [ "$remove" -eq 0 ] && result="${result:+$result }$item"
+  done
+  printf '%s\n' "$result"
+}
+
+config_set_var() {
+  local var="$1"
+  local value="$2"
+  local tmp escaped
+
+  escaped="$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  tmp="/tmp/ua-box-config.$$"
+  awk -v var="$var" -v value="$escaped" '
+    BEGIN { found=0 }
+    $0 ~ "^" var "=" {
+      print var "=\"" value "\"";
+      found=1;
+      next;
+    }
+    { print }
+    END {
+      if (!found) print var "=\"" value "\"";
+    }
+  ' "$UA_BOX_CONFIG" > "$tmp" && mv "$tmp" "$UA_BOX_CONFIG"
+  # shellcheck disable=SC1090
+  . "$UA_BOX_CONFIG"
 }
 
 pkg_manager() {
@@ -2897,6 +2975,432 @@ EOF
   esac
 }
 
+system_set_hostname() {
+  local current_hostname new_hostname
+  current_hostname="$(hostname)"
+  echo -e "当前 hostname: ${gl_lv}${current_hostname}${gl_bai}"
+  read -r -e -p "请输入新的 hostname（直接回车取消）: " new_hostname
+  [ -z "$new_hostname" ] && echo "已取消。" && return 0
+
+  # 基础合法性检查：只允许字母、数字、连字符，不能以连字符结尾
+  if ! printf '%s' "$new_hostname" | grep -Eq '^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$' || \
+       printf '%s' "$new_hostname" | grep -Eq '\-$'; then
+    echo -e "${gl_hong}错误:${gl_bai} hostname 只能包含字母、数字、连字符，且不能以连字符结尾。"
+    return 1
+  fi
+
+  if has_cmd hostnamectl; then
+    hostnamectl set-hostname "$new_hostname"
+  else
+    hostname "$new_hostname"
+    printf '%s\n' "$new_hostname" > /etc/hostname
+  fi
+
+  # 同步 /etc/hosts 中的旧 hostname 映射
+  if grep -q "$current_hostname" /etc/hosts 2>/dev/null; then
+    sed -i "s/\b${current_hostname}\b/${new_hostname}/g" /etc/hosts
+    echo "已同步更新 /etc/hosts。"
+  fi
+
+  log_action "set hostname: $current_hostname -> $new_hostname"
+  echo -e "hostname 已修改为: ${gl_lv}${new_hostname}${gl_bai}"
+  echo -e "${gl_huang}提示:${gl_bai} 新 hostname 对当前 shell 的提示符立即生效，重新登录后完全生效。"
+}
+
+# ── 一键初始化优化 ──────────────────────────────────────────
+system_init_optimize() {
+  need_root || return 1
+
+  local mem_mb swap_mb
+  local do_hostname=n new_hostname="" current_hostname
+  local step_ok="${gl_lv}✓${gl_bai}"
+  local step_skip="${gl_huang}–${gl_bai}"
+  local step_fail="${gl_hong}✗${gl_bai}"
+
+  # ── 采集当前内存，计算 2× swap ──────────────────────────
+  mem_mb="$(free -m | awk '/^Mem:/ {print $2}')"
+  if ! printf '%s' "$mem_mb" | grep -Eq '^[0-9]+$' || [ "$mem_mb" -lt 64 ]; then
+    mem_mb=1024
+  fi
+  swap_mb=$(( mem_mb * 2 ))
+
+  # ── 要安装的工具包 ───────────────────────────────────────
+  local INIT_TOOLS="curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lsof net-tools ca-certificates"
+
+  current_hostname="$(hostname)"
+
+  # ── 打印计划 ────────────────────────────────────────────
+  clear
+  echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+  echo -e "${gl_kjlan}  初始服务器一键优化${gl_bai}"
+  echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+  echo -e "  将按顺序执行以下步骤："
+  echo -e "  ${gl_kjlan}[1]${gl_bai} 系统更新"
+  echo -e "  ${gl_kjlan}[2]${gl_bai} 安装常用工具"
+  echo -e "        $INIT_TOOLS"
+  echo -e "  ${gl_kjlan}[3]${gl_bai} 设置 Swap 为内存的 2 倍 (${swap_mb}MB，当前内存 ${mem_mb}MB)"
+  echo -e "  ${gl_kjlan}[4]${gl_bai} 安装 Docker"
+  echo -e "  ${gl_kjlan}[5]${gl_bai} 修改 hostname（可选，默认跳过）"
+  echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+
+  # ── 询问是否修改 hostname ────────────────────────────────
+  echo -e "当前 hostname: ${gl_lv}${current_hostname}${gl_bai}"
+  read -r -e -p "是否修改 hostname？[y/N]: " do_hostname
+  do_hostname="${do_hostname:-n}"
+
+  if [ "$do_hostname" = "y" ] || [ "$do_hostname" = "Y" ]; then
+    while true; do
+      read -r -e -p "请输入新的 hostname（直接回车取消修改）: " new_hostname
+      if [ -z "$new_hostname" ]; then
+        do_hostname=n
+        echo "已跳过修改 hostname。"
+        break
+      elif printf '%s' "$new_hostname" | grep -Eq '^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$' && \
+           printf '%s' "$new_hostname" | grep -Eq '[a-zA-Z0-9]$'; then
+        break
+      else
+        echo -e "${gl_hong}hostname 格式不合法${gl_bai}，只能包含字母、数字、连字符，且不能以连字符结尾，请重新输入。"
+      fi
+    done
+  fi
+
+  echo ""
+  read -r -e -p "确认开始优化？[Y/n]: " confirm_start
+  confirm_start="${confirm_start:-y}"
+  if [ "$confirm_start" = "n" ] || [ "$confirm_start" = "N" ]; then
+    echo "已取消。"
+    return 0
+  fi
+
+  echo ""
+  echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+
+  # ── 结果追踪 ────────────────────────────────────────────
+  local r_update=0 r_tools=0 r_swap=0 r_docker=0 r_hostname=0
+  local tools_failed="" tools_ok=""
+
+  # ── [1] 系统更新 ─────────────────────────────────────────
+  echo -e "\n${gl_kjlan}[1/5] 系统更新...${gl_bai}"
+  if system_update; then
+    r_update=1
+    echo -e "$step_ok 系统更新完成"
+  else
+    echo -e "$step_fail 系统更新失败"
+  fi
+
+  # ── [2] 安装常用工具 ─────────────────────────────────────
+  echo -e "\n${gl_kjlan}[2/5] 安装常用工具...${gl_bai}"
+  local pm tool_pkg _batch_ok
+  pm="$(pkg_manager)"
+
+  # 先整体批量安装，减少 apt lock 次数
+  echo "  批量安装中..."
+  case "$pm" in
+    # shellcheck disable=SC2086
+    apt)    apt install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
+    dnf)    dnf install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
+    yum)    yum install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
+    apk)    apk add $INIT_TOOLS > /dev/null 2>&1       ; _batch_ok=$? ;;
+    pacman) pacman -S --noconfirm $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
+    zypper) zypper install -y $INIT_TOOLS > /dev/null 2>&1     ; _batch_ok=$? ;;
+    *)      _batch_ok=1 ;;
+  esac
+
+  # 逐包校验，失败的单独重试一次，统计结果
+  for tool_pkg in $INIT_TOOLS; do
+    if has_cmd "$tool_pkg" || [ "$_batch_ok" -eq 0 ]; then
+      tools_ok="$tools_ok $tool_pkg"
+    else
+      # 单独重试
+      local _retry_ok=0
+      case "$pm" in
+        apt)    apt install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+        dnf)    dnf install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+        yum)    yum install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+        apk)    apk add "$tool_pkg" > /dev/null 2>&1        && _retry_ok=1 ;;
+        pacman) pacman -S --noconfirm "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+        zypper) zypper install -y "$tool_pkg" > /dev/null 2>&1     && _retry_ok=1 ;;
+      esac
+      if has_cmd "$tool_pkg" || [ "$_retry_ok" -eq 1 ]; then
+        tools_ok="$tools_ok $tool_pkg"
+      else
+        tools_failed="$tools_failed $tool_pkg"
+      fi
+    fi
+  done
+
+  if [ -z "$tools_failed" ]; then
+    r_tools=1
+  fi
+  log_action "init_optimize install tools: ok=[$tools_ok] fail=[$tools_failed]"
+
+  # ── [3] 设置 Swap ────────────────────────────────────────
+  echo -e "\n${gl_kjlan}[3/5] 设置 Swap 为 ${swap_mb}MB...${gl_bai}"
+  local swap_result=0
+  (
+    swapoff /swapfile 2>/dev/null || true
+    sed -i '\|/swapfile swap swap|d' /etc/fstab 2>/dev/null || true
+    rm -f /swapfile
+    if has_cmd fallocate; then
+      fallocate -l "${swap_mb}M" /swapfile 2>/dev/null || \
+        dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
+    else
+      dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile > /dev/null
+    swapon /swapfile
+    grep -q '/swapfile swap swap' /etc/fstab || \
+      echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+  ) && swap_result=1
+  if [ "$swap_result" -eq 1 ]; then
+    r_swap=1
+    log_action "init_optimize swap ${swap_mb}MB"
+    echo -e "$step_ok Swap 已设置为 ${swap_mb}MB"
+  else
+    echo -e "$step_fail Swap 设置失败"
+  fi
+
+  # ── [4] 安装 Docker ──────────────────────────────────────
+  echo -e "\n${gl_kjlan}[4/5] 安装 Docker...${gl_bai}"
+  if install_docker; then
+    r_docker=1
+  fi
+
+  # ── [5] 修改 hostname ────────────────────────────────────
+  echo -e "\n${gl_kjlan}[5/5] 修改 hostname...${gl_bai}"
+  if [ "$do_hostname" = "y" ] || [ "$do_hostname" = "Y" ]; then
+    if has_cmd hostnamectl; then
+      hostnamectl set-hostname "$new_hostname"
+    else
+      hostname "$new_hostname"
+      printf '%s\n' "$new_hostname" > /etc/hostname
+    fi
+    if grep -q "$current_hostname" /etc/hosts 2>/dev/null; then
+      sed -i "s/\b${current_hostname}\b/${new_hostname}/g" /etc/hosts
+    fi
+    log_action "init_optimize hostname: $current_hostname -> $new_hostname"
+    r_hostname=1
+    echo -e "$step_ok hostname 已修改为 ${gl_lv}${new_hostname}${gl_bai}"
+  else
+    echo -e "$step_skip hostname 已跳过（保持 ${current_hostname}）"
+  fi
+
+  # ── 汇总报告 ─────────────────────────────────────────────
+  echo ""
+  echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+  echo -e "${gl_kjlan}  优化结果汇总${gl_bai}"
+  echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+
+  # 系统更新
+  [ "$r_update" -eq 1 ] && echo -e "  $step_ok 系统更新" || echo -e "  $step_fail 系统更新"
+
+  # 工具安装
+  if [ "$r_tools" -eq 1 ]; then
+    echo -e "  $step_ok 常用工具安装"
+  else
+    echo -e "  $step_fail 常用工具（以下包安装失败）:${gl_hong}$tools_failed${gl_bai}"
+  fi
+  if [ -n "$tools_ok" ]; then
+    echo -e "        已安装:${gl_lv}$tools_ok${gl_bai}"
+  fi
+
+  # Swap
+  if [ "$r_swap" -eq 1 ]; then
+    local cur_swap
+    cur_swap="$(free -m | awk '/^Swap:/ {print $2}')MB"
+    echo -e "  $step_ok Swap 设置为 ${swap_mb}MB（当前: $cur_swap）"
+  else
+    echo -e "  $step_fail Swap 设置"
+  fi
+
+  # Docker
+  if [ "$r_docker" -eq 1 ]; then
+    echo -e "  $step_ok Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
+  else
+    echo -e "  $step_fail Docker 安装"
+  fi
+
+  # hostname
+  if [ "$do_hostname" = "y" ] || [ "$do_hostname" = "Y" ]; then
+    [ "$r_hostname" -eq 1 ] \
+      && echo -e "  $step_ok hostname → ${gl_lv}${new_hostname}${gl_bai}" \
+      || echo -e "  $step_fail hostname 修改"
+  else
+    echo -e "  $step_skip hostname 未修改（${current_hostname}）"
+  fi
+
+  echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+  log_action "init_optimize done"
+}
+# ── /一键初始化优化 ──────────────────────────────────────────
+
+# ── BBR + 防火墙管理 ─────────────────────────────────────────
+system_bbr_menu() {
+  local cur_cc cur_qdisc
+  cur_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
+  cur_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '未知')"
+
+  clear
+  echo -e "${gl_kjlan}BBR 拥塞控制${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "当前拥塞控制: ${gl_lv}${cur_cc}${gl_bai}"
+  echo -e "当前队列算法: ${gl_lv}${cur_qdisc}${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}1.   ${gl_bai}开启 BBR"
+  echo -e "${gl_kjlan}2.   ${gl_bai}关闭 BBR（恢复 cubic）"
+  echo -e "${gl_kjlan}0.   ${gl_bai}返回"
+  read -r -e -p "请输入你的选择: " choice
+
+  case "$choice" in
+    1)
+      need_root || return 1
+      # 内核版本需 >= 4.9
+      local kver major minor
+      kver="$(uname -r)"
+      major="$(printf '%s' "$kver" | cut -d. -f1)"
+      minor="$(printf '%s' "$kver" | cut -d. -f2)"
+      if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+        echo -e "${gl_hong}当前内核 $kver 不支持 BBR（需要 >= 4.9）${gl_bai}"
+        return 1
+      fi
+      # 加载模块
+      modprobe tcp_bbr 2>/dev/null || true
+      # 写入 sysctl
+      local sysctl_conf="/etc/sysctl.d/99-ua-bbr.conf"
+      cat > "$sysctl_conf" <<'SYSCTL'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+SYSCTL
+      sysctl -p "$sysctl_conf" > /dev/null 2>&1 || sysctl --system > /dev/null 2>&1 || true
+      local now_cc
+      now_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+      if [ "$now_cc" = "bbr" ]; then
+        log_action "BBR enabled"
+        echo -e "${gl_lv}BBR 已成功开启！${gl_bai}"
+      else
+        echo -e "${gl_hong}BBR 开启失败，当前: $now_cc${gl_bai}"
+      fi
+      ;;
+    2)
+      need_root || return 1
+      rm -f /etc/sysctl.d/99-ua-bbr.conf
+      sysctl -w net.ipv4.tcp_congestion_control=cubic > /dev/null 2>&1 || true
+      sysctl -w net.core.default_qdisc=pfifo_fast > /dev/null 2>&1 || true
+      log_action "BBR disabled, restored cubic"
+      echo -e "${gl_lv}已恢复 cubic 拥塞控制。${gl_bai}"
+      ;;
+    0) return 0 ;;
+    *) echo "无效输入" ;;
+  esac
+}
+
+system_firewall_menu() {
+  local fw
+  if has_cmd ufw; then
+    fw=ufw
+  elif has_cmd firewall-cmd; then
+    fw=firewalld
+  elif has_cmd iptables; then
+    fw=iptables
+  else
+    fw=none
+  fi
+
+  clear
+  echo -e "${gl_kjlan}防火墙管理${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "检测到防火墙工具: ${gl_lv}${fw}${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+
+  case "$fw" in
+    ufw)
+      echo -e "当前状态: $(ufw status | head -n1)"
+      echo ""
+      echo -e "${gl_kjlan}1.  ${gl_bai}查看规则"
+      echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
+      echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
+      echo -e "${gl_kjlan}4.  ${gl_bai}删除规则"
+      echo -e "${gl_kjlan}5.  ${gl_bai}启用防火墙"
+      echo -e "${gl_kjlan}6.  ${gl_bai}禁用防火墙"
+      echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+      read -r -e -p "请输入你的选择: " choice
+      case "$choice" in
+        1) ufw status numbered ;;
+        2)
+          read -r -e -p "请输入要放行的 TCP 端口（如 8080 或 8080:8090）: " port
+          [ -n "$port" ] && ufw allow "${port}/tcp" && log_action "ufw allow ${port}/tcp"
+          ;;
+        3)
+          read -r -e -p "请输入要放行的 UDP 端口（如 51820）: " port
+          [ -n "$port" ] && ufw allow "${port}/udp" && log_action "ufw allow ${port}/udp"
+          ;;
+        4)
+          ufw status numbered
+          read -r -e -p "请输入要删除的规则编号: " num
+          [ -n "$num" ] && ufw delete "$num"
+          ;;
+        5) need_root && ufw --force enable && log_action "ufw enabled" ;;
+        6) need_root && ufw disable && log_action "ufw disabled" ;;
+        0) return 0 ;;
+        *) echo "无效输入" ;;
+      esac
+      ;;
+    firewalld)
+      echo -e "当前状态: $(firewall-cmd --state 2>/dev/null)"
+      echo ""
+      echo -e "${gl_kjlan}1.  ${gl_bai}查看开放端口"
+      echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
+      echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
+      echo -e "${gl_kjlan}4.  ${gl_bai}移除端口规则"
+      echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+      read -r -e -p "请输入你的选择: " choice
+      case "$choice" in
+        1) firewall-cmd --list-ports ;;
+        2)
+          read -r -e -p "请输入要放行的 TCP 端口: " port
+          [ -n "$port" ] && firewall-cmd --permanent --add-port="${port}/tcp" && firewall-cmd --reload && log_action "firewalld add ${port}/tcp"
+          ;;
+        3)
+          read -r -e -p "请输入要放行的 UDP 端口: " port
+          [ -n "$port" ] && firewall-cmd --permanent --add-port="${port}/udp" && firewall-cmd --reload && log_action "firewalld add ${port}/udp"
+          ;;
+        4)
+          read -r -e -p "请输入要移除的端口（格式如 8080/tcp）: " portproto
+          [ -n "$portproto" ] && firewall-cmd --permanent --remove-port="$portproto" && firewall-cmd --reload
+          ;;
+        0) return 0 ;;
+        *) echo "无效输入" ;;
+      esac
+      ;;
+    iptables)
+      echo -e "${gl_kjlan}1.  ${gl_bai}查看当前规则（INPUT 链）"
+      echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
+      echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
+      echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+      read -r -e -p "请输入你的选择: " choice
+      case "$choice" in
+        1) iptables -L INPUT -n --line-numbers ;;
+        2)
+          read -r -e -p "请输入要放行的 TCP 端口: " port
+          [ -n "$port" ] && iptables -I INPUT -p tcp --dport "$port" -j ACCEPT && log_action "iptables allow ${port}/tcp"
+          ;;
+        3)
+          read -r -e -p "请输入要放行的 UDP 端口: " port
+          [ -n "$port" ] && iptables -I INPUT -p udp --dport "$port" -j ACCEPT && log_action "iptables allow ${port}/udp"
+          ;;
+        0) return 0 ;;
+        *) echo "无效输入" ;;
+      esac
+      ;;
+    none)
+      echo -e "${gl_huang}未检测到 ufw / firewalld / iptables，无法管理防火墙。${gl_bai}"
+      echo "可先安装 ufw：ua install ufw"
+      ;;
+  esac
+}
+# ── /BBR + 防火墙管理 ────────────────────────────────────────
+
 system_tools_menu() {
   while true; do
     clear
@@ -2918,6 +3422,10 @@ system_tools_menu() {
     echo -e "${gl_kjlan}13.  ${gl_bai}切换系统更新源"
     echo -e "${gl_kjlan}14.  ${gl_bai}定时任务管理"
     echo -e "${gl_kjlan}15.  ${gl_bai}命令高级用法"
+    echo -e "${gl_kjlan}16.  ${gl_bai}修改 hostname"
+    echo -e "${gl_kjlan}17.  ${gl_bai}一键初始化优化"
+    echo -e "${gl_kjlan}18.  ${gl_bai}BBR 拥塞控制"
+    echo -e "${gl_kjlan}19.  ${gl_bai}防火墙管理"
     echo -e "${gl_kjlan}23.  ${gl_bai}限流自动关机"
     echo -e "${gl_kjlan}99.  ${gl_bai}重启服务器"
     echo -e "${gl_kjlan}101. ${gl_bai}卸载 UA Box 脚本"
@@ -2941,6 +3449,10 @@ system_tools_menu() {
       13) system_change_mirror; pause ;;
       14) system_cron_menu ;;
       15) system_command_advanced_help; pause ;;
+      16) system_set_hostname; pause ;;
+      17) system_init_optimize; pause ;;
+      18) system_bbr_menu; pause ;;
+      19) system_firewall_menu; pause ;;
       23) system_limit_shutdown_menu; pause ;;
       99) system_reboot; pause ;;
       101) system_uninstall_ua; pause ;;
@@ -2959,11 +3471,67 @@ installed_status() {
   fi
 }
 
+collect_bad_containers() {
+  local container_name container_status
+
+  has_cmd docker || return 0
+  docker info >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r container_name container_status; do
+    [ -z "$container_name" ] && continue
+    list_has_word "$container_name" "$UA_IGNORE_CONTAINERS" && continue
+    case "$container_status" in
+      Up*) ;;
+      *) printf '%s\n' "$container_name" ;;
+    esac
+  done <<EOF
+$(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
+EOF
+}
+
+collect_inactive_services() {
+  local svc
+
+  has_cmd systemctl || return 0
+  for svc in caddy nezha-agent V2bX; do
+    list_has_word "$svc" "$UA_IGNORE_SERVICES" && continue
+    if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
+      ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+      printf '%s\n' "$svc"
+    fi
+  done
+}
+
+collect_failed_rclone_remotes() {
+  local check_timeout remote rc
+
+  has_cmd rclone || return 0
+  check_timeout="${RCLONE_STATUS_CHECK_TIMEOUT:-${RCLONE_CHECK_TIMEOUT:-5}}"
+  while IFS= read -r remote; do
+    [ -z "$remote" ] && continue
+    list_has_word "$remote" "$UA_IGNORE_RCLONE_REMOTES" && continue
+    if has_cmd timeout; then
+      timeout "$check_timeout" rclone lsd "${remote}:" >/dev/null 2>&1
+      rc=$?
+    else
+      rclone lsd "${remote}:" >/dev/null 2>&1
+      rc=$?
+    fi
+    [ "$rc" -ne 0 ] && printf '%s\n' "$remote"
+  done <<EOF
+$(rclone listremotes 2>/dev/null | sed 's/:$//')
+EOF
+}
+
 ua_abnormal_summary() {
-  local found cpu_pct mem_pct disk_pct load_avg load_int cores bad_containers check_timeout failed_remotes remote rc output status svc
+  local found cpu_pct mem_pct disk_pct disk_warn disk_crit load_avg load_int cores bad_containers check_timeout failed_remotes remote rc output status svc
+  local container_name container_status
 
   found=0
   check_timeout="${RCLONE_STATUS_CHECK_TIMEOUT:-${RCLONE_CHECK_TIMEOUT:-5}}"
+  disk_warn="${UA_STATUS_DISK_WARN:-80}"
+  disk_crit="${UA_STATUS_DISK_CRIT:-90}"
+  printf '%s\n' "$disk_warn" | grep -Eq '^[0-9]+$' || disk_warn=80
+  printf '%s\n' "$disk_crit" | grep -Eq '^[0-9]+$' || disk_crit=90
 
   echo -e "${gl_kjlan}异常汇总${gl_bai}"
 
@@ -2975,14 +3543,21 @@ ua_abnormal_summary() {
 
   if printf '%s\n' "$cpu_pct" | grep -Eq '^[0-9]+$' && [ "$cpu_pct" -ge 80 ]; then
     echo "- CPU 占用高: ${cpu_pct}%"
+    echo "  建议: 使用 top/htop 查看高占用进程，必要时重启异常服务。"
     found=1
   fi
   if printf '%s\n' "$mem_pct" | grep -Eq '^[0-9]+$' && [ "$mem_pct" -ge 85 ]; then
     echo "- 内存占用高: ${mem_pct}%"
+    echo "  建议: 使用 free -h 和 docker stats 排查占用，必要时增加 swap 或限制容器内存。"
     found=1
   fi
-  if printf '%s\n' "$disk_pct" | grep -Eq '^[0-9]+$' && [ "$disk_pct" -ge 85 ]; then
-    echo "- 根分区占用高: ${disk_pct}%"
+  if printf '%s\n' "$disk_pct" | grep -Eq '^[0-9]+$' && [ "$disk_pct" -ge "$disk_crit" ]; then
+    echo "- 根分区占用严重: ${disk_pct}% >= ${disk_crit}%"
+    echo "  建议: 立即清理日志、缓存、旧备份或 Docker 无用数据。"
+    found=1
+  elif printf '%s\n' "$disk_pct" | grep -Eq '^[0-9]+$' && [ "$disk_pct" -ge "$disk_warn" ]; then
+    echo "- 根分区占用偏高: ${disk_pct}% >= ${disk_warn}%"
+    echo "  建议: 使用 ncdu/du 定位大目录，并关注日志和备份增长。"
     found=1
   fi
   load_int="${load_avg%%.*}"
@@ -2990,28 +3565,44 @@ ua_abnormal_summary() {
     printf '%s\n' "$cores" | grep -Eq '^[0-9]+$' &&
     [ "$cores" -gt 0 ] && [ "$load_int" -ge "$cores" ]; then
     echo "- 系统负载偏高: ${load_avg} / ${cores}核"
+    echo "  建议: 使用 uptime/top 查看负载来源，重点检查 CPU、磁盘 IO 和网络任务。"
     found=1
   fi
 
   if has_cmd docker; then
     if docker info >/dev/null 2>&1; then
-      bad_containers="$(docker ps -a --format '{{.Names}}  {{.Status}}' 2>/dev/null | awk '$0 !~ / Up / {print}')"
+      bad_containers=""
+      while IFS=$'\t' read -r container_name container_status; do
+        [ -z "$container_name" ] && continue
+        list_has_word "$container_name" "$UA_IGNORE_CONTAINERS" && continue
+        case "$container_status" in
+          Up*) ;;
+          *) bad_containers="${bad_containers}${container_name}  ${container_status}
+" ;;
+        esac
+      done <<EOF
+$(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
+EOF
       if [ -n "$bad_containers" ]; then
         echo "- Docker 异常容器:"
-        printf '%s\n' "$bad_containers" | sed 's/^/  /'
+        printf '%s' "$bad_containers" | sed 's/^/  /'
+        echo "  建议: 不再使用可执行 ua ignore container <名称>；仍需使用先查看日志再重启。"
         found=1
       fi
     else
       echo "- Docker 服务未运行或不可访问"
+      echo "  建议: 使用 systemctl status docker 查看原因，必要时执行 systemctl restart docker。"
       found=1
     fi
   fi
 
   if has_cmd systemctl; then
     for svc in caddy nezha-agent V2bX; do
+      list_has_word "$svc" "$UA_IGNORE_SERVICES" && continue
       if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
         ! systemctl is-active --quiet "$svc" 2>/dev/null; then
         echo "- 服务未运行: $svc"
+        echo "  建议: 需要该服务时执行 systemctl start $svc；不再使用可执行 ua ignore service $svc。"
         found=1
       fi
     done
@@ -3021,6 +3612,7 @@ ua_abnormal_summary() {
     failed_remotes=""
     while IFS= read -r remote; do
       [ -z "$remote" ] && continue
+      list_has_word "$remote" "$UA_IGNORE_RCLONE_REMOTES" && continue
       if has_cmd timeout; then
         output="$(timeout "$check_timeout" rclone lsd "${remote}:" 2>&1 >/dev/null)"
         rc=$?
@@ -3039,6 +3631,7 @@ EOF
     if [ -n "$failed_remotes" ]; then
       echo "- rclone remote 连接异常: $failed_remotes"
       echo "  连接测试超时: ${check_timeout}s/remote"
+      echo "  建议: 执行 ua rclone 检测配置；确认不用的 remote 可执行 ua ignore rclone <名称>。"
       found=1
     fi
   fi
@@ -3073,6 +3666,207 @@ ua_status() {
   tail -n 8 "$UA_BOX_LOG_FILE" 2>/dev/null || echo "暂无日志。"
 }
 
+ignore_var_for_kind() {
+  case "$1" in
+    container|containers|docker|容器) echo "UA_IGNORE_CONTAINERS" ;;
+    service|services|svc|服务) echo "UA_IGNORE_SERVICES" ;;
+    rclone|remote|remotes|远程盘) echo "UA_IGNORE_RCLONE_REMOTES" ;;
+    *) return 1 ;;
+  esac
+}
+
+ignore_label_for_kind() {
+  case "$1" in
+    container|containers|docker|容器) echo "容器" ;;
+    service|services|svc|服务) echo "服务" ;;
+    rclone|remote|remotes|远程盘) echo "rclone remote" ;;
+    *) return 1 ;;
+  esac
+}
+
+ignore_current_value() {
+  case "$1" in
+    UA_IGNORE_CONTAINERS) printf '%s\n' "$UA_IGNORE_CONTAINERS" ;;
+    UA_IGNORE_SERVICES) printf '%s\n' "$UA_IGNORE_SERVICES" ;;
+    UA_IGNORE_RCLONE_REMOTES) printf '%s\n' "$UA_IGNORE_RCLONE_REMOTES" ;;
+    *) return 1 ;;
+  esac
+}
+
+ua_ignore_show() {
+  echo -e "${gl_kjlan}异常忽略列表${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo "容器: ${UA_IGNORE_CONTAINERS:-无}"
+  echo "服务: ${UA_IGNORE_SERVICES:-无}"
+  echo "rclone remote: ${UA_IGNORE_RCLONE_REMOTES:-无}"
+}
+
+ua_ignore_add() {
+  local kind="$1"
+  shift
+
+  local var label current next normalized item
+  var="$(ignore_var_for_kind "$kind")" || { echo "未知类型: $kind"; return 1; }
+  label="$(ignore_label_for_kind "$kind")"
+  if [ "$#" -eq 0 ]; then
+    echo "未提供要忽略的${label}名称。"
+    return 1
+  fi
+
+  current="$(ignore_current_value "$var")"
+  for item in "$@"; do
+    normalized="${item%:}"
+    next="$(list_add_words "$current" "$normalized")"
+    current="$next"
+  done
+  config_set_var "$var" "$current"
+  log_action "ignore add $kind $*"
+  echo "已加入忽略列表: $label -> $*"
+}
+
+ua_ignore_remove() {
+  local kind="$1"
+  shift
+
+  local var label current next normalized items
+  var="$(ignore_var_for_kind "$kind")" || { echo "未知类型: $kind"; return 1; }
+  label="$(ignore_label_for_kind "$kind")"
+  if [ "$#" -eq 0 ]; then
+    echo "未提供要取消忽略的${label}名称。"
+    return 1
+  fi
+
+  current="$(ignore_current_value "$var")"
+  items=""
+  for item in "$@"; do
+    normalized="${item%:}"
+    items="${items:+$items }$normalized"
+  done
+  # shellcheck disable=SC2086
+  next="$(list_remove_words "$current" $items)"
+  config_set_var "$var" "$next"
+  log_action "ignore remove $kind $*"
+  echo "已取消忽略: $label -> $*"
+}
+
+ua_ignore_current() {
+  local yes="$1"
+  local bad_containers inactive_services failed_remotes answer
+
+  bad_containers="$(collect_bad_containers | tr '\n' ' ')"
+  inactive_services="$(collect_inactive_services | tr '\n' ' ')"
+  failed_remotes="$(collect_failed_rclone_remotes | tr '\n' ' ')"
+
+  if [ -z "$bad_containers$inactive_services$failed_remotes" ]; then
+    echo "当前没有可加入忽略列表的异常项。"
+    return 0
+  fi
+
+  echo -e "${gl_kjlan}将加入忽略列表的当前异常项${gl_bai}"
+  [ -n "$bad_containers" ] && echo "容器: $bad_containers"
+  [ -n "$inactive_services" ] && echo "服务: $inactive_services"
+  [ -n "$failed_remotes" ] && echo "rclone remote: $failed_remotes"
+
+  if [ "$yes" != "-y" ] && [ "$yes" != "--yes" ]; then
+    read -r -p "确认写入忽略列表？输入 y/yes 继续: " answer
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) echo "已取消。"; return 1 ;;
+    esac
+  fi
+
+  # shellcheck disable=SC2086
+  [ -n "$bad_containers" ] && config_set_var "UA_IGNORE_CONTAINERS" "$(list_add_words "$UA_IGNORE_CONTAINERS" $bad_containers)"
+  # shellcheck disable=SC2086
+  [ -n "$inactive_services" ] && config_set_var "UA_IGNORE_SERVICES" "$(list_add_words "$UA_IGNORE_SERVICES" $inactive_services)"
+  # shellcheck disable=SC2086
+  [ -n "$failed_remotes" ] && config_set_var "UA_IGNORE_RCLONE_REMOTES" "$(list_add_words "$UA_IGNORE_RCLONE_REMOTES" $failed_remotes)"
+  log_action "ignore current"
+  echo "已写入忽略列表。"
+}
+
+ua_ignore_cli() {
+  local action="$1"
+  shift || true
+
+  case "$action" in
+    ""|menu|管理)
+      ua_ignore_menu
+      ;;
+    list|ls|show|列表)
+      ua_ignore_show
+      ;;
+    current|now|当前)
+      ua_ignore_current "$1"
+      ;;
+    add)
+      ua_ignore_add "$@"
+      ;;
+    remove|rm|del|delete)
+      ua_ignore_remove "$@"
+      ;;
+    container|containers|docker|service|services|svc|rclone|remote|remotes|容器|服务|远程盘)
+      ua_ignore_add "$action" "$@"
+      ;;
+    *)
+      echo "用法:"
+      echo "  ua ignore list"
+      echo "  ua ignore current"
+      echo "  ua ignore container <name...>"
+      echo "  ua ignore service <name...>"
+      echo "  ua ignore rclone <remote...>"
+      echo "  ua unignore rclone <remote...>"
+      return 1
+      ;;
+  esac
+}
+
+ua_unignore_cli() {
+  local action="$1"
+  shift || true
+
+  case "$action" in
+    container|containers|docker|service|services|svc|rclone|remote|remotes|容器|服务|远程盘)
+      ua_ignore_remove "$action" "$@"
+      ;;
+    *)
+      ua_ignore_remove "$action" "$@"
+      ;;
+  esac
+}
+
+ua_ignore_menu() {
+  local choice names
+
+  while true; do
+    clear
+    ua_ignore_show
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}忽略当前异常项"
+    echo -e "${gl_kjlan}2.   ${gl_bai}添加忽略容器"
+    echo -e "${gl_kjlan}3.   ${gl_bai}添加忽略服务"
+    echo -e "${gl_kjlan}4.   ${gl_bai}添加忽略 rclone remote"
+    echo -e "${gl_kjlan}5.   ${gl_bai}取消忽略容器"
+    echo -e "${gl_kjlan}6.   ${gl_bai}取消忽略服务"
+    echo -e "${gl_kjlan}7.   ${gl_bai}取消忽略 rclone remote"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice
+
+    case "$choice" in
+      1) ua_ignore_current; pause ;;
+      2) read -r -e -p "请输入容器名，多个用空格分隔: " names; ua_ignore_add container $names; pause ;;
+      3) read -r -e -p "请输入服务名，多个用空格分隔: " names; ua_ignore_add service $names; pause ;;
+      4) read -r -e -p "请输入 rclone remote 名，多个用空格分隔: " names; ua_ignore_add rclone $names; pause ;;
+      5) read -r -e -p "请输入容器名，多个用空格分隔: " names; ua_ignore_remove container $names; pause ;;
+      6) read -r -e -p "请输入服务名，多个用空格分隔: " names; ua_ignore_remove service $names; pause ;;
+      7) read -r -e -p "请输入 rclone remote 名，多个用空格分隔: " names; ua_ignore_remove rclone $names; pause ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
 ua_settings_menu() {
   while true; do
     clear
@@ -3085,6 +3879,7 @@ ua_settings_menu() {
     echo -e "${gl_kjlan}5.   ${gl_bai}备份当前脚本"
     echo -e "${gl_kjlan}6.   ${gl_bai}查看备份列表"
     echo -e "${gl_kjlan}7.   ${gl_bai}按配置 URL 更新脚本"
+    echo -e "${gl_kjlan}8.   ${gl_bai}异常忽略管理"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice
@@ -3103,6 +3898,7 @@ ua_settings_menu() {
       5) backup_self; pause ;;
       6) ls -lh "$UA_BOX_BACKUP_DIR" 2>/dev/null || echo "暂无备份。"; pause ;;
       7) update_self; pause ;;
+      8) ua_ignore_menu ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -3133,10 +3929,17 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua rclone              打开 rclone 管理
   ua test                打开测试脚本菜单
   ua status              显示状态检查
+  ua ignore              打开异常忽略管理
+  ua ignore current      将当前异常项加入忽略列表
+  ua ignore rclone <name> 忽略指定 rclone remote 异常
+  ua unignore rclone <name> 取消忽略指定 rclone remote
   ua config              编辑配置文件
   ua log                 查看最近日志
   ua backup              备份当前脚本
   ua update              按配置 URL 更新脚本
+  ua init                一键初始化优化（系统更新+工具+Swap+Docker）
+  ua bbr                 BBR 拥塞控制管理
+  ua fw                  防火墙管理
   ua install <pkg>       安装指定软件包
   ua remove <pkg>        卸载指定软件包
   ua help                显示帮助
@@ -3243,6 +4046,14 @@ case "${1:-}" in
   status|状态)
     ua_status
     ;;
+  ignore|忽略)
+    shift
+    ua_ignore_cli "$@"
+    ;;
+  unignore|取消忽略)
+    shift
+    ua_unignore_cli "$@"
+    ;;
   config|cfg|配置)
     "${EDITOR:-nano}" "$UA_BOX_CONFIG"
     ;;
@@ -3257,6 +4068,15 @@ case "${1:-}" in
     ;;
   settings|setting|设置)
     ua_settings_menu
+    ;;
+  init|初始化)
+    system_init_optimize
+    ;;
+  bbr)
+    system_bbr_menu
+    ;;
+  fw|firewall|防火墙)
+    system_firewall_menu
     ;;
   install|add|安装)
     shift

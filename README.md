@@ -2,6 +2,8 @@
 
 UA Box 是一个轻量 Linux 命令行运维面板，整合系统管理、Docker、rclone、面板工具、网络测试和常用脚本入口。
 
+当前版本：**v0.5.0**
+
 适合 VPS、独服、轻量服务器的日常管理。脚本以 Bash 编写，尽量减少依赖；部分系统级操作需要 root 权限。
 
 ## 快速安装
@@ -72,6 +74,10 @@ cd /root/ua-box
 - 定时任务管理
 - 虚拟内存大小调整
 - 命令行历史记录查看/清理
+- **修改 hostname**
+- **BBR 拥塞控制**（一键开启/关闭，自动检测内核版本，写入 sysctl 永久生效）
+- **防火墙管理**（自动识别 ufw / firewalld / iptables，支持查看规则、放行/删除端口）
+- **一键初始化优化**（系统更新 + 常用工具批量安装 + Swap 自动设为内存 2 倍 + Docker + 可选 hostname）
 - 一键重装系统
 - 开放所有端口
 - 重启服务器
@@ -146,6 +152,8 @@ curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lso
 - CPU、内存、磁盘、系统负载高占用
 - 最近 UA Box 操作日志
 
+确认无需处理的异常可通过 `ua ignore` 管理，不需要手动编辑配置文件。
+
 ## 快捷命令
 
 ```bash
@@ -161,10 +169,16 @@ ua work            # 工作区管理
 ua rclone          # rclone 管理
 ua test            # 测试脚本合集
 ua status          # UA 状态检查
+ua ignore          # 异常忽略管理
+ua ignore current  # 忽略当前异常项
+ua ignore rclone quark # 忽略指定 rclone remote 异常
 ua config          # 编辑配置文件
 ua log             # 查看最近日志
 ua backup          # 备份当前脚本
 ua update          # 按配置 URL 更新脚本
+ua init            # 一键初始化优化（更新+工具+Swap+Docker）
+ua bbr             # BBR 拥塞控制管理
+ua fw              # 防火墙管理
 ua install curl jq # 安装指定工具
 ```
 
@@ -190,7 +204,14 @@ ua config
 DEFAULT_WORKSPACE_PREFIX="work"
 DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
 UA_BOX_UPDATE_URL="https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-box"
+UA_IGNORE_CONTAINERS="ms-oauth2-proxy"
+UA_IGNORE_SERVICES=""
+UA_IGNORE_RCLONE_REMOTES=""
+UA_STATUS_DISK_WARN=80
+UA_STATUS_DISK_CRIT=90
 ```
+
+`UA_IGNORE_CONTAINERS`、`UA_IGNORE_SERVICES` 和 `UA_IGNORE_RCLONE_REMOTES` 用空格分隔多个名称，用于隐藏已确认无需处理的历史异常。推荐通过 `ua ignore` 写入这些配置。
 
 ## 更新
 
@@ -238,6 +259,21 @@ UA Box 只在选择对应菜单项时下载并执行外部脚本：
 - mtr_trace: `https://github.com/zhucaidan/mtr_trace`
 - i-abc Speedtest: `https://github.com/i-abc/Speedtest`
 - 融合怪: `https://gitlab.com/spiritysdx/za`
+
+## 更新日志
+
+### v0.5.0
+
+- 新增「修改 hostname」功能，支持合法性校验并同步更新 `/etc/hosts`
+- 新增「一键初始化优化」：系统更新 + 常用工具批量安装（失败自动逐包重试）+ Swap 自动设为内存 2 倍 + Docker 安装 + 可选 hostname 修改，完成后打印详细结果报告
+- 新增「BBR 拥塞控制」：一键开启/关闭 BBR，自动检测内核版本（需 ≥ 4.9），写入 `/etc/sysctl.d/` 永久生效
+- 新增「防火墙管理」：自动识别 ufw / firewalld / iptables，支持查看规则、放行端口（TCP/UDP）、删除规则
+- 新增快捷命令 `ua init` / `ua bbr` / `ua fw`
+- 优化 `ua update` 空 URL 提示，直接显示推荐配置地址
+
+### v0.4.x
+
+- 早期版本迭代，基础运维功能逐步完善
 
 ## 许可证
 
