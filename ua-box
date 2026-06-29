@@ -7,8 +7,9 @@ UA_BOX_CONFIG="${UA_BOX_CONFIG:-$UA_BOX_HOME/config}"
 UA_BOX_LOG_DIR="${UA_BOX_LOG_DIR:-$UA_BOX_HOME/logs}"
 UA_BOX_LOG_FILE="${UA_BOX_LOG_FILE:-$UA_BOX_LOG_DIR/ua-box.log}"
 UA_BOX_BACKUP_DIR="${UA_BOX_BACKUP_DIR:-$UA_BOX_HOME/backups}"
-
-gl_hui='\e[37m'
+UA_BOX_TMP_DIR="${UA_BOX_TMP_DIR:-$(mktemp -d /tmp/ua-box.XXXXXX)}"
+trap 'rm -rf "$UA_BOX_TMP_DIR"' EXIT
+gl_hui='\033[37m'
 gl_hong='\033[31m'
 gl_lv='\033[32m'
 gl_huang='\033[33m'
@@ -20,8 +21,7 @@ gl_kjlan='\033[96m'
 NEZHA_SCRIPT_CN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh"
 NEZHA_SCRIPT_EN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install_en.sh"
 WARP_MANAGER_SCRIPT="https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh"
-V2BX_SCRIPT="https://raw.githubusercontent.com/wyx2685/V2bX-script/master/install.sh"
-V2BX_MANAGER="https://raw.githubusercontent.com/wyx2685/V2bX-script/master/V2bX.sh"
+
 DOCKER_INSTALL_SCRIPT="https://get.docker.com"
 DOCKER_INSTALL_SCRIPTS="https://get.docker.com https://raw.githubusercontent.com/docker/docker-install/master/install.sh https://github.com/docker/docker-install/raw/master/install.sh https://linuxmirrors.cn/docker.sh"
 RCLONE_INSTALL_SCRIPT="https://rclone.org/install.sh"
@@ -35,10 +35,12 @@ IABC_SPEEDTEST_SCRIPT="https://raw.githubusercontent.com/i-abc/Speedtest/main/sp
 FUSION_TEST_SCRIPT="https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh"
 GB5_SCRIPT="https://raw.githubusercontent.com/i-abc/GB5/main/gb5-test.sh"
 REINSTALL_SCRIPT="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+BESTTRACE_SCRIPT="https://raw.githubusercontent.com/zhanghanyun/backtrace/main/install.sh"
+SUPERSPEED_SCRIPT="https://raw.githubusercontent.com/uxh/superspeed/master/superspeed.sh"
 LIMIT_SHUTDOWN_SCRIPT="/root/ua-box/limit-shutdown.sh"
 DEFAULT_WORKSPACE_PREFIX="work"
 DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
-UA_BOX_UPDATE_URL=""
+UA_BOX_UPDATE_URL="https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-box"
 UA_IGNORE_CONTAINERS=""
 UA_IGNORE_SERVICES=""
 UA_IGNORE_RCLONE_REMOTES=""
@@ -54,7 +56,7 @@ init_ua_box() {
 
 DEFAULT_WORKSPACE_PREFIX="work"
 DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
-UA_BOX_UPDATE_URL=""
+UA_BOX_UPDATE_URL="https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-box"
 UA_IGNORE_CONTAINERS=""
 UA_IGNORE_SERVICES=""
 UA_IGNORE_RCLONE_REMOTES=""
@@ -64,8 +66,7 @@ UA_STATUS_DISK_CRIT=90
 NEZHA_SCRIPT_CN="$NEZHA_SCRIPT_CN"
 NEZHA_SCRIPT_EN="$NEZHA_SCRIPT_EN"
 WARP_MANAGER_SCRIPT="$WARP_MANAGER_SCRIPT"
-V2BX_SCRIPT="$V2BX_SCRIPT"
-V2BX_MANAGER="$V2BX_MANAGER"
+
 DOCKER_INSTALL_SCRIPT="$DOCKER_INSTALL_SCRIPT"
 DOCKER_INSTALL_SCRIPTS="$DOCKER_INSTALL_SCRIPTS"
 RCLONE_INSTALL_SCRIPT="$RCLONE_INSTALL_SCRIPT"
@@ -134,7 +135,7 @@ update_self() {
   fi
 
   src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-  tmp="/tmp/ua-box-update.$$"
+  tmp="$UA_BOX_TMP_DIR/ua-box-update.$$"
   backup_self || return 1
   download_to "$UA_BOX_UPDATE_URL" "$tmp" || return 1
   bash -n "$tmp" || {
@@ -217,10 +218,10 @@ config_set_var() {
   local tmp escaped
 
   escaped="$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-  tmp="/tmp/ua-box-config.$$"
+  tmp="$UA_BOX_TMP_DIR/ua-box-config.$$"
   awk -v var="$var" -v value="$escaped" '
     BEGIN { found=0 }
-    $0 ~ "^" var "=" {
+    substr($0, 1, length(var)+1) == var "=" {
       print var "=\"" value "\"";
       found=1;
       next;
@@ -235,23 +236,30 @@ config_set_var() {
 }
 
 pkg_manager() {
-  if has_cmd apt; then
-    echo "apt"
-  elif has_cmd dnf; then
-    echo "dnf"
-  elif has_cmd yum; then
-    echo "yum"
-  elif has_cmd apk; then
-    echo "apk"
-  elif has_cmd pacman; then
-    echo "pacman"
-  elif has_cmd zypper; then
-    echo "zypper"
-  elif has_cmd opkg; then
-    echo "opkg"
-  else
-    echo ""
+  if [ -n "$_UA_PKG_MANAGER" ]; then
+    echo "$_UA_PKG_MANAGER"
+    return
   fi
+
+  local pm=""
+  if has_cmd apt; then
+    pm="apt"
+  elif has_cmd dnf; then
+    pm="dnf"
+  elif has_cmd yum; then
+    pm="yum"
+  elif has_cmd apk; then
+    pm="apk"
+  elif has_cmd pacman; then
+    pm="pacman"
+  elif has_cmd zypper; then
+    pm="zypper"
+  elif has_cmd opkg; then
+    pm="opkg"
+  fi
+
+  _UA_PKG_MANAGER="$pm"
+  echo "$pm"
 }
 
 install_pkg() {
@@ -272,7 +280,11 @@ install_pkg() {
 
   case "$pm" in
     apt)
-      apt update -y
+      if [ ! -f /tmp/.ua-apt-updated ] || \
+         [ -n "$(find /tmp/.ua-apt-updated -mmin +60 2>/dev/null)" ]; then
+        apt update -y
+        touch /tmp/.ua-apt-updated
+      fi
       apt install -y "$@"
       ;;
     dnf)
@@ -372,13 +384,13 @@ download_to() {
   log_action "download $url -> $output"
 
   if has_cmd curl; then
-    curl -fsSL "$url" -o "$output"
+    curl --connect-timeout 10 --max-time 60 -fsSL "$url" -o "$output"
   elif has_cmd wget; then
-    wget -qO "$output" "$url"
+    wget --timeout=15 -qO "$output" "$url"
   else
     echo "未找到 curl/wget，先安装基础下载工具。"
     install_pkg curl wget || return 1
-    curl -fsSL "$url" -o "$output"
+    curl --connect-timeout 10 --max-time 60 -fsSL "$url" -o "$output"
   fi
 }
 
@@ -447,7 +459,7 @@ net_total() {
 cpu_usage() {
   awk '/^cpu / {u=$2+$4; t=$2+$4+$5; print u, t}' /proc/stat | {
     read -r u1 t1
-    sleep 1
+    sleep 0.2
     awk '/^cpu / {u=$2+$4; t=$2+$4+$5; print u, t}' /proc/stat | {
       read -r u2 t2
       awk -v u1="$u1" -v t1="$t1" -v u2="$u2" -v t2="$t2" 'BEGIN {
@@ -608,7 +620,7 @@ docker_daemon_status() {
 
 run_nezha_script() {
   local url="$1"
-  local target="/tmp/nezha.sh"
+  local target="$UA_BOX_TMP_DIR/nezha.sh"
 
   need_root || return 1
   download_to "$url" "$target" || return 1
@@ -685,111 +697,11 @@ nezha_menu() {
   done
 }
 
-install_v2bx_manager() {
-  need_root || return 1
-  download_to "$V2BX_MANAGER" /usr/bin/V2bX || return 1
-  chmod +x /usr/bin/V2bX
-  echo "V2bX 管理脚本已安装到 /usr/bin/V2bX"
-}
-
-install_v2bx() {
-  need_root || return 1
-  local target="/tmp/V2bX-install.sh"
-  download_to "$V2BX_SCRIPT" "$target" || return 1
-  bash "$target"
-}
-
-v2bx_status_line() {
-  if [ -x /usr/local/V2bX/V2bX ]; then
-    echo -n "服务: "
-    svc_status_short V2bX
-    echo -n "版本: "
-    /usr/local/V2bX/V2bX version 2>/dev/null || echo "未知"
-  else
-    echo -e "服务: ${gl_hui}未安装${gl_bai}"
-  fi
-}
-
-v2bx_menu() {
-  while true; do
-    clear
-    echo -e "${gl_kjlan}V2bX 安装管理${gl_bai}"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    v2bx_status_line
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}1.   ${gl_bai}一键安装/更新 V2bX"
-    echo -e "${gl_kjlan}2.   ${gl_bai}安装/更新 V2bX 管理脚本"
-    echo -e "${gl_kjlan}3.   ${gl_bai}打开 V2bX 官方管理菜单"
-    echo -e "${gl_kjlan}4.   ${gl_bai}编辑配置 /etc/V2bX/config.json"
-    echo -e "${gl_kjlan}5.   ${gl_bai}查看服务状态"
-    echo -e "${gl_kjlan}6.   ${gl_bai}启动服务"
-    echo -e "${gl_kjlan}7.   ${gl_bai}重启服务"
-    echo -e "${gl_kjlan}8.   ${gl_bai}停止服务"
-    echo -e "${gl_kjlan}9.   ${gl_bai}查看实时日志"
-    echo -e "${gl_kjlan}10.  ${gl_bai}设置开机自启"
-    echo -e "${gl_kjlan}11.  ${gl_bai}取消开机自启"
-    echo -e "${gl_kjlan}12.  ${gl_bai}卸载 V2bX"
-    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice || break
-
-    case "$choice" in
-      1) install_v2bx; pause ;;
-      2) install_v2bx_manager; pause ;;
-      3)
-        if has_cmd V2bX; then
-          V2bX
-        else
-          echo "未找到 V2bX 管理脚本，先选择 2 安装。"
-        fi
-        pause
-        ;;
-      4)
-        need_root || { pause; continue; }
-        if [ -f /etc/V2bX/config.json ]; then
-          "${EDITOR:-vi}" /etc/V2bX/config.json
-        else
-          echo "未找到 /etc/V2bX/config.json。"
-        fi
-        pause
-        ;;
-      5) svc status V2bX; pause ;;
-      6) need_root && svc start V2bX; pause ;;
-      7) need_root && svc restart V2bX; pause ;;
-      8) need_root && svc stop V2bX; pause ;;
-      9)
-        if has_cmd journalctl; then
-          journalctl -u V2bX.service -e --no-pager -f
-        else
-          echo "当前系统未找到 journalctl。"
-        fi
-        pause
-        ;;
-      10) need_root && svc enable V2bX; pause ;;
-      11) need_root && svc disable V2bX; pause ;;
-      12)
-        need_root || { pause; continue; }
-        if confirm_danger "卸载 V2bX，并删除 /etc/V2bX 和 /usr/local/V2bX" "rm -rf /etc/V2bX /usr/local/V2bX"; then
-          log_action "uninstall V2bX"
-          svc stop V2bX >/dev/null 2>&1 || true
-          svc disable V2bX >/dev/null 2>&1 || true
-          rm -f /etc/systemd/system/V2bX.service /usr/bin/V2bX
-          rm -rf /etc/V2bX /usr/local/V2bX
-          has_cmd systemctl && systemctl daemon-reload
-          echo "V2bX 已卸载。"
-        fi
-        pause
-        ;;
-      0) break ;;
-      *) echo "无效输入"; pause ;;
-    esac
-  done
-}
 
 run_warp_manager() {
   need_root || return 1
 
-  local target="/root/ua-box/warp-menu.sh"
+  local target="$UA_BOX_TMP_DIR/warp-menu.sh"
   download_to "$WARP_MANAGER_SCRIPT" "$target" || return 1
   chmod +x "$target"
   log_action "run WARP manager"
@@ -822,7 +734,16 @@ warp_tools_menu() {
     clear
     echo -e "${gl_kjlan}WARP 管理${gl_bai}"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    warp_status
+    if has_cmd warp-cli; then
+      echo -e "warp-cli:     ${gl_lv}已安装${gl_bai}"
+    else
+      echo -e "warp-cli:     ${gl_hui}未安装${gl_bai}"
+    fi
+    if has_cmd warp; then
+      echo -e "warp 快捷命令: ${gl_lv}已安装${gl_bai}"
+    else
+      echo -e "warp 快捷命令: ${gl_hui}未安装${gl_bai}"
+    fi
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}1.   ${gl_bai}运行 fscarmen WARP 管理菜单"
     echo -e "${gl_kjlan}2.   ${gl_bai}查看 WARP 状态"
@@ -1176,7 +1097,7 @@ install_docker() {
     return 0
   fi
 
-  local target="/tmp/get-docker.sh"
+  local target="$UA_BOX_TMP_DIR/get-docker.sh"
   local sources source args country
 
   sources="${DOCKER_INSTALL_SCRIPTS:-$DOCKER_INSTALL_SCRIPT}"
@@ -1201,12 +1122,14 @@ install_docker() {
     systemctl enable --now docker >/dev/null 2>&1 || true
   fi
 
-  if command -v apt >/dev/null 2>&1; then
-    apt update >/dev/null 2>&1 && apt install -y docker-compose-plugin >/dev/null 2>&1 || true
-  elif command -v dnf >/dev/null 2>&1; then
+  if has_cmd apt; then
+    apt install -y docker-compose-plugin >/dev/null 2>&1 || true
+  elif has_cmd dnf; then
     dnf install -y docker-compose-plugin >/dev/null 2>&1 || true
-  elif command -v yum >/dev/null 2>&1; then
+  elif has_cmd yum; then
     yum install -y docker-compose-plugin >/dev/null 2>&1 || true
+  elif has_cmd apk; then
+    apk add docker-compose >/dev/null 2>&1 || true
   fi
 
   if has_cmd docker; then
@@ -1239,10 +1162,15 @@ docker_compose_run() {
     return 1
   fi
 
+  local _compose_extra=""
+  [ "$action" = "up" ] && _compose_extra="-d"
+
   if docker compose version >/dev/null 2>&1; then
-    (cd "$compose_dir" && docker compose "$action" -d)
+    # shellcheck disable=SC2086
+    (cd "$compose_dir" && docker compose "$action" $_compose_extra)
   elif has_cmd docker-compose; then
-    (cd "$compose_dir" && docker-compose "$action" -d)
+    # shellcheck disable=SC2086
+    (cd "$compose_dir" && docker-compose "$action" $_compose_extra)
   else
     echo "未找到 docker compose 插件或 docker-compose。"
     return 1
@@ -1489,10 +1417,13 @@ docker_container_create() {
   [ -z "$cmd" ] && return 1
 
   log_action "create container: $cmd"
+  local _full_cmd
   case "$cmd" in
-    docker\ run*) sh -c "$cmd" ;;
-    *) sh -c "docker run $cmd" ;;
+    docker\ run*) _full_cmd="$cmd" ;;
+    *) _full_cmd="docker run $cmd" ;;
   esac
+  echo -e "${gl_huang}将执行: ${gl_bai}$_full_cmd"
+  sh -c "$_full_cmd"
 }
 
 docker_container_stats_once() {
@@ -1586,7 +1517,9 @@ docker_container_menu() {
         if [ -z "$names" ]; then
           echo "未输入容器名/ID。"
         elif confirm_danger "删除指定 Docker 容器" "$names"; then
-          docker_container_action rm "-f $names"
+          log_action "docker rm -f $names"
+          # shellcheck disable=SC2086
+          docker rm -f $names
         fi
         pause
         ;;
@@ -1828,7 +1761,7 @@ workspace_menu() {
 
 install_rclone() {
   need_root || return 1
-  local target="/tmp/rclone-install.sh"
+  local target="$UA_BOX_TMP_DIR/rclone-install.sh"
   download_to "$RCLONE_INSTALL_SCRIPT" "$target" || return 1
   bash "$target"
 }
@@ -1885,7 +1818,7 @@ rclone_config_check() {
   remote_count="$(rclone listremotes 2>/dev/null | wc -l)"
   mount_count="$(pgrep -af "rclone mount" 2>/dev/null | wc -l)"
   check_timeout="${RCLONE_CHECK_TIMEOUT:-5}"
-  result_file="/tmp/ua-rclone-check.$$"
+  result_file="$UA_BOX_TMP_DIR/ua-rclone-check.$$"
 
   echo -e "${gl_kjlan}rclone 配置检测${gl_bai}"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -2168,31 +2101,31 @@ test_scripts_menu() {
     read -r -e -p "请输入你的选择: " choice
 
     case "$choice" in
-      1) run_downloaded_script "$OPENAI_CHECK_SCRIPT" /tmp/openai-check.sh; pause ;;
-      2) run_downloaded_script "$REGION_UNLOCK_SCRIPT" /tmp/unlock-media.sh; pause ;;
-      3) run_downloaded_script "$YEAHWU_UNLOCK_SCRIPT" /tmp/yeahwu-unlock.sh; pause ;;
-      4) download_to "https://IP.Check.Place" /tmp/ip-check.sh && bash /tmp/ip-check.sh; pause ;;
-      11) download_to "https://git.io/besttrace" /tmp/besttrace.sh && bash /tmp/besttrace.sh; pause ;;
-      12) run_downloaded_script "$MTR_TRACE_SCRIPT" /tmp/mtr_trace.sh; pause ;;
-      13) download_to "https://git.io/superspeed_uxh" /tmp/superspeed.sh && bash /tmp/superspeed.sh; pause ;;
-      14) download_to "https://nxtrace.org/nt" /tmp/nxtrace.sh && bash /tmp/nxtrace.sh && nexttrace --fast-trace --tcp; pause ;;
+      1) run_downloaded_script "$OPENAI_CHECK_SCRIPT" "$UA_BOX_TMP_DIR"/openai-check.sh; pause ;;
+      2) run_downloaded_script "$REGION_UNLOCK_SCRIPT" "$UA_BOX_TMP_DIR"/unlock-media.sh; pause ;;
+      3) run_downloaded_script "$YEAHWU_UNLOCK_SCRIPT" "$UA_BOX_TMP_DIR"/yeahwu-unlock.sh; pause ;;
+      4) download_to "https://IP.Check.Place" "$UA_BOX_TMP_DIR"/ip-check.sh && bash "$UA_BOX_TMP_DIR"/ip-check.sh; pause ;;
+      11) run_downloaded_script "$BESTTRACE_SCRIPT" "$UA_BOX_TMP_DIR"/besttrace.sh; pause ;;
+      12) run_downloaded_script "$MTR_TRACE_SCRIPT" "$UA_BOX_TMP_DIR"/mtr_trace.sh; pause ;;
+      13) run_downloaded_script "$SUPERSPEED_SCRIPT" "$UA_BOX_TMP_DIR"/superspeed.sh; pause ;;
+      14) download_to "https://nxtrace.org/nt" "$UA_BOX_TMP_DIR"/nxtrace.sh && bash "$UA_BOX_TMP_DIR"/nxtrace.sh && nexttrace --fast-trace --tcp; pause ;;
       15)
         echo "可参考的 IP 列表"
         echo "北京电信: 219.141.136.12     北京联通: 202.106.50.1      北京移动: 221.179.155.161"
         echo "上海电信: 202.96.209.133     上海联通: 210.22.97.1       上海移动: 211.136.112.200"
         echo "广州电信: 58.60.188.222      广州联通: 210.21.196.6      广州移动: 120.196.165.24"
         read -r -e -p "请输入指定 IP: " test_ip
-        download_to "https://nxtrace.org/nt" /tmp/nxtrace.sh && bash /tmp/nxtrace.sh
+        download_to "https://nxtrace.org/nt" "$UA_BOX_TMP_DIR"/nxtrace.sh && bash "$UA_BOX_TMP_DIR"/nxtrace.sh
         nexttrace "$test_ip"
         pause
         ;;
-      16) run_downloaded_script "$IABC_SPEEDTEST_SCRIPT" /tmp/iabc-speedtest.sh; pause ;;
-      17) download_to "https://Net.Check.Place" /tmp/net-check.sh && bash /tmp/net-check.sh; pause ;;
-      21) run_downloaded_script "$YABS_SCRIPT" /tmp/yabs.sh; pause ;;
-      22) run_downloaded_script "$YABS_SCRIPT" /tmp/yabs.sh -i; pause ;;
-      23) run_downloaded_script "$GB5_SCRIPT" /tmp/gb5.sh; pause ;;
-      31) run_downloaded_script "$BENCH_SCRIPT" /tmp/bench.sh; pause ;;
-      32) run_downloaded_script "$FUSION_TEST_SCRIPT" /tmp/fusion-test.sh; pause ;;
+      16) run_downloaded_script "$IABC_SPEEDTEST_SCRIPT" "$UA_BOX_TMP_DIR"/iabc-speedtest.sh; pause ;;
+      17) download_to "https://Net.Check.Place" "$UA_BOX_TMP_DIR"/net-check.sh && bash "$UA_BOX_TMP_DIR"/net-check.sh; pause ;;
+      21) run_downloaded_script "$YABS_SCRIPT" "$UA_BOX_TMP_DIR"/yabs.sh; pause ;;
+      22) run_downloaded_script "$YABS_SCRIPT" "$UA_BOX_TMP_DIR"/yabs.sh -i; pause ;;
+      23) run_downloaded_script "$GB5_SCRIPT" "$UA_BOX_TMP_DIR"/gb5.sh; pause ;;
+      31) run_downloaded_script "$BENCH_SCRIPT" "$UA_BOX_TMP_DIR"/bench.sh; pause ;;
+      32) run_downloaded_script "$FUSION_TEST_SCRIPT" "$UA_BOX_TMP_DIR"/fusion-test.sh; pause ;;
       33) install_pkg speedtest-cli; pause ;;
       34)
         if has_cmd speedtest-cli; then
@@ -2234,9 +2167,9 @@ test_scripts_menu() {
         read -r -e -p "请输入脚本 URL: " url
         read -r -e -p "请输入脚本参数，回车跳过: " args
         if [ -n "$url" ]; then
-          download_to "$url" /tmp/ua-box-custom-test.sh && chmod +x /tmp/ua-box-custom-test.sh
+          download_to "$url" "$UA_BOX_TMP_DIR"/ua-box-custom-test.sh && chmod +x "$UA_BOX_TMP_DIR"/ua-box-custom-test.sh
           # shellcheck disable=SC2086
-          bash /tmp/ua-box-custom-test.sh $args
+          bash "$UA_BOX_TMP_DIR"/ua-box-custom-test.sh $args
         fi
         pause
         ;;
@@ -2330,7 +2263,7 @@ system_set_shortcut() {
   fi
 
   shell_rc="$HOME/.bashrc"
-  [ -n "$ZSH_VERSION" ] && shell_rc="$HOME/.zshrc"
+  case "${SHELL##*/}" in zsh) shell_rc="$HOME/.zshrc" ;; esac
   target="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
   sed -i "/# UA Box shortcut:/d" "$shell_rc" 2>/dev/null || true
@@ -2437,7 +2370,9 @@ ssh_apply_login_profile() {
   local label="$1"
   local root_login="$2"
   local password_auth="$3"
-  local backup="/etc/ssh/sshd_config.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+  local backup
+  backup="/etc/ssh/sshd_config.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+
 
   need_root || return 1
   if [ ! -f /etc/ssh/sshd_config ]; then
@@ -2566,9 +2501,6 @@ system_ssh_login_security_menu() {
   done
 }
 
-system_root_password_login() {
-  system_enable_root_password_login
-}
 
 system_reinstall_menu() {
   need_root || return 1
@@ -2596,12 +2528,12 @@ system_reinstall_menu() {
     *) echo "无效输入"; return 1 ;;
   esac
 
-  if confirm_danger "即将重装系统，当前系统数据可能丢失" "bash /tmp/reinstall.sh $args"; then
-    download_to "$REINSTALL_SCRIPT" /tmp/reinstall.sh || return 1
-    chmod +x /tmp/reinstall.sh
+  if confirm_danger "即将重装系统，当前系统数据可能丢失" "bash $UA_BOX_TMP_DIR/reinstall.sh $args"; then
+    download_to "$REINSTALL_SCRIPT" "$UA_BOX_TMP_DIR"/reinstall.sh || return 1
+    chmod +x "$UA_BOX_TMP_DIR"/reinstall.sh
     log_action "reinstall system $args"
     # shellcheck disable=SC2086
-    bash /tmp/reinstall.sh $args
+    bash "$UA_BOX_TMP_DIR"/reinstall.sh $args
   fi
 }
 
@@ -2715,10 +2647,10 @@ system_change_mirror() {
   echo "将调用 LinuxMirrors 换源脚本。"
   echo "脚本来源: https://linuxmirrors.cn/main.sh"
   if confirm_danger "切换系统更新源" "linuxmirrors.cn/main.sh"; then
-    download_to "https://linuxmirrors.cn/main.sh" /tmp/linuxmirrors-main.sh || return 1
-    chmod +x /tmp/linuxmirrors-main.sh
+    download_to "https://linuxmirrors.cn/main.sh" "$UA_BOX_TMP_DIR"/linuxmirrors-main.sh || return 1
+    chmod +x "$UA_BOX_TMP_DIR"/linuxmirrors-main.sh
     log_action "change system mirror via linuxmirrors"
-    bash /tmp/linuxmirrors-main.sh
+    bash "$UA_BOX_TMP_DIR"/linuxmirrors-main.sh
   fi
 }
 
@@ -2940,14 +2872,25 @@ STATE_FILE="/var/lib/ua-box-limit-shutdown.state"
 
 mkdir -p "\$(dirname "\$STATE_FILE")"
 today="\$(date +%d)"
-rx_now="\$(awk '\$1 ~ /^[a-zA-Z0-9_.:-]+:$/ && \$1 !~ /^lo:/ {rx += \$2} END {print rx+0}' /proc/net/dev)"
-tx_now="\$(awk '\$1 ~ /^[a-zA-Z0-9_.:-]+:$/ && \$1 !~ /^lo:/ {tx += \$10} END {print tx+0}' /proc/net/dev)"
+today_full="\$(date +%Y-%m-%d)"
+rx_now="\$(awk '\$1 ~ /^[a-zA-Z0-9_.:-]+:\$/ && \$1 !~ /^lo:/ {rx += \$2} END {print rx+0}' /proc/net/dev)"
+tx_now="\$(awk '\$1 ~ /^[a-zA-Z0-9_.:-]+:\$/ && \$1 !~ /^lo:/ {tx += \$10} END {print tx+0}' /proc/net/dev)"
 
-if [ ! -f "\$STATE_FILE" ] || [ "\$today" = "\$(printf "%02d" "\$RESET_DAY")" ]; then
-  printf 'RX_BASE=%s\nTX_BASE=%s\nLAST_RESET=%s\n' "\$rx_now" "\$tx_now" "\$(date +%Y-%m-%d)" > "\$STATE_FILE"
+# 首次运行：创建基准状态文件
+if [ ! -f "\$STATE_FILE" ]; then
+  printf 'RX_BASE=%s\nTX_BASE=%s\nLAST_RESET=%s\n' "\$rx_now" "\$tx_now" "\$today_full" > "\$STATE_FILE"
 fi
 
+# shellcheck disable=SC1090
 . "\$STATE_FILE"
+
+# 每月重置日：仅当天首次执行时更新基准（避免每分钟归零）
+if [ "\$today" = "\$(printf "%02d" "\$RESET_DAY")" ] && [ "\${LAST_RESET:-}" != "\$today_full" ]; then
+  printf 'RX_BASE=%s\nTX_BASE=%s\nLAST_RESET=%s\n' "\$rx_now" "\$tx_now" "\$today_full" > "\$STATE_FILE"
+  # shellcheck disable=SC1090
+  . "\$STATE_FILE"
+fi
+
 rx_used_gb="\$(( (rx_now - RX_BASE) / 1024 / 1024 / 1024 ))"
 tx_used_gb="\$(( (tx_now - TX_BASE) / 1024 / 1024 / 1024 ))"
 
@@ -2999,8 +2942,12 @@ system_set_hostname() {
   # 同步 /etc/hosts 中的旧 hostname 映射
   if grep -q "$current_hostname" /etc/hosts 2>/dev/null; then
     sed -i "s/\b${current_hostname}\b/${new_hostname}/g" /etc/hosts
-    echo "已同步更新 /etc/hosts。"
   fi
+  # 确保新的 hostname 在 /etc/hosts 中可解析（防止 sudo 卡顿报错）
+  if ! grep -q "$new_hostname" /etc/hosts 2>/dev/null; then
+    echo "127.0.1.1 $new_hostname" >> /etc/hosts
+  fi
+  echo "已同步更新 /etc/hosts。"
 
   log_action "set hostname: $current_hostname -> $new_hostname"
   echo -e "hostname 已修改为: ${gl_lv}${new_hostname}${gl_bai}"
@@ -3095,9 +3042,9 @@ system_init_optimize() {
 
   # 先整体批量安装，减少 apt lock 次数
   echo "  批量安装中..."
+  # shellcheck disable=SC2086
   case "$pm" in
-    # shellcheck disable=SC2086
-    apt)    apt install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
+    apt)    apt install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ; touch /tmp/.ua-apt-updated 2>/dev/null || true ;;
     dnf)    dnf install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
     yum)    yum install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
     apk)    apk add $INIT_TOOLS > /dev/null 2>&1       ; _batch_ok=$? ;;
@@ -3106,12 +3053,12 @@ system_init_optimize() {
     *)      _batch_ok=1 ;;
   esac
 
-  # 逐包校验，失败的单独重试一次，统计结果
+  # 逐包校验：has_cmd 可检测则直接确认，否则单独重试并用退出码判断
   for tool_pkg in $INIT_TOOLS; do
-    if has_cmd "$tool_pkg" || [ "$_batch_ok" -eq 0 ]; then
+    if has_cmd "$tool_pkg"; then
       tools_ok="$tools_ok $tool_pkg"
     else
-      # 单独重试
+      # 命令不可检测（如 ca-certificates）或批量未成功，单独重试
       local _retry_ok=0
       case "$pm" in
         apt)    apt install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
@@ -3128,6 +3075,7 @@ system_init_optimize() {
       fi
     fi
   done
+
 
   if [ -z "$tools_failed" ]; then
     r_tools=1
@@ -3178,6 +3126,9 @@ system_init_optimize() {
     fi
     if grep -q "$current_hostname" /etc/hosts 2>/dev/null; then
       sed -i "s/\b${current_hostname}\b/${new_hostname}/g" /etc/hosts
+    fi
+    if ! grep -q "$new_hostname" /etc/hosts 2>/dev/null; then
+      echo "127.0.1.1 $new_hostname" >> /etc/hosts
     fi
     log_action "init_optimize hostname: $current_hostname -> $new_hostname"
     r_hostname=1
@@ -3377,6 +3328,8 @@ system_firewall_menu() {
       echo -e "${gl_kjlan}1.  ${gl_bai}查看当前规则（INPUT 链）"
       echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
       echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
+      echo -e "${gl_kjlan}4.  ${gl_bai}删除规则"
+      echo -e "${gl_kjlan}5.  ${gl_bai}保存规则（尝试持久化）"
       echo -e "${gl_kjlan}0.  ${gl_bai}返回"
       read -r -e -p "请输入你的选择: " choice
       case "$choice" in
@@ -3384,10 +3337,28 @@ system_firewall_menu() {
         2)
           read -r -e -p "请输入要放行的 TCP 端口: " port
           [ -n "$port" ] && iptables -I INPUT -p tcp --dport "$port" -j ACCEPT && log_action "iptables allow ${port}/tcp"
+          echo -e "${gl_huang}警告: iptables 规则将在重启后失效，请选择 5 进行保存。${gl_bai}"
           ;;
         3)
           read -r -e -p "请输入要放行的 UDP 端口: " port
           [ -n "$port" ] && iptables -I INPUT -p udp --dport "$port" -j ACCEPT && log_action "iptables allow ${port}/udp"
+          echo -e "${gl_huang}警告: iptables 规则将在重启后失效，请选择 5 进行保存。${gl_bai}"
+          ;;
+        4)
+          iptables -L INPUT -n --line-numbers
+          read -r -e -p "请输入要删除的 INPUT 规则编号: " num
+          [ -n "$num" ] && iptables -D INPUT "$num"
+          ;;
+        5)
+          if has_cmd netfilter-persistent; then
+            netfilter-persistent save && echo "已保存 (netfilter-persistent)。"
+          elif [ -f /etc/sysconfig/iptables ]; then
+            iptables-save > /etc/sysconfig/iptables && echo "已保存 (/etc/sysconfig/iptables)。"
+          elif [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 && echo "已保存 (/etc/iptables/rules.v4)。"
+          else
+            echo -e "${gl_hong}未找到标准的 iptables 持久化路径，请手动保存。${gl_bai}"
+          fi
           ;;
         0) return 0 ;;
         *) echo "无效输入" ;;
@@ -3426,7 +3397,7 @@ system_tools_menu() {
     echo -e "${gl_kjlan}17.  ${gl_bai}一键初始化优化"
     echo -e "${gl_kjlan}18.  ${gl_bai}BBR 拥塞控制"
     echo -e "${gl_kjlan}19.  ${gl_bai}防火墙管理"
-    echo -e "${gl_kjlan}23.  ${gl_bai}限流自动关机"
+    echo -e "${gl_kjlan}20.  ${gl_bai}限流自动关机"
     echo -e "${gl_kjlan}99.  ${gl_bai}重启服务器"
     echo -e "${gl_kjlan}101. ${gl_bai}卸载 UA Box 脚本"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
@@ -3453,7 +3424,7 @@ system_tools_menu() {
       17) system_init_optimize; pause ;;
       18) system_bbr_menu; pause ;;
       19) system_firewall_menu; pause ;;
-      23) system_limit_shutdown_menu; pause ;;
+      20) system_limit_shutdown_menu; pause ;;
       99) system_reboot; pause ;;
       101) system_uninstall_ua; pause ;;
       0) break ;;
@@ -3492,7 +3463,7 @@ collect_inactive_services() {
   local svc
 
   has_cmd systemctl || return 0
-  for svc in caddy nezha-agent V2bX; do
+  for svc in caddy nezha-agent; do
     list_has_word "$svc" "$UA_IGNORE_SERVICES" && continue
     if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
       ! systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -3597,7 +3568,7 @@ EOF
   fi
 
   if has_cmd systemctl; then
-    for svc in caddy nezha-agent V2bX; do
+    for svc in caddy nezha-agent; do
       list_has_word "$svc" "$UA_IGNORE_SERVICES" && continue
       if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
         ! systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -3609,6 +3580,11 @@ EOF
   fi
 
   if has_cmd rclone; then
+    local _rclone_count
+    _rclone_count="$(rclone listremotes 2>/dev/null | wc -l)"
+    if [ "$_rclone_count" -gt 0 ]; then
+      echo -e "${gl_huang}检测 ${_rclone_count} 个 rclone remote，每个最多等待 ${check_timeout}s，请稍候...${gl_bai}"
+    fi
     failed_remotes=""
     while IFS= read -r remote; do
       [ -z "$remote" ] && continue
@@ -3658,12 +3634,12 @@ ua_status() {
   echo -e "${gl_kjlan}wget:         ${gl_bai}$(installed_status wget)"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   echo -e "${gl_kjlan}Nezha Agent:  ${gl_bai}$(svc_status_short nezha-agent)"
-  echo -e "${gl_kjlan}V2bX:         ${gl_bai}$(svc_status_short V2bX)"
+
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   ua_abnormal_summary
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   echo "最近日志:"
-  tail -n 8 "$UA_BOX_LOG_FILE" 2>/dev/null || echo "暂无日志。"
+  tail -n 20 "$UA_BOX_LOG_FILE" 2>/dev/null || echo "暂无日志。"
 }
 
 ignore_var_for_kind() {
@@ -3855,12 +3831,12 @@ ua_ignore_menu() {
 
     case "$choice" in
       1) ua_ignore_current; pause ;;
-      2) read -r -e -p "请输入容器名，多个用空格分隔: " names; ua_ignore_add container $names; pause ;;
-      3) read -r -e -p "请输入服务名，多个用空格分隔: " names; ua_ignore_add service $names; pause ;;
-      4) read -r -e -p "请输入 rclone remote 名，多个用空格分隔: " names; ua_ignore_add rclone $names; pause ;;
-      5) read -r -e -p "请输入容器名，多个用空格分隔: " names; ua_ignore_remove container $names; pause ;;
-      6) read -r -e -p "请输入服务名，多个用空格分隔: " names; ua_ignore_remove service $names; pause ;;
-      7) read -r -e -p "请输入 rclone remote 名，多个用空格分隔: " names; ua_ignore_remove rclone $names; pause ;;
+      2) read -r -e -a names -p "请输入容器名，多个用空格分隔: "; ua_ignore_add container "${names[@]}"; pause ;;
+      3) read -r -e -a names -p "请输入服务名，多个用空格分隔: "; ua_ignore_add service "${names[@]}"; pause ;;
+      4) read -r -e -a names -p "请输入 rclone remote 名，多个用空格分隔: "; ua_ignore_add rclone "${names[@]}"; pause ;;
+      5) read -r -e -a names -p "请输入容器名，多个用空格分隔: "; ua_ignore_remove container "${names[@]}"; pause ;;
+      6) read -r -e -a names -p "请输入服务名，多个用空格分隔: "; ua_ignore_remove service "${names[@]}"; pause ;;
+      7) read -r -e -a names -p "请输入 rclone remote 名，多个用空格分隔: "; ua_ignore_remove rclone "${names[@]}"; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -3880,6 +3856,7 @@ ua_settings_menu() {
     echo -e "${gl_kjlan}6.   ${gl_bai}查看备份列表"
     echo -e "${gl_kjlan}7.   ${gl_bai}按配置 URL 更新脚本"
     echo -e "${gl_kjlan}8.   ${gl_bai}异常忽略管理"
+    echo -e "${gl_kjlan}9.   ${gl_bai}从备份恢复脚本"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice
@@ -3899,6 +3876,25 @@ ua_settings_menu() {
       6) ls -lh "$UA_BOX_BACKUP_DIR" 2>/dev/null || echo "暂无备份。"; pause ;;
       7) update_self; pause ;;
       8) ua_ignore_menu ;;
+      9)
+        ls -lh "$UA_BOX_BACKUP_DIR" 2>/dev/null || echo "暂无备份。"
+        read -r -e -p "请输入要恢复的备份文件名: " bak
+        if [ -z "$bak" ]; then
+          echo "已取消。"
+        else
+          local _bak_path="$UA_BOX_BACKUP_DIR/$bak"
+          if [ ! -f "$_bak_path" ]; then
+            echo -e "${gl_hong}未找到备份文件: $_bak_path${gl_bai}"
+          elif confirm_danger "从备份覆盖当前脚本" "$_bak_path"; then
+            local _src
+            _src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+            backup_self && cp "$_bak_path" "$_src" && chmod +x "$_src"
+            log_action "restore from backup $_bak_path"
+            echo -e "${gl_lv}已从备份恢复: $bak${gl_bai}"
+          fi
+        fi
+        pause
+        ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -3923,7 +3919,7 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua tools               打开常用工具菜单
   ua panel               打开面板工具
   ua nezha               打开哪吒探针管理
-  ua v2bx                打开 V2bX 安装管理
+
   ua docker              打开 Docker 管理
   ua work                打开工作区模块
   ua rclone              打开 rclone 管理
@@ -3960,7 +3956,7 @@ main_menu() {
     echo -e "${gl_kjlan}2.   ${gl_bai}系统工具"
     echo -e "${gl_kjlan}3.   ${gl_bai}常用工具安装"
     echo -e "${gl_kjlan}4.   ${gl_bai}面板工具"
-    echo -e "${gl_kjlan}5.   ${gl_bai}V2bX 安装管理"
+    echo -e "${gl_kjlan}5.   ${gl_bai}一键初始化优化"
     echo -e "${gl_kjlan}6.   ${gl_bai}Docker 管理"
     echo -e "${gl_kjlan}7.   ${gl_bai}工作区模块"
     echo -e "${gl_kjlan}8.   ${gl_bai}rclone 管理"
@@ -3976,7 +3972,7 @@ main_menu() {
       2) system_tools_menu ;;
       3) common_tools_menu ;;
       4) panel_tools_menu ;;
-      5) v2bx_menu ;;
+      5) system_init_optimize; pause ;;
       6) docker_menu ;;
       7) workspace_menu ;;
       8) rclone_menu ;;
@@ -4028,9 +4024,7 @@ case "${1:-}" in
   nezha|nazha|哪吒)
     nezha_menu
     ;;
-  v2bx|V2bX|V2BX)
-    v2bx_menu
-    ;;
+
   docker|dk|容器)
     docker_menu
     ;;
