@@ -2,7 +2,7 @@
 
 UA Box 是一个轻量 Linux 命令行运维面板，整合系统管理、Docker、rclone、面板工具、网络测试和常用脚本入口。
 
-当前版本：**v0.5.0**
+当前版本：**v0.6.0**
 
 适合 VPS、独服、轻量服务器的日常管理。脚本以 Bash 编写，尽量减少依赖；部分系统级操作需要 root 权限。
 
@@ -53,7 +53,7 @@ cd /root/ua-box
 2.  系统工具
 3.  常用工具
 4.  面板工具
-5.  V2bX 管理
+5.  一键初始化优化
 6.  Docker 管理
 7.  工作区管理
 8.  rclone 管理
@@ -95,21 +95,22 @@ curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lso
 ### 面板工具
 
 - WARP 管理
-- Caddy 反代管理
+- Caddy 反代管理（支持宿主机原生部署与 Docker 容器化部署，双栈自适应管理）
 - Nginx Proxy Manager 可视化面板
 - it-tools 工具箱
-- 哪吒探针管理
 
-面板工具顶部会显示统一状态页，包括安装状态、运行状态、端口和访问地址。Nginx Proxy Manager 会自动识别容器名，例如 `npm` 或 `nginx-proxy-manager`，避免后续管理混淆。
+面板工具顶部会显示统一状态页，包括安装状态、运行状态、端口和访问地址（实时读取 Compose 状态比率）。Nginx Proxy Manager 会自动识别容器名，例如 `npm` 或 `nginx-proxy-manager`，避免后续管理混淆。
 
 ### Docker 管理
 
 - Docker 安装/卸载
 - Docker 镜像源配置，支持多个备用安装源
-- 容器创建、启动、停止、重启、删除
+- 容器创建、启动、停止、重启、删除（列表分类显示 `docker run` 与 `Docker Compose` 运行状态）
 - 查看容器日志、网络、资源占用
-- 镜像、网络、卷、Compose 管理
+- 镜像、网络、卷管理
 - Docker 占用分析和清理
+- **限制 Docker 容器日志最大体积** (一键/安全合并配置 daemon.json 日志容量限制，防爆磁盘)
+- **Docker Compose 项目控制台** (秒级从容器 Labels 抓取工作路径，独立操作 Up/Down/Start/Stop/Restart/Logs/Pull)
 
 ### rclone 管理
 
@@ -118,10 +119,11 @@ curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lso
 - 查看远程盘
 - 列出远程目录
 - copy / sync
-- 挂载和卸载远程盘
+- 挂载和卸载远程盘（支持开机自启/Systemd守护，内置异常自动重启的频率限制）
 - 查看 rclone mount 进程
 - 打开 rclone ncdu
 - 配置安全摘要和 remote 连接检测
+- **手动编辑 rclone.conf 配置文件**（编辑前自动生成精确时间戳备份文件）
 
 配置检测会先逐个测试 remote 连接，再显示摘要；不会输出 token、密码、client_secret 等敏感字段。
 
@@ -162,8 +164,6 @@ ua ps              # 系统信息
 ua sys             # 系统工具
 ua tools           # 常用工具
 ua panel           # 面板工具
-ua nezha           # 哪吒探针管理
-ua v2bx            # V2bX 管理
 ua docker          # Docker 管理
 ua work            # 工作区管理
 ua rclone          # rclone 管理
@@ -247,8 +247,6 @@ UA_BOX_UPDATE_URL="https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-bo
 
 UA Box 只在选择对应菜单项时下载并执行外部脚本：
 
-- Nezha: `https://github.com/nezhahq/scripts`
-- V2bX: `https://github.com/wyx2685/V2bX-script`
 - Docker: `https://get.docker.com`
 - WARP: `https://gitlab.com/fscarmen/warp`
 - rclone: `https://rclone.org/install.sh`
@@ -261,6 +259,18 @@ UA Box 只在选择对应菜单项时下载并执行外部脚本：
 - 融合怪: `https://gitlab.com/spiritysdx/za`
 
 ## 更新日志
+
+### v0.6.0
+
+- 新增「Docker Compose 项目控制台」：支持秒级从容器元数据 Labels 提取项目目录，提供 Up/Down/Start/Stop/Restart/Logs/Pull 全生命周期管理。
+- 新增「Docker 容器日志最大体积限制」：提供一键在 daemon.json 中合并或限制日志体积（50MB x 3），通过内置 JSON 语法校验与自动备份防止损坏。
+- 新增「状态面板与异常监控联动」：工具总览与 `ua status` 增加对 Docker Compose 状态比率的读取与偏离（部分停止）报警。
+- 新增「Caddy 部署 Docker 双模支持」：Caddy 管理支持原生服务与 Docker 容器化双模，并对配置与证书路径实现持久化宿主机映射。
+- 新增「工作区退出常驻向导」：Tmux 会话右下角以红底白字高亮常驻退出快捷键（`退出: Ctrl+B, D`），彻底防止会话误杀。
+- 新增「RClone 开机挂载防死循环」：Systemd 自启服务内置启动频率限制（300秒限5次），防 CPU 空转。
+- 新增「RClone 配置文件手动编辑」：增加一键编辑 `rclone.conf` 入口（附带精确时间戳自动备份）。
+- 优化 Docker 容器列表，清晰区分普通 `docker run` 与 `Docker Compose` 状态。
+- 彻底移除老旧的哪吒探针管理模块与外部脚本。
 
 ### v0.5.0
 

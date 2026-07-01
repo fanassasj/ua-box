@@ -18,8 +18,6 @@ gl_bai='\033[0m'
 gl_zi='\033[35m'
 gl_kjlan='\033[96m'
 
-NEZHA_SCRIPT_CN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh"
-NEZHA_SCRIPT_EN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install_en.sh"
 WARP_MANAGER_SCRIPT="https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh"
 
 DOCKER_INSTALL_SCRIPT="https://get.docker.com"
@@ -46,6 +44,9 @@ UA_IGNORE_SERVICES=""
 UA_IGNORE_RCLONE_REMOTES=""
 UA_STATUS_DISK_WARN=80
 UA_STATUS_DISK_CRIT=90
+UA_APT_UPDATE_INTERVAL=60
+UA_MONITOR_SERVICES="caddy"
+UA_STATUS_SKIP_RCLONE=0
 
 init_ua_box() {
   mkdir -p "$UA_BOX_HOME" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR"
@@ -62,9 +63,10 @@ UA_IGNORE_SERVICES=""
 UA_IGNORE_RCLONE_REMOTES=""
 UA_STATUS_DISK_WARN=80
 UA_STATUS_DISK_CRIT=90
+UA_APT_UPDATE_INTERVAL=60
+UA_MONITOR_SERVICES="caddy"
+UA_STATUS_SKIP_RCLONE=0
 
-NEZHA_SCRIPT_CN="$NEZHA_SCRIPT_CN"
-NEZHA_SCRIPT_EN="$NEZHA_SCRIPT_EN"
 WARP_MANAGER_SCRIPT="$WARP_MANAGER_SCRIPT"
 
 DOCKER_INSTALL_SCRIPT="$DOCKER_INSTALL_SCRIPT"
@@ -80,6 +82,8 @@ IABC_SPEEDTEST_SCRIPT="$IABC_SPEEDTEST_SCRIPT"
 FUSION_TEST_SCRIPT="$FUSION_TEST_SCRIPT"
 GB5_SCRIPT="$GB5_SCRIPT"
 REINSTALL_SCRIPT="$REINSTALL_SCRIPT"
+BESTTRACE_SCRIPT="$BESTTRACE_SCRIPT"
+SUPERSPEED_SCRIPT="$SUPERSPEED_SCRIPT"
 LIMIT_SHUTDOWN_SCRIPT="$LIMIT_SHUTDOWN_SCRIPT"
 EOF
   fi
@@ -91,6 +95,10 @@ EOF
 log_action() {
   local message="$*"
   mkdir -p "$UA_BOX_LOG_DIR"
+  # 日志超过 5MB 自动轮转，保留最近一份
+  if [ -f "$UA_BOX_LOG_FILE" ] && [ "$(wc -c < "$UA_BOX_LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+    mv "$UA_BOX_LOG_FILE" "${UA_BOX_LOG_FILE}.1"
+  fi
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$message" >> "$UA_BOX_LOG_FILE"
 }
 
@@ -171,6 +179,17 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+is_port_taken() {
+  local port="$1"
+  if has_cmd ss; then
+    ss -tlnp 2>/dev/null | grep -Eq ":${port}\s"
+  elif has_cmd netstat; then
+    netstat -tlnp 2>/dev/null | grep -Eq ":${port}\s"
+  else
+    lsof -i :"$port" >/dev/null 2>&1
+  fi
+}
+
 list_has_word() {
   local needle="$1"
   local list="$2"
@@ -221,7 +240,7 @@ config_set_var() {
   tmp="$UA_BOX_TMP_DIR/ua-box-config.$$"
   awk -v var="$var" -v value="$escaped" '
     BEGIN { found=0 }
-    substr($0, 1, length(var)+1) == var "=" {
+    $0 ~ "^" var "=" {
       print var "=\"" value "\"";
       found=1;
       next;
@@ -280,8 +299,9 @@ install_pkg() {
 
   case "$pm" in
     apt)
+      local _apt_interval="${UA_APT_UPDATE_INTERVAL:-60}"
       if [ ! -f /tmp/.ua-apt-updated ] || \
-         [ -n "$(find /tmp/.ua-apt-updated -mmin +60 2>/dev/null)" ]; then
+         [ -n "$(find /tmp/.ua-apt-updated -mmin +"$_apt_interval" 2>/dev/null)" ]; then
         apt update -y
         touch /tmp/.ua-apt-updated
       fi
@@ -440,6 +460,33 @@ public_ip() {
   fi
 }
 
+public_ipv6() {
+  if has_cmd curl; then
+    curl -6 -fsS --max-time 3 https://api64.ipify.org 2>/dev/null || curl -6 -fsS --max-time 3 https://ip.sb 2>/dev/null
+  elif has_cmd wget; then
+    wget -6 -qO- --timeout=3 https://api64.ipify.org 2>/dev/null || wget -6 -qO- --timeout=3 https://ip.sb 2>/dev/null
+  fi
+}
+
+get_virt() {
+  local virt="未知"
+  if has_cmd systemd-detect-virt; then
+    virt="$(systemd-detect-virt 2>/dev/null)"
+    [ "$virt" = "none" ] && virt="物理机"
+  elif [ -f /proc/user_beancounters ]; then
+    virt="OpenVZ"
+  elif [ -d /proc/xen ] || grep -q "control_d" /proc/xen/capabilities 2>/dev/null; then
+    virt="Xen"
+  elif grep -Eqi "qemu|kvm" /sys/class/dmi/id/product_name 2>/dev/null || grep -Eqi "qemu|kvm" /sys/class/dmi/id/sys_vendor 2>/dev/null; then
+    virt="KVM"
+  elif [ -d /sys/module/hyperv ]; then
+    virt="Hyper-V"
+  elif grep -qi "vmware" /proc/cpuinfo 2>/dev/null; then
+    virt="VMware"
+  fi
+  echo "$virt" | tr '[:lower:]' '[:upper:]'
+}
+
 local_ip() {
   ip route get 8.8.8.8 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
 }
@@ -472,9 +519,10 @@ cpu_usage() {
 
 system_info() {
   clear
-  local hostname os kernel arch cpu_model cores cpu_freq cpu_percent load mem swap disk uptime dns ipv4 wan_ip tcp_cc qdisc net_io now
+  local hostname os kernel arch cpu_model cores cpu_freq cpu_percent load mem swap disk uptime dns ipv4 ipv6 wan_ipv4 wan_ipv6 tcp_cc qdisc net_io now virt country
 
   hostname="$(hostname 2>/dev/null)"
+  virt="$(get_virt)"
   os="$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
   kernel="$(uname -r)"
   arch="$(uname -m)"
@@ -489,7 +537,10 @@ system_info() {
   uptime="$(human_uptime)"
   dns="$(awk '/^nameserver/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)"
   ipv4="$(local_ip)"
-  wan_ip="$(public_ip)"
+  ipv6="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2; exit}')"
+  wan_ipv4="$(public_ip)"
+  wan_ipv6="$(public_ipv6)"
+  country="$(country_code)"
   tcp_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
   net_io="$(net_total)"
@@ -498,6 +549,7 @@ system_info() {
   echo -e "${gl_kjlan}系统信息显示${gl_bai}"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   echo -e "${gl_kjlan}主机名:       ${gl_bai}${hostname:-未知}"
+  echo -e "${gl_kjlan}虚拟化:       ${gl_bai}${virt}"
   echo -e "${gl_kjlan}系统版本:     ${gl_bai}${os:-未知}"
   echo -e "${gl_kjlan}Linux版本:    ${gl_bai}${kernel}"
   echo -e "${gl_kjlan}CPU架构:      ${gl_bai}${arch}"
@@ -513,7 +565,10 @@ system_info() {
   echo -e "${gl_kjlan}总收/发:      ${gl_bai}${net_io:-未知}"
   echo -e "${gl_kjlan}网络算法:     ${gl_bai}${tcp_cc:-未知} ${qdisc:-未知}"
   echo -e "${gl_kjlan}内网IPv4:     ${gl_bai}${ipv4:-未知}"
-  echo -e "${gl_kjlan}公网IP:       ${gl_bai}${wan_ip:-未知}"
+  echo -e "${gl_kjlan}内网IPv6:     ${gl_bai}${ipv6:-未知}"
+  echo -e "${gl_kjlan}公网IPv4:     ${gl_bai}${wan_ipv4:-未知}"
+  echo -e "${gl_kjlan}公网IPv6:     ${gl_bai}${wan_ipv6:-未分配或检测失败}"
+  echo -e "${gl_kjlan}地理位置:     ${gl_bai}${country:-未知}"
   echo -e "${gl_kjlan}DNS地址:      ${gl_bai}${dns:-未知}"
   echo -e "${gl_kjlan}系统时间:     ${gl_bai}${now}"
   echo -e "${gl_kjlan}运行时长:     ${gl_bai}${uptime:-未知}"
@@ -582,12 +637,12 @@ common_tools_menu() {
 
 docker_container_exists() {
   local name="$1"
-  has_cmd docker && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"
+  has_cmd docker && docker inspect "$name" >/dev/null 2>&1
 }
 
 docker_container_running() {
   local name="$1"
-  has_cmd docker && docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"
+  has_cmd docker && [ "$(docker inspect --format '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]
 }
 
 docker_container_status() {
@@ -597,10 +652,15 @@ docker_container_status() {
     return
   fi
 
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"; then
-    echo -e "${gl_lv}运行中${gl_bai}"
-  elif docker_container_exists "$name"; then
-    echo -e "${gl_huang}已停止${gl_bai}"
+  local running
+  running="$(docker inspect --format '{{.State.Running}}' "$name" 2>/dev/null)"
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    if [ "$running" = "true" ]; then
+      echo -e "${gl_lv}运行中${gl_bai}"
+    else
+      echo -e "${gl_huang}已停止${gl_bai}"
+    fi
   else
     echo -e "${gl_hui}未安装${gl_bai}"
   fi
@@ -618,84 +678,6 @@ docker_daemon_status() {
   fi
 }
 
-run_nezha_script() {
-  local url="$1"
-  local target="$UA_BOX_TMP_DIR/nezha.sh"
-
-  need_root || return 1
-  download_to "$url" "$target" || return 1
-  chmod +x "$target"
-  "$target"
-}
-
-nezha_menu() {
-  while true; do
-    clear
-    echo -e "${gl_kjlan}哪吒探针管理${gl_bai}"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "Dashboard: $(docker_container_status nezha-dashboard)"
-    echo -e "Agent:     $(svc_status_short nezha-agent)"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}1.   ${gl_bai}运行官方中文管理脚本"
-    echo -e "${gl_kjlan}2.   ${gl_bai}运行官方英文管理脚本"
-    echo -e "${gl_kjlan}3.   ${gl_bai}查看 Agent 状态"
-    echo -e "${gl_kjlan}4.   ${gl_bai}启动 Agent"
-    echo -e "${gl_kjlan}5.   ${gl_bai}重启 Agent"
-    echo -e "${gl_kjlan}6.   ${gl_bai}停止 Agent"
-    echo -e "${gl_kjlan}7.   ${gl_bai}查看 Dashboard 容器日志"
-    echo -e "${gl_kjlan}8.   ${gl_bai}重启 Dashboard 容器"
-    echo -e "${gl_kjlan}9.   ${gl_bai}停止 Dashboard 容器"
-    echo -e "${gl_kjlan}10.  ${gl_bai}删除 Dashboard 容器"
-    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice || break
-
-    case "$choice" in
-      1) run_nezha_script "$NEZHA_SCRIPT_CN"; pause ;;
-      2) run_nezha_script "$NEZHA_SCRIPT_EN"; pause ;;
-      3) svc status nezha-agent; pause ;;
-      4) need_root && svc start nezha-agent; pause ;;
-      5) need_root && svc restart nezha-agent; pause ;;
-      6) need_root && svc stop nezha-agent; pause ;;
-      7)
-        if has_cmd docker && docker_container_exists nezha-dashboard; then
-          docker logs --tail 120 nezha-dashboard
-        else
-          echo "未找到 nezha-dashboard 容器。"
-        fi
-        pause
-        ;;
-      8)
-        need_root || { pause; continue; }
-        if has_cmd docker && docker_container_exists nezha-dashboard; then
-          docker restart nezha-dashboard
-        else
-          echo "未找到 nezha-dashboard 容器。"
-        fi
-        pause
-        ;;
-      9)
-        need_root || { pause; continue; }
-        if has_cmd docker && docker_container_exists nezha-dashboard; then
-          docker stop nezha-dashboard
-        else
-          echo "未找到 nezha-dashboard 容器。"
-        fi
-        pause
-        ;;
-      10)
-        need_root || { pause; continue; }
-        if confirm_danger "删除 nezha-dashboard 容器" "docker rm -f nezha-dashboard"; then
-          log_action "delete nezha-dashboard container"
-          docker rm -f nezha-dashboard
-        fi
-        pause
-        ;;
-      0) break ;;
-      *) echo "无效输入"; pause ;;
-    esac
-  done
-}
 
 
 run_warp_manager() {
@@ -774,20 +756,100 @@ warp_tools_menu() {
 caddy_status() {
   echo -e "${gl_kjlan}Caddy 状态${gl_bai}"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
-  if has_cmd caddy; then
+  if docker_container_exists caddy; then
+    local _running
+    _running="$(docker inspect --format '{{.State.Running}}' caddy 2>/dev/null)"
+    if [ "$_running" = "true" ]; then
+      echo -e "部署模式: ${gl_lv}Docker 容器${gl_bai}"
+      echo -e "服务状态: ${gl_lv}运行中${gl_bai}"
+    else
+      echo -e "部署模式: ${gl_lv}Docker 容器${gl_bai}"
+      echo -e "服务状态: ${gl_huang}已停止${gl_bai}"
+    fi
+    echo "容器名称: caddy"
+    echo "配置文件: /root/caddy/Caddyfile"
+  elif has_cmd caddy; then
     caddy version 2>/dev/null || true
+    echo "部署模式: 原生系统服务"
     echo -n "服务状态: "
     svc_status_short caddy
+    [ -f /etc/caddy/Caddyfile ] && echo "配置文件: /etc/caddy/Caddyfile"
   else
     echo "Caddy: 未安装"
   fi
-  [ -f /etc/caddy/Caddyfile ] && echo "配置文件: /etc/caddy/Caddyfile"
+}
+
+resolve_dns() {
+  local domain="$1"
+  local type="${2:-A}"
+  if has_cmd curl; then
+    curl -sH "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name=${domain}&type=${type}" 2>/dev/null | \
+      grep -oE '"data":"[^"]+"' | cut -d'"' -f4
+  elif has_cmd wget; then
+    wget -qO- --header="accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name=${domain}&type=${type}" 2>/dev/null | \
+      grep -oE '"data":"[^"]+"' | cut -d'"' -f4
+  fi
+}
+
+caddy_docker_install() {
+  need_root || return 1
+  docker_require || install_docker || return 1
+
+  if docker_container_exists caddy; then
+    docker start caddy
+    echo "Caddy 容器已存在并已启动。"
+    return 0
+  fi
+
+  local port_80 port_443
+  read -r -e -p "请输入 Caddy HTTP(80) 映射端口，回车默认 80: " u_80
+  port_80="${u_80:-80}"
+  read -r -e -p "请输入 Caddy HTTPS(443) 映射端口，回车默认 443: " u_443
+  port_443="${u_443:-443}"
+
+  for p in "$port_80" "$port_443"; do
+    if ! printf '%s\n' "$p" | grep -Eq '^[0-9]+$'; then
+      echo "错误: 端口必须是纯数字。"
+      return 1
+    fi
+    if is_port_taken "$p"; then
+      echo -e "${gl_hong}错误:${gl_bai} 端口 $p 已被系统占用，请先释放该端口，或者指定其他映射端口。"
+      return 1
+    fi
+  done
+
+  mkdir -p /root/caddy /root/caddy_data /root/caddy_config
+  if [ ! -f /root/caddy/Caddyfile ]; then
+    cat > /root/caddy/Caddyfile <<EOF
+# Caddy 配置文件
+# 您可以在这里添加您的反代或静态站配置
+EOF
+  fi
+
+  log_action "install Caddy Docker (80:$port_80, 443:$port_443)"
+  docker run -d \
+    --name caddy \
+    --restart unless-stopped \
+    -p "$port_80":80 -p "$port_443":443 \
+    -v /root/caddy/Caddyfile:/etc/caddy/Caddyfile \
+    -v /root/caddy_data:/data \
+    -v /root/caddy_config:/config \
+    caddy:latest
+
+  echo "Caddy Docker 容器部署完成。"
+  echo "配置文件已映射到宿主机: /root/caddy/Caddyfile"
 }
 
 caddy_add_reverse_proxy() {
   need_root || return 1
 
-  local domain upstream
+  local domain upstream cfg_file
+  if docker_container_exists caddy; then
+    cfg_file="/root/caddy/Caddyfile"
+  else
+    cfg_file="/etc/caddy/Caddyfile"
+  fi
+
   read -r -e -p "请输入域名，如 example.com: " domain
   read -r -e -p "请输入反代目标，如 http://127.0.0.1:3000: " upstream
   if [ -z "$domain" ] || [ -z "$upstream" ]; then
@@ -795,22 +857,55 @@ caddy_add_reverse_proxy() {
     return 1
   fi
 
-  mkdir -p /etc/caddy
-  touch /etc/caddy/Caddyfile
-  cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.ua-box.$(date +%Y%m%d-%H%M%S).bak"
-  cat >> /etc/caddy/Caddyfile <<EOF
+  # DNS 解析与本机公网 IP 一致性校验
+  local resolved_ip resolved_ip6 local_ip_v4 local_ip_v6
+  echo "正在获取公网 IP 并验证域名解析指向，请稍候..."
+  local_ip_v4="$(public_ip)"
+  local_ip_v6="$(public_ipv6)"
+  resolved_ip="$(resolve_dns "$domain" "A" | head -n 1)"
+  resolved_ip6="$(resolve_dns "$domain" "AAAA" | head -n 1)"
+
+  local dns_ok=0
+  if [ -n "$resolved_ip" ] && [ "$resolved_ip" = "$local_ip_v4" ]; then
+    dns_ok=1
+  fi
+  if [ -n "$resolved_ip6" ] && [ "$resolved_ip6" = "$local_ip_v6" ]; then
+    dns_ok=1
+  fi
+
+  if [ "$dns_ok" -eq 0 ]; then
+    echo -e "${gl_huang}⚠️  警告:${gl_bai} 域名 $domain 解析到的公网 IP 与本机不匹配。"
+    echo -e "  域名解析到: IPv4: ${gl_lv}${resolved_ip:-无}${gl_bai} / IPv6: ${gl_lv}${resolved_ip6:-无}${gl_bai}"
+    echo -e "  本机公网IP: IPv4: ${gl_lv}${local_ip_v4:-无}${gl_bai} / IPv6: ${gl_lv}${local_ip_v6:-无}${gl_bai}"
+    echo "  如果强行添加，Caddy 在为该域名申请 SSL 证书时极大概率会报错或阻塞。"
+    read -r -e -p "是否仍然强制添加反代配置？输入 y 继续，回车取消: " _caddy_confirm
+    [ "$_caddy_confirm" != "y" ] && [ "$_caddy_confirm" != "Y" ] && echo "已取消操作。" && return 1
+  else
+    echo -e "${gl_lv}✓ DNS 解析校验通过，域名已正确指向本机。${gl_bai}"
+  fi
+
+  mkdir -p "$(dirname "$cfg_file")"
+  touch "$cfg_file"
+  cp "$cfg_file" "${cfg_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+  cat >> "$cfg_file" <<EOF
 
 $domain {
     reverse_proxy $upstream
 }
 EOF
   log_action "add caddy reverse proxy $domain -> $upstream"
-  if has_cmd caddy; then
+  
+  if docker_container_exists caddy; then
+    if docker_container_running caddy; then
+      docker exec -w /etc/caddy caddy caddy fmt --overwrite Caddyfile 2>/dev/null || true
+      docker exec -w /etc/caddy caddy caddy reload
+    fi
+  elif has_cmd caddy; then
     caddy fmt --overwrite /etc/caddy/Caddyfile 2>/dev/null || true
     caddy validate --config /etc/caddy/Caddyfile || return 1
     svc reload caddy 2>/dev/null || svc restart caddy 2>/dev/null || true
   fi
-  echo "已追加 Caddy 反代配置。"
+  echo "已追加 Caddy 反代配置并重载服务。"
 }
 
 caddy_tools_menu() {
@@ -818,41 +913,88 @@ caddy_tools_menu() {
     clear
     caddy_status
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}1.   ${gl_bai}安装/更新 Caddy"
-    echo -e "${gl_kjlan}2.   ${gl_bai}编辑 Caddyfile"
-    echo -e "${gl_kjlan}3.   ${gl_bai}新增反代站点"
-    echo -e "${gl_kjlan}4.   ${gl_bai}验证并重载配置"
-    echo -e "${gl_kjlan}5.   ${gl_bai}查看最近日志"
-    echo -e "${gl_kjlan}6.   ${gl_bai}启动 Caddy"
-    echo -e "${gl_kjlan}7.   ${gl_bai}重启 Caddy"
-    echo -e "${gl_kjlan}8.   ${gl_bai}停止 Caddy"
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装/更新 Caddy (系统原生)"
+    echo -e "${gl_kjlan}2.   ${gl_bai}部署 Caddy (Docker 容器)"
+    echo -e "${gl_kjlan}3.   ${gl_bai}编辑 Caddyfile"
+    echo -e "${gl_kjlan}4.   ${gl_bai}新增反代站点"
+    echo -e "${gl_kjlan}5.   ${gl_bai}验证并重载配置"
+    echo -e "${gl_kjlan}6.   ${gl_bai}查看最近日志"
+    echo -e "${gl_kjlan}7.   ${gl_bai}启动 Caddy"
+    echo -e "${gl_kjlan}8.   ${gl_bai}重启 Caddy"
+    echo -e "${gl_kjlan}9.   ${gl_bai}停止 Caddy"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) install_pkg caddy; pause ;;
-      2) need_root && mkdir -p /etc/caddy && "${EDITOR:-nano}" /etc/caddy/Caddyfile; pause ;;
-      3) caddy_add_reverse_proxy; pause ;;
-      4)
-        if has_cmd caddy; then
+      2) caddy_docker_install; pause ;;
+      3)
+        local cfg_file
+        if docker_container_exists caddy; then
+          cfg_file="/root/caddy/Caddyfile"
+        else
+          cfg_file="/etc/caddy/Caddyfile"
+        fi
+        need_root && mkdir -p "$(dirname "$cfg_file")" && "${EDITOR:-nano}" "$cfg_file"
+        pause
+        ;;
+      4) caddy_add_reverse_proxy; pause ;;
+      5)
+        if docker_container_exists caddy; then
+          if docker_container_running caddy; then
+            docker exec -w /etc/caddy caddy caddy reload && echo "Caddy 容器配置重载成功。"
+          else
+            echo "Caddy 容器未运行，正在启动..."
+            docker start caddy
+          fi
+        elif has_cmd caddy; then
           caddy validate --config /etc/caddy/Caddyfile && (svc reload caddy 2>/dev/null || svc restart caddy)
         else
-          echo "未安装 Caddy。"
+          echo "未检测到 Caddy 安装。"
         fi
         pause
         ;;
-      5)
-        if has_cmd journalctl; then
+      6)
+        if docker_container_exists caddy; then
+          docker logs --tail 120 caddy
+        elif has_cmd journalctl; then
           journalctl -u caddy --no-pager -n 120
         else
-          echo "当前系统未找到 journalctl。"
+          echo "当前系统未找到 journalctl，且未在容器模式运行。"
         fi
         pause
         ;;
-      6) need_root && svc start caddy; pause ;;
-      7) need_root && svc restart caddy; pause ;;
-      8) need_root && svc stop caddy; pause ;;
+      7)
+        if docker_container_exists caddy; then
+          docker start caddy
+        elif has_cmd caddy; then
+          need_root && svc start caddy
+        else
+          echo "未检测到 Caddy 安装。"
+        fi
+        pause
+        ;;
+      8)
+        if docker_container_exists caddy; then
+          docker restart caddy
+        elif has_cmd caddy; then
+          need_root && svc restart caddy
+        else
+          echo "未检测到 Caddy 安装。"
+        fi
+        pause
+        ;;
+      9)
+        if docker_container_exists caddy; then
+          docker stop caddy
+        elif has_cmd caddy; then
+          need_root && svc stop caddy
+        else
+          echo "未检测到 Caddy 安装。"
+        fi
+        pause
+        ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -870,7 +1012,7 @@ npm_container_name() {
 }
 
 panel_status_overview() {
-  local npm_name npm_status it_status caddy_line warp_line nezha_status npm_url it_url nezha_url
+  local npm_name npm_status it_status caddy_line warp_line npm_url it_url caddy_file
 
   npm_name="$(npm_container_name)"
   if has_cmd warp || has_cmd warp-cli || ip addr show CloudflareWARP >/dev/null 2>&1 || ip addr show warp >/dev/null 2>&1; then
@@ -879,10 +1021,19 @@ panel_status_overview() {
     warp_line="${gl_hui}未安装${gl_bai}"
   fi
 
-  if has_cmd caddy; then
-    caddy_line="$(svc_status_short caddy)"
+  if docker_container_exists caddy; then
+    if docker_container_running caddy; then
+      caddy_line="${gl_lv}运行中 (Docker)${gl_bai}"
+    else
+      caddy_line="${gl_huang}已停止 (Docker)${gl_bai}"
+    fi
+    caddy_file="/root/caddy/Caddyfile"
+  elif has_cmd caddy; then
+    caddy_line="$(svc_status_short caddy) (原生)"
+    caddy_file="/etc/caddy/Caddyfile"
   else
     caddy_line="${gl_hui}未安装${gl_bai}"
+    caddy_file="-"
   fi
 
   if has_cmd docker && docker_container_exists "$npm_name"; then
@@ -891,7 +1042,8 @@ panel_status_overview() {
     else
       npm_status="${gl_huang}已停止${gl_bai}"
     fi
-    npm_url="http://服务器IP:81"
+    npm_url="$(docker port "$npm_name" 81/tcp 2>/dev/null | head -n 1 | awk -F: '{print "http://服务器IP:"$NF}')"
+    [ -z "$npm_url" ] && npm_url="http://服务器IP:81"
   else
     npm_status="${gl_hui}未安装${gl_bai}"
     npm_url="-"
@@ -910,26 +1062,13 @@ panel_status_overview() {
     it_url="-"
   fi
 
-  if has_cmd docker && docker_container_exists nezha-dashboard; then
-    if docker_container_running nezha-dashboard; then
-      nezha_status="${gl_lv}Dashboard 运行中${gl_bai}"
-    else
-      nezha_status="${gl_huang}Dashboard 已停止${gl_bai}"
-    fi
-    nezha_url="$(docker port nezha-dashboard 2>/dev/null | awk -F: 'NR==1 {print "http://服务器IP:"$NF}')"
-    [ -z "$nezha_url" ] && nezha_url="-"
-  else
-    nezha_status="$(svc_status_short nezha-agent)"
-    nezha_url="-"
-  fi
-
   echo -e "${gl_kjlan}工具状态总览${gl_bai}"
   printf "%-24s %-18b %-28s\n" "WARP" "$warp_line" "-"
-  printf "%-24s %-18b %-28s\n" "Caddy" "$caddy_line" "/etc/caddy/Caddyfile"
+  printf "%-24s %-18b %-28s\n" "Caddy" "$caddy_line" "$caddy_file"
   printf "%-24s %-18b %-28s\n" "Nginx Proxy Manager" "$npm_status" "$npm_url"
   printf "%-24s %-18b %-28s\n" "it-tools" "$it_status" "$it_url"
-  printf "%-24s %-18b %-28s\n" "哪吒探针" "$nezha_status" "$nezha_url"
   echo "NPM 识别到容器名: $npm_name"
+  echo -e "Compose项目状态:  ${gl_lv}$(get_compose_projects_summary)${gl_bai}"
 }
 
 npm_install() {
@@ -944,16 +1083,36 @@ npm_install() {
     return 0
   fi
 
+  local port_80 port_443 port_81
+  echo "提示: 如果你的服务器上已经运行了其他 Web 服务(如 Caddy 或 Nginx)，绑定默认的 80/443 会导致冲突。"
+  read -r -e -p "请输入 HTTP(80) 映射端口，回车默认 80: " u_80
+  port_80="${u_80:-80}"
+  read -r -e -p "请输入 HTTPS(443) 映射端口，回车默认 443: " u_443
+  port_443="${u_443:-443}"
+  read -r -e -p "请输入管理后台(81) 映射端口，回车默认 81: " u_81
+  port_81="${u_81:-81}"
+
+  for p in "$port_80" "$port_443" "$port_81"; do
+    if ! printf '%s\n' "$p" | grep -Eq '^[0-9]+$'; then
+      echo "错误: 端口必须是纯数字。"
+      return 1
+    fi
+    if is_port_taken "$p"; then
+      echo -e "${gl_hong}错误:${gl_bai} 端口 $p 已被系统占用，请先释放该端口，或者在安装时指定其他映射端口。"
+      return 1
+    fi
+  done
+
   mkdir -p /root/nginx-proxy-manager/data /root/nginx-proxy-manager/letsencrypt
-  log_action "install Nginx Proxy Manager"
+  log_action "install Nginx Proxy Manager (80:$port_80, 443:$port_443, 81:$port_81)"
   docker run -d \
     --name "$name" \
     --restart unless-stopped \
-    -p 80:80 -p 81:81 -p 443:443 \
+    -p "$port_80":80 -p "$port_81":81 -p "$port_443":443 \
     -v /root/nginx-proxy-manager/data:/data \
     -v /root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt \
     jc21/nginx-proxy-manager:latest
-  echo "Nginx Proxy Manager 已部署。访问: http://服务器IP:81"
+  echo "Nginx Proxy Manager 已部署。如果映射了非标准端口，请访问对应的映射端口，例如管理后台: http://服务器IP:$port_81"
 }
 
 npm_tools_menu() {
@@ -1011,6 +1170,10 @@ it_tools_install() {
   port="${port:-8080}"
   if ! printf '%s\n' "$port" | grep -Eq '^[0-9]+$'; then
     echo "端口必须是数字。"
+    return 1
+  fi
+  if is_port_taken "$port"; then
+    echo -e "${gl_hong}错误:${gl_bai} 端口 $port 已被系统占用，请先释放该端口，或者指定其他端口。"
     return 1
   fi
 
@@ -1071,7 +1234,6 @@ panel_tools_menu() {
     echo -e "${gl_kjlan}2.   ${gl_bai}Caddy 反代管理"
     echo -e "${gl_kjlan}3.   ${gl_bai}Nginx Proxy Manager 可视化面板"
     echo -e "${gl_kjlan}4.   ${gl_bai}it-tools 工具箱"
-    echo -e "${gl_kjlan}5.   ${gl_bai}哪吒探针管理"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
@@ -1081,7 +1243,6 @@ panel_tools_menu() {
       2) caddy_tools_menu ;;
       3) npm_tools_menu ;;
       4) it_tools_menu ;;
-      5) nezha_menu ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -1135,7 +1296,11 @@ install_docker() {
   if has_cmd docker; then
     echo "Docker 安装完成。"
     docker --version
-    docker compose version 2>/dev/null || true
+    if docker compose version >/dev/null 2>&1; then
+      docker compose version
+    else
+      echo -e "${gl_huang}提示: docker compose 插件未安装，可手动执行: ua install docker-compose-plugin${gl_bai}"
+    fi
   else
     echo "Docker 安装后仍未检测到 docker 命令，请查看上方安装输出。"
     return 1
@@ -1145,6 +1310,10 @@ install_docker() {
 docker_require() {
   if ! has_cmd docker; then
     echo "未找到 Docker，请先安装 Docker。"
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "Docker 已安装但 daemon 未运行，请执行: systemctl start docker"
     return 1
   fi
 }
@@ -1190,6 +1359,9 @@ docker_global_status() {
   docker --version
   docker compose version 2>/dev/null || true
   echo ""
+  echo -e "${gl_kjlan}磁盘使用概览:${gl_bai}"
+  docker system df
+  echo ""
   echo -e "Docker 镜像: ${gl_lv}${image_count}${gl_bai}"
   docker image ls
   echo ""
@@ -1211,12 +1383,7 @@ docker_network_menu() {
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     docker network ls
     echo ""
-    echo "运行容器网络信息"
-    printf "%-28s %-22s %-16s\n" "容器名称" "网络名称" "IP地址"
-    for cid in $(docker ps -q); do
-      docker inspect --format '{{.Name}}{{range $network, $config := .NetworkSettings.Networks}} {{$network}} {{$config.IPAddress}}{{end}}' "$cid" |
-        awk '{for (i=2; i<=NF; i+=2) printf "%-28s %-22s %-16s\n", substr($1,2), $i, $(i+1)}'
-    done
+    docker_container_network_overview
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}1.   ${gl_bai}创建网络"
     echo -e "${gl_kjlan}2.   ${gl_bai}容器加入网络"
@@ -1298,6 +1465,20 @@ docker_edit_daemon() {
   need_root || return 1
   mkdir -p /etc/docker
   "${EDITOR:-nano}" /etc/docker/daemon.json
+  # 检查 JSON 语法，避免重启后 Docker 无法启动
+  if [ -f /etc/docker/daemon.json ]; then
+    if has_cmd python3; then
+      if ! python3 -m json.tool /etc/docker/daemon.json >/dev/null 2>&1; then
+        echo -e "${gl_hong}daemon.json JSON 语法错误，已取消重启，请修复后重试。${gl_bai}"
+        return 1
+      fi
+    elif has_cmd jq; then
+      if ! jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+        echo -e "${gl_hong}daemon.json JSON 语法错误，已取消重启，请修复后重试。${gl_bai}"
+        return 1
+      fi
+    fi
+  fi
   if has_cmd systemctl; then
     systemctl restart docker
   else
@@ -1309,16 +1490,21 @@ docker_uninstall() {
   need_root || return 1
   if confirm_danger "卸载 Docker，并清理容器、镜像、网络和卷" "docker rm/rmi/prune + remove docker packages"; then
     log_action "uninstall Docker"
-    docker ps -a -q 2>/dev/null | xargs -r docker rm -f
-    docker images -q 2>/dev/null | xargs -r docker rmi -f
-    docker network prune -f 2>/dev/null || true
-    docker volume prune -f 2>/dev/null || true
+    # 仅在 daemon 可访问时清理运行时资源
+    if docker info >/dev/null 2>&1; then
+      docker ps -a -q 2>/dev/null | xargs -r docker rm -f
+      docker images -q 2>/dev/null | xargs -r docker rmi -f
+      docker network prune -f 2>/dev/null || true
+      docker volume prune -f 2>/dev/null || true
+    fi
     remove_pkg docker docker.io docker-compose docker-ce docker-ce-cli containerd.io
   fi
 }
 
 docker_container_list() {
-  docker ps -a --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}'
+  printf "%-12s %-25s %-22s %-25s %-30s\n" "CONTAINER ID" "NAMES" "TYPE" "STATUS" "PORTS"
+  docker ps -a --format '{{.ID}}\t{{.Names}}\t{{if .Label "com.docker.compose.project"}}Compose ({{.Label "com.docker.compose.project"}}){{else}}docker run{{end}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null | \
+    awk -F'\t' '{printf "%-12s %-25s %-22s %-25s %-30s\n", $1, $2, $3, $4, $5}'
 }
 
 docker_container_network_overview() {
@@ -1326,18 +1512,21 @@ docker_container_network_overview() {
   echo "------------------------------------------------------------"
   printf "%-25s %-25s %-20s\n" "容器名称" "网络名称" "IP地址"
 
-  local cid
-  for cid in $(docker ps -a -q); do
-    docker inspect --format '{{.Name}}{{range $network, $config := .NetworkSettings.Networks}} {{$network}} {{$config.IPAddress}}{{end}}' "$cid" |
-      awk '{
-        name=substr($1,2);
-        if (NF < 3) {
-          printf "%-25s %-25s %-20s\n", name, "-", "-";
-        } else {
-          for (i=2; i<=NF; i+=2) printf "%-25s %-25s %-20s\n", name, $i, $(i+1);
-        }
-      }'
-  done
+  local _ids
+  _ids="$(docker ps -a -q 2>/dev/null)"
+  [ -z "$_ids" ] && return 0
+  # 一次性批量 inspect，减少 N 次子进程开销
+  # shellcheck disable=SC2086
+  docker inspect --format '{{.Name}}{{range $network, $config := .NetworkSettings.Networks}} {{$network}} {{$config.IPAddress}}{{end}}' \
+    $_ids 2>/dev/null | \
+    awk '{
+      name=substr($1,2);
+      if (NF < 3) {
+        printf "%-25s %-25s %-20s\n", name, "-", "-";
+      } else {
+        for (i=2; i<=NF; i+=2) printf "%-25s %-25s %-20s\n", name, $i, $(i+1);
+      }
+    }'
 }
 
 docker_container_action() {
@@ -1356,27 +1545,28 @@ docker_container_action() {
 
 docker_container_all_action() {
   local action="$1"
-  local ids
 
   case "$action" in
-    start|rm) ids="$(docker ps -a -q)" ;;
-    stop|restart) ids="$(docker ps -q)" ;;
+    start|rm)
+      if [ -z "$(docker ps -a -q 2>/dev/null)" ]; then
+        echo "没有可操作的容器。"; return 0
+      fi
+      ;;
+    stop|restart)
+      if [ -z "$(docker ps -q 2>/dev/null)" ]; then
+        echo "没有可操作的容器。"; return 0
+      fi
+      ;;
     *) return 1 ;;
   esac
 
-  if [ -z "$ids" ]; then
-    echo "没有可操作的容器。"
-    return 0
-  fi
-
   log_action "docker $action all containers"
-  if [ "$action" = "rm" ]; then
-    # shellcheck disable=SC2086
-    docker rm -f $ids
-  else
-    # shellcheck disable=SC2086
-    docker "$action" $ids
-  fi
+  case "$action" in
+    rm)      docker ps -a -q | xargs -r docker rm -f ;;
+    start)   docker ps -a -q | xargs -r docker start ;;
+    stop)    docker ps -q    | xargs -r docker stop ;;
+    restart) docker ps -q    | xargs -r docker restart ;;
+  esac
 }
 
 docker_container_shell() {
@@ -1387,7 +1577,10 @@ docker_container_shell() {
     return 1
   fi
 
-  docker exec -it "$name" sh -lc 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'
+  echo "提示: 按 Ctrl+D 或输入 exit 退出容器 shell"
+  docker exec -it "$name" sh -lc 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi' 2>/dev/null || \
+    docker exec -it "$name" /bin/sh 2>/dev/null || \
+    echo "无法进入容器 shell，容器可能未运行或不含可用 shell。"
 }
 
 docker_container_logs() {
@@ -1400,9 +1593,10 @@ docker_container_logs() {
   fi
 
   read -r -e -p "显示最近多少行，回车默认 200: " tail_lines
-  read -r -e -p "是否持续跟随日志？输入 y 开启: " follow
+  read -r -e -p "是否持续跟随日志？输入 y 开启（Ctrl+C 退出跟随）: " follow
 
   if [ "$follow" = "y" ] || [ "$follow" = "Y" ]; then
+    echo "提示: 按 Ctrl+C 退出日志跟随"
     docker logs -f --tail "${tail_lines:-200}" "$name"
   else
     docker logs --tail "${tail_lines:-200}" "$name"
@@ -1416,13 +1610,15 @@ docker_container_create() {
   read -r -e -p "请输入 docker run 命令或 docker run 后面的参数: " cmd
   [ -z "$cmd" ] && return 1
 
-  log_action "create container: $cmd"
   local _full_cmd
   case "$cmd" in
     docker\ run*) _full_cmd="$cmd" ;;
     *) _full_cmd="docker run $cmd" ;;
   esac
   echo -e "${gl_huang}将执行: ${gl_bai}$_full_cmd"
+  read -r -e -p "确认执行？输入 y 继续，回车取消: " _confirm
+  [ "$_confirm" != "y" ] && [ "$_confirm" != "Y" ] && echo "已取消。" && return 0
+  log_action "create container: $cmd"
   sh -c "$_full_cmd"
 }
 
@@ -1483,6 +1679,17 @@ docker_container_port_access() {
   fi
 }
 
+docker_container_rename() {
+  local old_name new_name
+  read -r -e -p "请输入要重命名的容器名/ID: " old_name
+  [ -z "$old_name" ] && echo "未输入容器名/ID。" && return 1
+  read -r -e -p "请输入新名称: " new_name
+  [ -z "$new_name" ] && echo "未输入新名称。" && return 1
+  docker rename "$old_name" "$new_name" && \
+    log_action "docker rename $old_name -> $new_name" && \
+    echo "已将容器 $old_name 重命名为 $new_name"
+}
+
 docker_container_menu() {
   while true; do
     clear
@@ -1501,6 +1708,7 @@ docker_container_menu() {
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}11.  ${gl_bai}进入指定容器           ${gl_kjlan}12.  ${gl_bai}查看容器日志"
     echo -e "${gl_kjlan}13.  ${gl_bai}查看容器网络           ${gl_kjlan}14.  ${gl_bai}查看容器占用"
+    echo -e "${gl_kjlan}17.  ${gl_bai}重命名容器"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}15.  ${gl_bai}开启容器端口访问       ${gl_kjlan}16.  ${gl_bai}关闭容器端口访问"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -1539,10 +1747,271 @@ docker_container_menu() {
       14) docker_container_stats_once; pause ;;
       15) docker_container_port_access open; pause ;;
       16) docker_container_port_access close; pause ;;
+      17) docker_container_rename; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
   done
+}
+
+docker_compose_project_control() {
+  local dir="$1"
+  local cmd_prefix
+  if docker compose version >/dev/null 2>&1; then
+    cmd_prefix="docker compose"
+  elif has_cmd docker-compose; then
+    cmd_prefix="docker-compose"
+  else
+    echo "未找到 docker compose 插件或 docker-compose。"
+    pause
+    return 1
+  fi
+
+  while true; do
+    clear
+    echo -e "${gl_kjlan}Compose 项目控制台${gl_bai}"
+    echo -e "项目路径: ${gl_lv}${dir}${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo "关联的容器运行状态："
+    local proj_name
+    proj_name="$(basename "$dir")"
+    docker ps -a --filter "label=com.docker.compose.project=${proj_name}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}Compose Up (启动/同步升级)"
+    echo -e "${gl_kjlan}2.   ${gl_bai}Compose Down (销毁并清理容器)"
+    echo -e "${gl_kjlan}3.   ${gl_bai}Compose Start (重新启动)"
+    echo -e "${gl_kjlan}4.   ${gl_bai}Compose Stop (暂停运行)"
+    echo -e "${gl_kjlan}5.   ${gl_bai}Compose Restart (重启容器)"
+    echo -e "${gl_kjlan}6.   ${gl_bai}查看容器日志 (Logs)"
+    echo -e "${gl_kjlan}7.   ${gl_bai}拉取新镜像 (Pull)"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回项目列表"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入操作编号: " op_choice || break
+
+    case "$op_choice" in
+      1)
+        log_action "$cmd_prefix up -d in $dir"
+        (cd "$dir" && $cmd_prefix up -d)
+        pause
+        ;;
+      2)
+        if confirm_danger "销毁该 Compose 项目下的所有容器" "$dir"; then
+          log_action "$cmd_prefix down in $dir"
+          (cd "$dir" && $cmd_prefix down)
+        fi
+        pause
+        ;;
+      3)
+        log_action "$cmd_prefix start in $dir"
+        (cd "$dir" && $cmd_prefix start)
+        pause
+        ;;
+      4)
+        log_action "$cmd_prefix stop in $dir"
+        (cd "$dir" && $cmd_prefix stop)
+        pause
+        ;;
+      5)
+        log_action "$cmd_prefix restart in $dir"
+        (cd "$dir" && $cmd_prefix restart)
+        pause
+        ;;
+      6)
+        read -r -e -p "输入日志行数，回车默认 100: " lines
+        lines="${lines:-100}"
+        (cd "$dir" && $cmd_prefix logs --tail "$lines")
+        pause
+        ;;
+      7)
+        log_action "$cmd_prefix pull in $dir"
+        (cd "$dir" && $cmd_prefix pull)
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效操作"; pause ;;
+    esac
+  done
+}
+
+docker_compose_menu() {
+  docker_require || { pause; return; }
+
+  local proj_dirs=()
+  local dir
+
+  # 1. 优先从容器 Labels 中直接秒级抓取已被 Docker 记录的 Compose 工作目录，完全免去 find 扫描
+  echo "正在从系统容器中自动提取 Compose 项目目录..."
+  while IFS= read -r dir; do
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      proj_dirs+=("$dir")
+    fi
+  done < <(docker ps -a --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u)
+
+  while true; do
+    clear
+    echo -e "${gl_kjlan}Docker Compose 项目管理${gl_bai}"
+    echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
+    
+    local idx=1
+    if [ ${#proj_dirs[@]} -gt 0 ]; then
+      echo "从系统容器运行历史中自动获取的项目："
+      for dir in "${proj_dirs[@]}"; do
+        printf "%2d)  %-30s (%s)\n" "$idx" "$(basename "$dir")" "$dir"
+        idx=$((idx + 1))
+      done
+    else
+      echo "（暂未检测到运行过 Compose 的容器记录）"
+    fi
+    echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
+    echo -e "${gl_kjlan}s.   ${gl_bai}手动扫描未启动的项目目录"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上级"
+    echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
+    
+    read -r -e -p "请输入项目编号或选择操作: " choice
+    [ -z "$choice" ] && continue
+    if [ "$choice" = "0" ]; then
+      break
+    fi
+
+    # 手动扫描
+    if [ "$choice" = "s" ] || [ "$choice" = "S" ]; then
+      local search_dir="/root"
+      echo "默认扫描目录为 /root 和 /home（限深 5 层）。"
+      read -r -e -p "请输入你要扫描的目录，直接回车默认: " user_dir
+      [ -n "$user_dir" ] && search_dir="$user_dir"
+
+      if [ ! -d "$search_dir" ]; then
+        echo "错误: 目录不存在: $search_dir"
+        pause
+        continue
+      fi
+
+      echo "正在扫描 $search_dir 下的 Compose 项目，请稍候..."
+      local scanned_files=()
+      local f scanned_dir
+      while IFS= read -r f; do
+        [ -n "$f" ] && scanned_files+=("$f")
+      done < <(find "$search_dir" -maxdepth 5 \( -name "docker-compose.yml" -o -name "docker-compose.yaml" -o -name "compose.yml" -o -name "compose.yaml" \) 2>/dev/null)
+
+      # 合并到 proj_dirs 中去重
+      local added_count=0
+      for f in "${scanned_files[@]}"; do
+        scanned_dir="$(dirname "$f")"
+        local exists=0
+        for d in "${proj_dirs[@]}"; do
+          [ "$d" = "$scanned_dir" ] && exists=1 && break
+        done
+        if [ "$exists" -eq 0 ]; then
+          proj_dirs+=("$scanned_dir")
+          added_count=$((added_count + 1))
+        fi
+      done
+      echo "扫描完成。新增找到 $added_count 个未运行的项目目录。"
+      pause
+      continue
+    fi
+
+    # 选项编号合法性判断
+    if ! printf '%s\n' "$choice" | grep -Eq '^[0-9]+$' || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#proj_dirs[@]} ]; then
+      echo "无效选择。"
+      pause
+      continue
+    fi
+
+    local target_dir="${proj_dirs[$((choice - 1))]}"
+    docker_compose_project_control "$target_dir"
+  done
+}
+
+docker_limit_container_logs() {
+  need_root || return 1
+  mkdir -p /etc/docker
+  local daemon_file="/etc/docker/daemon.json"
+
+  echo -e "${gl_kjlan}Docker 容器日志体积限制${gl_bai}"
+  echo -e "该操作将限制所有新建/重建的容器日志最大为 50MB，并仅保留最近 3 个文件，彻底杜绝磁盘爆满问题。"
+  echo -e "已运行的容器在下次重建(docker rm & docker run)时该配置会生效。"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+
+  if [ -f "$daemon_file" ]; then
+    echo "检测到已存在 daemon.json。正在尝试安全合并限制参数..."
+    cp "$daemon_file" "${daemon_file}.ua-box.bak.$(date +%Y%m%d-%H%M%S)"
+    
+    local success=0
+    if has_cmd python3; then
+      python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data["log-driver"] = "json-file"
+data["log-opts"] = {"max-size": "50m", "max-file": "3"}
+with open(sys.argv[1], "w") as f:
+    json.dump(data, f, indent=2)
+' "$daemon_file" && success=1
+    elif has_cmd jq; then
+      local tmp_json
+      tmp_json="$(jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}}' "$daemon_file" 2>/dev/null)"
+      if [ -n "$tmp_json" ]; then
+        echo "$tmp_json" > "$daemon_file"
+        success=1
+      fi
+    fi
+
+    if [ "$success" -eq 1 ]; then
+      echo -e "${gl_lv}成功将限制参数安全合并进现有的 daemon.json 中！${gl_bai}"
+    else
+      echo -e "${gl_huang}警告: 未找到 python3/jq 或合并解析出错。将覆盖写入全新的限制配置。${gl_bai}"
+      cat > "$daemon_file" <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  }
+}
+EOF
+    fi
+  else
+    cat > "$daemon_file" <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  }
+}
+EOF
+    echo -e "${gl_lv}已创建并写入限制容器日志配置到 /etc/docker/daemon.json${gl_bai}"
+  fi
+
+  # 语法校验以防写入乱码导致 docker 启动失败
+  local check_rc=0
+  if has_cmd python3; then
+    python3 -m json.tool "$daemon_file" >/dev/null 2>&1 || check_rc=$?
+  elif has_cmd jq; then
+    jq . "$daemon_file" >/dev/null 2>&1 || check_rc=$?
+  fi
+
+  if [ "$check_rc" -eq 0 ]; then
+    echo "正在重启 Docker 以重载配置..."
+    if has_cmd systemctl; then
+      systemctl restart docker && echo -e "${gl_lv}Docker 服务已重启，日志配置已全局生效！${gl_bai}"
+    else
+      svc restart docker && echo -e "${gl_lv}Docker 服务已重启，日志配置已全局生效！${gl_bai}"
+    fi
+  else
+    echo -e "${gl_hong}错误: 配置文件 JSON 语法校验失败，已自动恢复备份。${gl_bai}"
+    local latest_bak
+    latest_bak="$(ls -t "${daemon_file}.ua-box.bak."* 2>/dev/null | head -n 1)"
+    if [ -n "$latest_bak" ] && [ -f "$latest_bak" ]; then
+      cp "$latest_bak" "$daemon_file" && echo "已恢复先前配置文件。"
+    else
+      rm -f "$daemon_file"
+    fi
+  fi
 }
 
 docker_menu() {
@@ -1565,10 +2034,11 @@ docker_menu() {
     echo -e "${gl_kjlan}5.   ${gl_bai}拉取镜像"
     echo -e "${gl_kjlan}6.   ${gl_bai}Docker 网络管理"
     echo -e "${gl_kjlan}7.   ${gl_bai}Docker 卷管理"
-    echo -e "${gl_kjlan}8.   ${gl_bai}Compose up"
-    echo -e "${gl_kjlan}9.   ${gl_bai}Compose down"
-    echo -e "${gl_kjlan}10.  ${gl_bai}清理无用资源"
+    echo -e "${gl_kjlan}8.   ${gl_bai}Docker Compose 项目管理（自动寻找与控制）"
+    echo -e "${gl_kjlan}10.  ${gl_bai}清理无用资源（全量）"
     echo -e "${gl_kjlan}11.  ${gl_bai}编辑 daemon.json 并重启"
+    echo -e "${gl_kjlan}12.  ${gl_bai}清理悬空镜像（dangling）"
+    echo -e "${gl_kjlan}13.  ${gl_bai}限制容器日志大小 (防撑爆磁盘)"
     echo -e "${gl_kjlan}20.  ${gl_bai}卸载 Docker"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -1587,34 +2057,33 @@ docker_menu() {
         ;;
       6) docker_network_menu ;;
       7) docker_volume_menu ;;
-      8)
-        docker_require || { pause; continue; }
-        read -r -e -p "请输入 compose 项目目录，回车为当前目录: " dir
-        docker_compose_run up "$dir"
-        pause
-        ;;
-      9)
-        docker_require || { pause; continue; }
-        read -r -e -p "请输入 compose 项目目录，回车为当前目录: " dir
-        if docker compose version >/dev/null 2>&1; then
-          (cd "${dir:-.}" && docker compose down)
-        elif has_cmd docker-compose; then
-          (cd "${dir:-.}" && docker-compose down)
-        else
-          echo "未找到 docker compose 插件或 docker-compose。"
-        fi
-        pause
-        ;;
+      8) docker_compose_menu ;;
       10)
         docker_require || { pause; continue; }
         if confirm_danger "清理停止容器、无用镜像、网络、卷和构建缓存" "docker system prune -af --volumes"; then
           log_action "docker system prune"
           docker system prune -af --volumes
-          docker builder prune -af
         fi
         pause
         ;;
       11) docker_edit_daemon; pause ;;
+      12)
+        docker_require || { pause; continue; }
+        local dcount
+        dcount="$(docker images -f dangling=true -q 2>/dev/null | wc -l)"
+        if [ "$dcount" -eq 0 ]; then
+          echo "无悬空镜像。"
+        else
+          echo "发现 ${dcount} 个悬空镜像:"
+          docker images -f dangling=true
+          if confirm_danger "清理 ${dcount} 个悬空镜像" "docker image prune -f"; then
+            docker image prune -f
+            log_action "docker image prune (dangling)"
+          fi
+        fi
+        pause
+        ;;
+       13) docker_limit_container_logs; pause ;;
       20) docker_uninstall; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
@@ -1634,11 +2103,18 @@ tmux_open_session() {
   [ -z "$name" ] && name="ua"
   tmux_require || return 1
 
-  if tmux has-session -t "$name" 2>/dev/null; then
-    tmux attach -t "$name"
-  else
-    tmux new -s "$name"
+  # 若会话不存在则静默创建
+  if ! tmux has-session -t "$name" 2>/dev/null; then
+    tmux new-session -d -s "$name"
   fi
+
+  # 注入状态栏常驻退出向导 (高亮红底白字)
+  tmux set-option -t "$name" status-right-length 50 2>/dev/null || true
+  tmux set-option -t "$name" status-right " 退出: Ctrl+B, D " 2>/dev/null || true
+  tmux set-option -t "$name" status-right-style "bg=red,fg=white,bold" 2>/dev/null || true
+
+  # 附加挂载
+  tmux attach-session -t "$name"
 }
 
 tmux_ssh_persistent_menu() {
@@ -1851,9 +2327,7 @@ rclone_config_check() {
     fi
     printf "%s\n" "$status"
     printf '%s\t%s\t%s\n' "$remote" "$status" "$(printf '%s' "$output" | tr '\t\r\n' '   ' | cut -c1-90)" >> "$result_file"
-  done <<EOF
-$(rclone listremotes 2>/dev/null | sed 's/:$//')
-EOF
+  done < <(rclone listremotes 2>/dev/null | sed 's/:$//')
 
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   printf "%-18s %-10s %-16s %-16s %-10s %-32s\n" "Name" "Type" "Auth" "Scope/Root" "Connect" "Message"
@@ -1950,6 +2424,114 @@ rclone_choose_remote_lsd() {
   rclone lsd "$remote_path"
 }
 
+rclone_mount_systemd() {
+  need_root || return 1
+  rclone_require || return 1
+
+  local remote_path mount_point extra config_file rclone_path service_name service_file
+  read -r -e -p "请输入远程路径，如 remote:path : " remote_path
+  read -r -e -p "请输入本地挂载点: " mount_point
+  read -r -e -p "额外参数，回车使用默认: " extra
+  [ -z "$extra" ] && extra="$DEFAULT_RCLONE_MOUNT_ARGS"
+
+  if [ -z "$remote_path" ] || [ -z "$mount_point" ]; then
+    echo "远程路径和本地挂载点不能为空。"
+    return 1
+  fi
+
+  # 转换绝对路径
+  mkdir -p "$mount_point"
+  mount_point="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
+
+  # 生成合法的服务名后缀
+  service_name="$(echo "$mount_point" | sed 's|^/||; s|/|-|g; s|[^a-zA-Z0-9-]||g')"
+  [ -z "$service_name" ] && service_name="default"
+  service_file="/etc/systemd/system/rclone-mount-${service_name}.service"
+
+  config_file="$(rclone_config_file_path)"
+  rclone_path="$(command -v rclone 2>/dev/null || echo "/usr/bin/rclone")"
+
+  # 写入服务文件：限制 5分钟(300s)内最多重试 5 次，规避无限循环重启
+  cat > "$service_file" <<EOF
+[Unit]
+Description=RClone Mount Service for ${service_name}
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=${rclone_path} mount "${remote_path}" "${mount_point}" --config="${config_file}" ${extra}
+ExecStop=/bin/umount -l "${mount_point}"
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "rclone-mount-${service_name}.service"
+  systemctl restart "rclone-mount-${service_name}.service"
+
+  sleep 1.5
+  if systemctl is-active --quiet "rclone-mount-${service_name}.service"; then
+    log_action "rclone systemd mount configured: ${service_name} -> ${mount_point}"
+    echo -e "${gl_lv}✓ RClone 开机自启守护服务已成功配置并启动！${gl_bai}"
+    echo "服务名称: rclone-mount-${service_name}.service"
+    echo "挂载点: $mount_point"
+  else
+    echo -e "${gl_hong}✗ 服务启动失败！${gl_bai} 请执行以下命令查看日志排查原因："
+    echo "journalctl -u rclone-mount-${service_name}.service -n 50 --no-pager"
+  fi
+}
+
+rclone_unmount_point() {
+  local mount_point service_name service_file
+  read -r -e -p "请输入本地挂载点: " mount_point
+  [ -z "$mount_point" ] && echo "挂载点不能为空。" && return 1
+
+  mount_point="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
+  service_name="$(echo "$mount_point" | sed 's|^/||; s|/|-|g; s|[^a-zA-Z0-9-]||g')"
+  [ -z "$service_name" ] && service_name="default"
+  service_file="/etc/systemd/system/rclone-mount-${service_name}.service"
+
+  if [ -f "$service_file" ]; then
+    echo "检测到该挂载点由 Systemd 守护服务运行，正在卸载并删除该开机自启服务..."
+    systemctl disable --now "rclone-mount-${service_name}.service" 2>/dev/null || true
+    rm -f "$service_file"
+    systemctl daemon-reload
+    log_action "rclone systemd mount removed: ${service_name}"
+    echo "Systemd 守护服务已被清除。"
+  fi
+
+  if has_cmd fusermount; then
+    fusermount -uz "$mount_point" 2>/dev/null || umount -l "$mount_point" 2>/dev/null || true
+  elif has_cmd fusermount3; then
+    fusermount3 -uz "$mount_point" 2>/dev/null || umount -l "$mount_point" 2>/dev/null || true
+  else
+    umount -l "$mount_point" 2>/dev/null || true
+  fi
+  echo "挂载点卸载操作已完成。"
+}
+
+rclone_edit_config() {
+  rclone_require || return 1
+  local config_file
+  config_file="$(rclone_config_file_path)"
+  if [ -z "$config_file" ] || [ ! -f "$config_file" ]; then
+    echo "未找到 rclone 配置文件。您可以先选择 2 配置 rclone 创建一个。"
+    return 1
+  fi
+
+  echo "正在使用默认编辑器打开配置文件: $config_file"
+  # 安全备份
+  cp "$config_file" "${config_file}.ua-box.bak.$(date +%Y%m%d-%H%M%S)"
+  "${EDITOR:-nano}" "$config_file"
+  echo "配置文件已编辑完成。"
+}
+
 rclone_menu() {
   while true; do
     clear
@@ -1977,11 +2559,13 @@ rclone_menu() {
     echo -e "${gl_kjlan}4.   ${gl_bai}列出远程目录"
     echo -e "${gl_kjlan}5.   ${gl_bai}复制 copy"
     echo -e "${gl_kjlan}6.   ${gl_bai}同步 sync"
-    echo -e "${gl_kjlan}7.   ${gl_bai}挂载远程盘"
-    echo -e "${gl_kjlan}8.   ${gl_bai}卸载挂载点"
-    echo -e "${gl_kjlan}9.   ${gl_bai}查看 rclone mount 进程"
-    echo -e "${gl_kjlan}10.  ${gl_bai}打开 rclone ncdu"
-    echo -e "${gl_kjlan}11.  ${gl_bai}查看配置情况检测"
+    echo -e "${gl_kjlan}7.   ${gl_bai}挂载远程盘（临时/后台进程）"
+    echo -e "${gl_kjlan}8.   ${gl_bai}挂载远程盘（开机自启/Systemd守护）"
+    echo -e "${gl_kjlan}9.   ${gl_bai}卸载挂载点"
+    echo -e "${gl_kjlan}10.  ${gl_bai}查看 rclone 挂载与守护服务状态"
+    echo -e "${gl_kjlan}11.  ${gl_bai}打开 rclone ncdu"
+    echo -e "${gl_kjlan}12.  ${gl_bai}查看配置情况检测"
+    echo -e "${gl_kjlan}13.  ${gl_bai}编辑 rclone.conf 配置文件 (高级/手动)"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice
@@ -2026,25 +2610,26 @@ rclone_menu() {
         rclone mount "$remote_path" "$mount_point" --daemon $extra
         pause
         ;;
-      8)
-        read -r -e -p "请输入本地挂载点: " mount_point
-        if has_cmd fusermount; then
-          fusermount -uz "$mount_point"
-        elif has_cmd fusermount3; then
-          fusermount3 -uz "$mount_point"
+      8) rclone_mount_systemd; pause ;;
+      9) rclone_unmount_point; pause ;;
+      10)
+        pgrep -af "rclone mount" || echo "未找到前台/后台 rclone mount 挂载进程。"
+        echo -e "\n${gl_kjlan}Systemd 守护服务运行列表:${gl_bai}"
+        if has_cmd systemctl; then
+          systemctl list-units --type=service --all | grep "rclone-mount" || echo "未找到正在运行的 RClone 守护服务。"
         else
-          umount "$mount_point"
+          echo "当前系统不支持 systemctl 检测。"
         fi
         pause
         ;;
-      9) pgrep -af "rclone mount" || echo "未找到 rclone mount 进程。"; pause ;;
-      10)
+      11)
         rclone_require || { pause; continue; }
         read -r -e -p "请输入路径，如 remote:path : " path
         rclone ncdu "$path"
         pause
         ;;
-      11) rclone_config_check; pause ;;
+      12) rclone_config_check; pause ;;
+      13) rclone_edit_config; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -2057,8 +2642,56 @@ run_downloaded_script() {
   shift 2
 
   download_to "$url" "$target" || return 1
+  if ! bash -n "$target" 2>/dev/null; then
+    echo "脚本语法校验失败，已跳过执行。"
+    rm -f "$target"
+    return 1
+  fi
   chmod +x "$target"
   bash "$target" "$@"
+}
+
+run_speed_io_test() {
+  clear
+  echo -e "${gl_kjlan}极速网络与磁盘 IO 自检${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+
+  # 1. 磁盘 IO 测试
+  echo -e "${gl_huang}正在评估磁盘写入速度（测试 1GB 连续写入，请稍候...）${gl_bai}"
+  local io_res
+  io_res="$(dd if=/dev/zero of=ua_io_speed_test_file bs=1M count=1024 oflag=direct 2>&1 | awk '/copied/ {print $(NF-1), $NF; exit} {speed=$0} END {print speed}')"
+  rm -f ua_io_speed_test_file
+  echo -e "磁盘写入速度: ${gl_lv}${io_res:-未知}${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+
+  # 2. 网络延迟测试
+  echo -e "${gl_huang}正在测算各大骨干网络延迟...${gl_bai}"
+  printf "%-20s %-16s %-12s\n" "测试节点" "目标 IP" "平均延迟"
+
+  local nodes=(
+    "Cloudflare DNS" "1.1.1.1"
+    "Google DNS" "8.8.8.8"
+    "北京电信" "219.141.136.12"
+    "北京联通" "202.106.50.1"
+    "北京移动" "221.179.155.161"
+    "上海电信" "202.96.209.133"
+    "上海联通" "210.22.97.1"
+    "上海移动" "211.136.112.200"
+    "广州电信" "58.60.188.222"
+    "广州联通" "210.21.196.6"
+    "广州移动" "120.196.165.24"
+  )
+
+  local i name ip delay
+  for ((i=0; i<${#nodes[@]}; i+=2)); do
+    name="${nodes[i]}"
+    ip="${nodes[i+1]}"
+    delay="$(ping -c 3 -W 2 "$ip" 2>/dev/null | awk -F'/' '/rtt|minavgmax/ {print $(NF-2)" ms"}')"
+    [ -z "$delay" ] && delay="${gl_hong}超时/不可达${gl_bai}" || delay="${gl_lv}${delay}${gl_bai}"
+    printf "%-20s %-16s %b\n" "$name" "$ip" "$delay"
+  done
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo "自检完成。"
 }
 
 test_scripts_menu() {
@@ -2085,6 +2718,7 @@ test_scripts_menu() {
     echo -e "${gl_kjlan}21.  ${gl_bai}YABS 综合性能测试"
     echo -e "${gl_kjlan}22.  ${gl_bai}YABS 跳过 iperf"
     echo -e "${gl_kjlan}23.  ${gl_bai}icu/gb5 CPU 性能测试"
+    echo -e "${gl_kjlan}24.  ${gl_bai}极速硬盘与网络延迟自检"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}常用基础测试${gl_bai}"
     echo -e "${gl_kjlan}31.  ${gl_bai}bench.sh 基础性能测试"
@@ -2124,6 +2758,7 @@ test_scripts_menu() {
       21) run_downloaded_script "$YABS_SCRIPT" "$UA_BOX_TMP_DIR"/yabs.sh; pause ;;
       22) run_downloaded_script "$YABS_SCRIPT" "$UA_BOX_TMP_DIR"/yabs.sh -i; pause ;;
       23) run_downloaded_script "$GB5_SCRIPT" "$UA_BOX_TMP_DIR"/gb5.sh; pause ;;
+      24) run_speed_io_test; pause ;;
       31) run_downloaded_script "$BENCH_SCRIPT" "$UA_BOX_TMP_DIR"/bench.sh; pause ;;
       32) run_downloaded_script "$FUSION_TEST_SCRIPT" "$UA_BOX_TMP_DIR"/fusion-test.sh; pause ;;
       33) install_pkg speedtest-cli; pause ;;
@@ -2356,7 +2991,7 @@ ssh_set_global_option() {
         print key " " value
       }
     }
-  ' "$file" > "$tmp" && cat "$tmp" > "$file"
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
   local rc=$?
   rm -f "$tmp"
   return "$rc"
@@ -2891,6 +3526,14 @@ if [ "\$today" = "\$(printf "%02d" "\$RESET_DAY")" ] && [ "\${LAST_RESET:-}" != 
   . "\$STATE_FILE"
 fi
 
+# 检测计数器归零（系统重启导致 /proc/net/dev 重置为小值）
+if [ "\$rx_now" -lt "\${RX_BASE:-0}" ] || [ "\$tx_now" -lt "\${TX_BASE:-0}" ]; then
+  logger "UA Box limit shutdown: counter reset detected (reboot), updating baseline"
+  printf 'RX_BASE=%s\nTX_BASE=%s\nLAST_RESET=%s\n' "\$rx_now" "\$tx_now" "\$today_full" > "\$STATE_FILE"
+  # shellcheck disable=SC1090
+  . "\$STATE_FILE"
+fi
+
 rx_used_gb="\$(( (rx_now - RX_BASE) / 1024 / 1024 / 1024 ))"
 tx_used_gb="\$(( (tx_now - TX_BASE) / 1024 / 1024 / 1024 ))"
 
@@ -2918,6 +3561,25 @@ EOF
   esac
 }
 
+# 公共函数: 应用 hostname 修改并同步 /etc/hosts
+_apply_hostname() {
+  local new_hostname="$1"
+  local current_hostname="$2"
+  if has_cmd hostnamectl; then
+    hostnamectl set-hostname "$new_hostname"
+  else
+    hostname "$new_hostname"
+    printf '%s\n' "$new_hostname" > /etc/hostname
+  fi
+  if grep -q "$current_hostname" /etc/hosts 2>/dev/null; then
+    sed -i "s/\b${current_hostname}\b/${new_hostname}/g" /etc/hosts
+  fi
+  if ! grep -q "$new_hostname" /etc/hosts 2>/dev/null; then
+    echo "127.0.1.1 $new_hostname" >> /etc/hosts
+  fi
+  echo "已同步更新 /etc/hosts。"
+}
+
 system_set_hostname() {
   local current_hostname new_hostname
   current_hostname="$(hostname)"
@@ -2932,23 +3594,7 @@ system_set_hostname() {
     return 1
   fi
 
-  if has_cmd hostnamectl; then
-    hostnamectl set-hostname "$new_hostname"
-  else
-    hostname "$new_hostname"
-    printf '%s\n' "$new_hostname" > /etc/hostname
-  fi
-
-  # 同步 /etc/hosts 中的旧 hostname 映射
-  if grep -q "$current_hostname" /etc/hosts 2>/dev/null; then
-    sed -i "s/\b${current_hostname}\b/${new_hostname}/g" /etc/hosts
-  fi
-  # 确保新的 hostname 在 /etc/hosts 中可解析（防止 sudo 卡顿报错）
-  if ! grep -q "$new_hostname" /etc/hosts 2>/dev/null; then
-    echo "127.0.1.1 $new_hostname" >> /etc/hosts
-  fi
-  echo "已同步更新 /etc/hosts。"
-
+  _apply_hostname "$new_hostname" "$current_hostname"
   log_action "set hostname: $current_hostname -> $new_hostname"
   echo -e "hostname 已修改为: ${gl_lv}${new_hostname}${gl_bai}"
   echo -e "${gl_huang}提示:${gl_bai} 新 hostname 对当前 shell 的提示符立即生效，重新登录后完全生效。"
@@ -2988,6 +3634,8 @@ system_init_optimize() {
   echo -e "  ${gl_kjlan}[3]${gl_bai} 设置 Swap 为内存的 2 倍 (${swap_mb}MB，当前内存 ${mem_mb}MB)"
   echo -e "  ${gl_kjlan}[4]${gl_bai} 安装 Docker"
   echo -e "  ${gl_kjlan}[5]${gl_bai} 修改 hostname（可选，默认跳过）"
+  echo -e "  ${gl_kjlan}[6]${gl_bai} 开启网络内核协议栈高级优化"
+  echo -e "  ${gl_kjlan}[7]${gl_bai} 默认开启 BBR 拥塞控制"
   echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
 
   # ── 询问是否修改 hostname ────────────────────────────────
@@ -3116,25 +3764,67 @@ system_init_optimize() {
   fi
 
   # ── [5] 修改 hostname ────────────────────────────────────
-  echo -e "\n${gl_kjlan}[5/5] 修改 hostname...${gl_bai}"
+  echo -e "\n${gl_kjlan}[5/7] 修改 hostname...${gl_bai}"
   if [ "$do_hostname" = "y" ] || [ "$do_hostname" = "Y" ]; then
-    if has_cmd hostnamectl; then
-      hostnamectl set-hostname "$new_hostname"
-    else
-      hostname "$new_hostname"
-      printf '%s\n' "$new_hostname" > /etc/hostname
-    fi
-    if grep -q "$current_hostname" /etc/hosts 2>/dev/null; then
-      sed -i "s/\b${current_hostname}\b/${new_hostname}/g" /etc/hosts
-    fi
-    if ! grep -q "$new_hostname" /etc/hosts 2>/dev/null; then
-      echo "127.0.1.1 $new_hostname" >> /etc/hosts
-    fi
+    _apply_hostname "$new_hostname" "$current_hostname"
     log_action "init_optimize hostname: $current_hostname -> $new_hostname"
     r_hostname=1
     echo -e "$step_ok hostname 已修改为 ${gl_lv}${new_hostname}${gl_bai}"
   else
     echo -e "$step_skip hostname 已跳过（保持 ${current_hostname}）"
+  fi
+
+  # ── [6] TCP 协议栈网络高级优化 ───────────────────────────
+  echo -e "\n${gl_kjlan}[6/7] 开启网络内核协议栈高级优化...${gl_bai}"
+  local r_tcptune=0
+  local sysctl_tcp_conf="/etc/sysctl.d/99-ua-tcp-tune.conf"
+  cat > "$sysctl_tcp_conf" <<'TCPTUNE'
+# UA Box TCP High Performance Tuning
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_tw_buckets = 5000
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.core.somaxconn = 4096
+TCPTUNE
+  if sysctl -p "$sysctl_tcp_conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1; then
+    r_tcptune=1
+    echo -e "$step_ok TCP 调优配置已成功加载"
+  else
+    echo -e "$step_fail TCP 调优配置加载失败"
+  fi
+
+  # ── [7] 默认开启 BBR 拥塞控制 ─────────────────────────────
+  echo -e "\n${gl_kjlan}[7/7] 默认开启 BBR 拥塞控制...${gl_bai}"
+  local r_bbr=0
+  local virt_type
+  virt_type="$(get_virt)"
+  if [ "$virt_type" = "OPENVZ" ] || [ "$virt_type" = "LXC" ]; then
+    echo -e "$step_skip 架构为 ${virt_type}，不支持开启 BBR"
+  else
+    local kver major minor
+    kver="$(uname -r)"
+    major="$(printf '%s' "$kver" | cut -d. -f1)"
+    minor="$(printf '%s' "$kver" | cut -d. -f2)"
+    if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+      echo -e "$step_fail 当前内核 $kver 不支持 BBR（需要 >= 4.9）"
+    else
+      modprobe tcp_bbr 2>/dev/null || true
+      local sysctl_conf="/etc/sysctl.d/99-ua-bbr.conf"
+      cat > "$sysctl_conf" <<'SYSCTL'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+SYSCTL
+      if sysctl -p "$sysctl_conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1; then
+        r_bbr=1
+        echo -e "$step_ok BBR 拥塞控制已成功开启"
+      else
+        echo -e "$step_fail BBR 开启失败"
+      fi
+    fi
   fi
 
   # ── 汇总报告 ─────────────────────────────────────────────
@@ -3181,6 +3871,20 @@ system_init_optimize() {
     echo -e "  $step_skip hostname 未修改（${current_hostname}）"
   fi
 
+  # TCP 协议栈调优
+  [ "$r_tcptune" -eq 1 ] && echo -e "  $step_ok TCP 协议栈高级优化已生效" || echo -e "  $step_fail TCP 协议栈高级优化"
+
+  # BBR 拥塞控制
+  if [ "$r_bbr" -eq 1 ]; then
+    echo -e "  $step_ok BBR 拥塞控制已开启"
+  else
+    if [ "$virt_type" = "OPENVZ" ] || [ "$virt_type" = "LXC" ]; then
+      echo -e "  $step_skip BBR 拥塞控制（容器虚拟化暂不支持）"
+    else
+      echo -e "  $step_fail BBR 拥塞控制（内核版本过低或配置加载失败）"
+    fi
+  fi
+
   echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
   log_action "init_optimize done"
 }
@@ -3188,62 +3892,92 @@ system_init_optimize() {
 
 # ── BBR + 防火墙管理 ─────────────────────────────────────────
 system_bbr_menu() {
-  local cur_cc cur_qdisc
-  cur_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
-  cur_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '未知')"
+  local cur_cc cur_qdisc choice
+  while true; do
+    cur_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
+    cur_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '未知')"
+    clear
+    echo -e "${gl_kjlan}BBR 拥塞控制与网络调优${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "当前拥塞控制: ${gl_lv}${cur_cc}${gl_bai}"
+    echo -e "当前队列算法: ${gl_lv}${cur_qdisc}${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}开启 BBR"
+    echo -e "${gl_kjlan}2.   ${gl_bai}关闭 BBR（恢复 cubic）"
+    echo -e "${gl_kjlan}3.   ${gl_bai}开启网络内核协议栈高级优化"
+    echo -e "${gl_kjlan}4.   ${gl_bai}恢复默认 TCP 参数"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回"
+    read -r -e -p "请输入你的选择: " choice || break
 
-  clear
-  echo -e "${gl_kjlan}BBR 拥塞控制${gl_bai}"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
-  echo -e "当前拥塞控制: ${gl_lv}${cur_cc}${gl_bai}"
-  echo -e "当前队列算法: ${gl_lv}${cur_qdisc}${gl_bai}"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
-  echo -e "${gl_kjlan}1.   ${gl_bai}开启 BBR"
-  echo -e "${gl_kjlan}2.   ${gl_bai}关闭 BBR（恢复 cubic）"
-  echo -e "${gl_kjlan}0.   ${gl_bai}返回"
-  read -r -e -p "请输入你的选择: " choice
-
-  case "$choice" in
-    1)
-      need_root || return 1
-      # 内核版本需 >= 4.9
-      local kver major minor
-      kver="$(uname -r)"
-      major="$(printf '%s' "$kver" | cut -d. -f1)"
-      minor="$(printf '%s' "$kver" | cut -d. -f2)"
-      if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
-        echo -e "${gl_hong}当前内核 $kver 不支持 BBR（需要 >= 4.9）${gl_bai}"
-        return 1
-      fi
-      # 加载模块
-      modprobe tcp_bbr 2>/dev/null || true
-      # 写入 sysctl
-      local sysctl_conf="/etc/sysctl.d/99-ua-bbr.conf"
-      cat > "$sysctl_conf" <<'SYSCTL'
+    case "$choice" in
+      1)
+        need_root || { pause; continue; }
+        local kver major minor
+        kver="$(uname -r)"
+        major="$(printf '%s' "$kver" | cut -d. -f1)"
+        minor="$(printf '%s' "$kver" | cut -d. -f2)"
+        if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+          echo -e "${gl_hong}当前内核 $kver 不支持 BBR（需要 >= 4.9）${gl_bai}"
+          pause; continue
+        fi
+        modprobe tcp_bbr 2>/dev/null || true
+        local sysctl_conf="/etc/sysctl.d/99-ua-bbr.conf"
+        cat > "$sysctl_conf" <<'SYSCTL'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 SYSCTL
-      sysctl -p "$sysctl_conf" > /dev/null 2>&1 || sysctl --system > /dev/null 2>&1 || true
-      local now_cc
-      now_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-      if [ "$now_cc" = "bbr" ]; then
-        log_action "BBR enabled"
-        echo -e "${gl_lv}BBR 已成功开启！${gl_bai}"
-      else
-        echo -e "${gl_hong}BBR 开启失败，当前: $now_cc${gl_bai}"
-      fi
-      ;;
-    2)
-      need_root || return 1
-      rm -f /etc/sysctl.d/99-ua-bbr.conf
-      sysctl -w net.ipv4.tcp_congestion_control=cubic > /dev/null 2>&1 || true
-      sysctl -w net.core.default_qdisc=pfifo_fast > /dev/null 2>&1 || true
-      log_action "BBR disabled, restored cubic"
-      echo -e "${gl_lv}已恢复 cubic 拥塞控制。${gl_bai}"
-      ;;
-    0) return 0 ;;
-    *) echo "无效输入" ;;
-  esac
+        sysctl -p "$sysctl_conf" > /dev/null 2>&1 || sysctl --system > /dev/null 2>&1 || true
+        local now_cc
+        now_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+        if [ "$now_cc" = "bbr" ]; then
+          log_action "BBR enabled"
+          echo -e "${gl_lv}BBR 已成功开启！${gl_bai}"
+        else
+          echo -e "${gl_hong}BBR 开启失败，当前: $now_cc${gl_bai}"
+        fi
+        pause
+        ;;
+      2)
+        need_root || { pause; continue; }
+        rm -f /etc/sysctl.d/99-ua-bbr.conf
+        sysctl -w net.ipv4.tcp_congestion_control=cubic > /dev/null 2>&1 || true
+        sysctl -w net.core.default_qdisc=pfifo_fast > /dev/null 2>&1 || true
+        log_action "BBR disabled, restored cubic"
+        echo -e "${gl_lv}已恢复 cubic 拥塞控制。${gl_bai}"
+        pause
+        ;;
+      3)
+        need_root || { pause; continue; }
+        local sysctl_tcp_conf="/etc/sysctl.d/99-ua-tcp-tune.conf"
+        cat > "$sysctl_tcp_conf" <<'TCPTUNE'
+# UA Box TCP High Performance Tuning
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_tw_buckets = 5000
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.core.somaxconn = 4096
+TCPTUNE
+        sysctl -p "$sysctl_tcp_conf" > /dev/null 2>&1 || sysctl --system > /dev/null 2>&1 || true
+        log_action "TCP kernel parameters optimized"
+        echo -e "${gl_lv}TCP 协议栈网络高级优化参数已成功加载！${gl_bai}"
+        pause
+        ;;
+      4)
+        need_root || { pause; continue; }
+        rm -f /etc/sysctl.d/99-ua-tcp-tune.conf
+        sysctl --system >/dev/null 2>&1 || true
+        log_action "TCP kernel optimization removed"
+        echo -e "${gl_lv}已清除 TCP 协议栈网络高级优化配置，恢复默认系统参数。${gl_bai}"
+        pause
+        ;;
+      0) return 0 ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
 }
 
 system_firewall_menu() {
@@ -3258,113 +3992,139 @@ system_firewall_menu() {
     fw=none
   fi
 
-  clear
-  echo -e "${gl_kjlan}防火墙管理${gl_bai}"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
-  echo -e "检测到防火墙工具: ${gl_lv}${fw}${gl_bai}"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
-
   case "$fw" in
     ufw)
-      echo -e "当前状态: $(ufw status | head -n1)"
-      echo ""
-      echo -e "${gl_kjlan}1.  ${gl_bai}查看规则"
-      echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
-      echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
-      echo -e "${gl_kjlan}4.  ${gl_bai}删除规则"
-      echo -e "${gl_kjlan}5.  ${gl_bai}启用防火墙"
-      echo -e "${gl_kjlan}6.  ${gl_bai}禁用防火墙"
-      echo -e "${gl_kjlan}0.  ${gl_bai}返回"
-      read -r -e -p "请输入你的选择: " choice
-      case "$choice" in
-        1) ufw status numbered ;;
-        2)
-          read -r -e -p "请输入要放行的 TCP 端口（如 8080 或 8080:8090）: " port
-          [ -n "$port" ] && ufw allow "${port}/tcp" && log_action "ufw allow ${port}/tcp"
-          ;;
-        3)
-          read -r -e -p "请输入要放行的 UDP 端口（如 51820）: " port
-          [ -n "$port" ] && ufw allow "${port}/udp" && log_action "ufw allow ${port}/udp"
-          ;;
-        4)
-          ufw status numbered
-          read -r -e -p "请输入要删除的规则编号: " num
-          [ -n "$num" ] && ufw delete "$num"
-          ;;
-        5) need_root && ufw --force enable && log_action "ufw enabled" ;;
-        6) need_root && ufw disable && log_action "ufw disabled" ;;
-        0) return 0 ;;
-        *) echo "无效输入" ;;
-      esac
+      while true; do
+        clear
+        echo -e "${gl_kjlan}防火墙管理${gl_bai}"
+        echo -e "${gl_kjlan}------------------------${gl_bai}"
+        echo -e "检测到防火墙工具: ${gl_lv}ufw${gl_bai}"
+        echo -e "当前状态: $(ufw status | head -n1)"
+        echo -e "${gl_kjlan}------------------------${gl_bai}"
+        echo -e "${gl_kjlan}1.  ${gl_bai}查看规则"
+        echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
+        echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
+        echo -e "${gl_kjlan}4.  ${gl_bai}删除规则"
+        echo -e "${gl_kjlan}5.  ${gl_bai}启用防火墙"
+        echo -e "${gl_kjlan}6.  ${gl_bai}禁用防火墙"
+        echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+        read -r -e -p "请输入你的选择: " choice || break
+        case "$choice" in
+          1) ufw status numbered; pause ;;
+          2)
+            read -r -e -p "请输入要放行的 TCP 端口（如 8080 或 8080:8090）: " port
+            [ -n "$port" ] && ufw allow "${port}/tcp" && log_action "ufw allow ${port}/tcp"
+            pause
+            ;;
+          3)
+            read -r -e -p "请输入要放行的 UDP 端口（如 51820）: " port
+            [ -n "$port" ] && ufw allow "${port}/udp" && log_action "ufw allow ${port}/udp"
+            pause
+            ;;
+          4)
+            ufw status numbered
+            read -r -e -p "请输入要删除的规则编号: " num
+            [ -n "$num" ] && ufw delete "$num"
+            pause
+            ;;
+          5) need_root && ufw --force enable && log_action "ufw enabled"; pause ;;
+          6) need_root && ufw disable && log_action "ufw disabled"; pause ;;
+          0) return 0 ;;
+          *) echo "无效输入"; pause ;;
+        esac
+      done
       ;;
     firewalld)
-      echo -e "当前状态: $(firewall-cmd --state 2>/dev/null)"
-      echo ""
-      echo -e "${gl_kjlan}1.  ${gl_bai}查看开放端口"
-      echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
-      echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
-      echo -e "${gl_kjlan}4.  ${gl_bai}移除端口规则"
-      echo -e "${gl_kjlan}0.  ${gl_bai}返回"
-      read -r -e -p "请输入你的选择: " choice
-      case "$choice" in
-        1) firewall-cmd --list-ports ;;
-        2)
-          read -r -e -p "请输入要放行的 TCP 端口: " port
-          [ -n "$port" ] && firewall-cmd --permanent --add-port="${port}/tcp" && firewall-cmd --reload && log_action "firewalld add ${port}/tcp"
-          ;;
-        3)
-          read -r -e -p "请输入要放行的 UDP 端口: " port
-          [ -n "$port" ] && firewall-cmd --permanent --add-port="${port}/udp" && firewall-cmd --reload && log_action "firewalld add ${port}/udp"
-          ;;
-        4)
-          read -r -e -p "请输入要移除的端口（格式如 8080/tcp）: " portproto
-          [ -n "$portproto" ] && firewall-cmd --permanent --remove-port="$portproto" && firewall-cmd --reload
-          ;;
-        0) return 0 ;;
-        *) echo "无效输入" ;;
-      esac
+      while true; do
+        clear
+        echo -e "${gl_kjlan}防火墙管理${gl_bai}"
+        echo -e "${gl_kjlan}------------------------${gl_bai}"
+        echo -e "检测到防火墙工具: ${gl_lv}firewalld${gl_bai}"
+        echo -e "当前状态: $(firewall-cmd --state 2>/dev/null)"
+        echo -e "${gl_kjlan}------------------------${gl_bai}"
+        echo -e "${gl_kjlan}1.  ${gl_bai}查看开放端口"
+        echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
+        echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
+        echo -e "${gl_kjlan}4.  ${gl_bai}移除端口规则"
+        echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+        read -r -e -p "请输入你的选择: " choice || break
+        case "$choice" in
+          1) firewall-cmd --list-ports; pause ;;
+          2)
+            read -r -e -p "请输入要放行的 TCP 端口: " port
+            [ -n "$port" ] && firewall-cmd --permanent --add-port="${port}/tcp" && firewall-cmd --reload && log_action "firewalld add ${port}/tcp"
+            pause
+            ;;
+          3)
+            read -r -e -p "请输入要放行的 UDP 端口: " port
+            [ -n "$port" ] && firewall-cmd --permanent --add-port="${port}/udp" && firewall-cmd --reload && log_action "firewalld add ${port}/udp"
+            pause
+            ;;
+          4)
+            read -r -e -p "请输入要移除的端口（格式如 8080/tcp）: " portproto
+            [ -n "$portproto" ] && firewall-cmd --permanent --remove-port="$portproto" && firewall-cmd --reload
+            pause
+            ;;
+          0) return 0 ;;
+          *) echo "无效输入"; pause ;;
+        esac
+      done
       ;;
     iptables)
-      echo -e "${gl_kjlan}1.  ${gl_bai}查看当前规则（INPUT 链）"
-      echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
-      echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
-      echo -e "${gl_kjlan}4.  ${gl_bai}删除规则"
-      echo -e "${gl_kjlan}5.  ${gl_bai}保存规则（尝试持久化）"
-      echo -e "${gl_kjlan}0.  ${gl_bai}返回"
-      read -r -e -p "请输入你的选择: " choice
-      case "$choice" in
-        1) iptables -L INPUT -n --line-numbers ;;
-        2)
-          read -r -e -p "请输入要放行的 TCP 端口: " port
-          [ -n "$port" ] && iptables -I INPUT -p tcp --dport "$port" -j ACCEPT && log_action "iptables allow ${port}/tcp"
-          echo -e "${gl_huang}警告: iptables 规则将在重启后失效，请选择 5 进行保存。${gl_bai}"
-          ;;
-        3)
-          read -r -e -p "请输入要放行的 UDP 端口: " port
-          [ -n "$port" ] && iptables -I INPUT -p udp --dport "$port" -j ACCEPT && log_action "iptables allow ${port}/udp"
-          echo -e "${gl_huang}警告: iptables 规则将在重启后失效，请选择 5 进行保存。${gl_bai}"
-          ;;
-        4)
-          iptables -L INPUT -n --line-numbers
-          read -r -e -p "请输入要删除的 INPUT 规则编号: " num
-          [ -n "$num" ] && iptables -D INPUT "$num"
-          ;;
-        5)
-          if has_cmd netfilter-persistent; then
-            netfilter-persistent save && echo "已保存 (netfilter-persistent)。"
-          elif [ -f /etc/sysconfig/iptables ]; then
-            iptables-save > /etc/sysconfig/iptables && echo "已保存 (/etc/sysconfig/iptables)。"
-          elif [ -d /etc/iptables ]; then
-            iptables-save > /etc/iptables/rules.v4 && echo "已保存 (/etc/iptables/rules.v4)。"
-          else
-            echo -e "${gl_hong}未找到标准的 iptables 持久化路径，请手动保存。${gl_bai}"
-          fi
-          ;;
-        0) return 0 ;;
-        *) echo "无效输入" ;;
-      esac
+      while true; do
+        clear
+        echo -e "${gl_kjlan}防火墙管理${gl_bai}"
+        echo -e "${gl_kjlan}------------------------${gl_bai}"
+        echo -e "检测到防火墙工具: ${gl_lv}iptables${gl_bai}"
+        echo -e "${gl_kjlan}------------------------${gl_bai}"
+        echo -e "${gl_kjlan}1.  ${gl_bai}查看当前规则（INPUT 链）"
+        echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
+        echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
+        echo -e "${gl_kjlan}4.  ${gl_bai}删除规则"
+        echo -e "${gl_kjlan}5.  ${gl_bai}保存规则（尝试持久化）"
+        echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+        read -r -e -p "请输入你的选择: " choice || break
+        case "$choice" in
+          1) iptables -L INPUT -n --line-numbers; pause ;;
+          2)
+            read -r -e -p "请输入要放行的 TCP 端口: " port
+            [ -n "$port" ] && iptables -I INPUT -p tcp --dport "$port" -j ACCEPT && log_action "iptables allow ${port}/tcp"
+            echo -e "${gl_huang}警告: iptables 规则将在重启后失效，请选择 5 进行保存。${gl_bai}"
+            pause
+            ;;
+          3)
+            read -r -e -p "请输入要放行的 UDP 端口: " port
+            [ -n "$port" ] && iptables -I INPUT -p udp --dport "$port" -j ACCEPT && log_action "iptables allow ${port}/udp"
+            echo -e "${gl_huang}警告: iptables 规则将在重启后失效，请选择 5 进行保存。${gl_bai}"
+            pause
+            ;;
+          4)
+            iptables -L INPUT -n --line-numbers
+            read -r -e -p "请输入要删除的 INPUT 规则编号: " num
+            [ -n "$num" ] && iptables -D INPUT "$num"
+            pause
+            ;;
+          5)
+            if has_cmd netfilter-persistent; then
+              netfilter-persistent save && echo "已保存 (netfilter-persistent)。"
+            elif [ -f /etc/sysconfig/iptables ]; then
+              iptables-save > /etc/sysconfig/iptables && echo "已保存 (/etc/sysconfig/iptables)。"
+            elif [ -d /etc/iptables ]; then
+              iptables-save > /etc/iptables/rules.v4 && echo "已保存 (/etc/iptables/rules.v4)。"
+            else
+              echo -e "${gl_hong}未找到标准的 iptables 持久化路径，请手动保存。${gl_bai}"
+            fi
+            pause
+            ;;
+          0) return 0 ;;
+          *) echo "无效输入"; pause ;;
+        esac
+      done
       ;;
     none)
+      clear
+      echo -e "${gl_kjlan}防火墙管理${gl_bai}"
+      echo -e "${gl_kjlan}------------------------${gl_bai}"
       echo -e "${gl_huang}未检测到 ufw / firewalld / iptables，无法管理防火墙。${gl_bai}"
       echo "可先安装 ufw：ua install ufw"
       ;;
@@ -3442,6 +4202,35 @@ installed_status() {
   fi
 }
 
+get_compose_projects_summary() {
+  has_cmd docker || return 0
+  docker info >/dev/null 2>&1 || return 0
+
+  local ps_out
+  ps_out="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.State.Running}}' 2>/dev/null)"
+  if [ -z "$ps_out" ]; then
+    echo "-"
+    return 0
+  fi
+
+  printf '%s\n' "$ps_out" | awk -F'\t' '
+    $2 != "" {
+      proj=$2
+      total[proj]++
+      if ($3 == "true") running[proj]++
+    }
+    END {
+      count = 0
+      for (p in total) {
+        run_count = running[p] ? running[p] : 0
+        printf "%s (%d/%d %s) | ", p, run_count, total[p], (run_count == total[p] ? "运行" : "部分停止")
+        count++
+      }
+      if (count == 0) printf "-"
+    }
+  ' | sed 's/ | $//'
+}
+
 collect_bad_containers() {
   local container_name container_status
 
@@ -3454,16 +4243,16 @@ collect_bad_containers() {
       Up*) ;;
       *) printf '%s\n' "$container_name" ;;
     esac
-  done <<EOF
-$(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
-EOF
+  done < <(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
 }
 
 collect_inactive_services() {
-  local svc
+  local svc _monitor_svcs
 
   has_cmd systemctl || return 0
-  for svc in caddy nezha-agent; do
+  _monitor_svcs="${UA_MONITOR_SERVICES:-caddy}"
+  # shellcheck disable=SC2086
+  for svc in $_monitor_svcs; do
     list_has_word "$svc" "$UA_IGNORE_SERVICES" && continue
     if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
       ! systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -3488,9 +4277,7 @@ collect_failed_rclone_remotes() {
       rc=$?
     fi
     [ "$rc" -ne 0 ] && printf '%s\n' "$remote"
-  done <<EOF
-$(rclone listremotes 2>/dev/null | sed 's/:$//')
-EOF
+  done < <(rclone listremotes 2>/dev/null | sed 's/:$//')
 }
 
 ua_abnormal_summary() {
@@ -3542,23 +4329,47 @@ ua_abnormal_summary() {
 
   if has_cmd docker; then
     if docker info >/dev/null 2>&1; then
-      bad_containers=""
-      while IFS=$'\t' read -r container_name container_status; do
-        [ -z "$container_name" ] && continue
-        list_has_word "$container_name" "$UA_IGNORE_CONTAINERS" && continue
-        case "$container_status" in
+      local _bad _bname _bstatus
+      _bad=""
+      while IFS=$'\t' read -r _bname _bstatus; do
+        [ -z "$_bname" ] && continue
+        list_has_word "$_bname" "$UA_IGNORE_CONTAINERS" && continue
+        case "$_bstatus" in
           Up*) ;;
-          *) bad_containers="${bad_containers}${container_name}  ${container_status}
-" ;;
+          *) _bad="${_bad}  $_bname  $_bstatus\n" ;;
         esac
-      done <<EOF
-$(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
-EOF
-      if [ -n "$bad_containers" ]; then
+      done < <(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
+      if [ -n "$_bad" ]; then
         echo "- Docker 异常容器:"
-        printf '%s' "$bad_containers" | sed 's/^/  /'
+        printf '%b' "$_bad"
         echo "  建议: 不再使用可执行 ua ignore container <名称>；仍需使用先查看日志再重启。"
         found=1
+      fi
+
+      # 检测 Docker Compose 项目部分容器停止的异常
+      local ps_out bad_projects
+      ps_out="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.State.Running}}' 2>/dev/null)"
+      if [ -n "$ps_out" ]; then
+        bad_projects="$(printf '%s\n' "$ps_out" | awk -F'\t' '
+          $2 != "" {
+            proj=$2
+            total[proj]++
+            if ($3 == "true") running[proj]++
+          }
+          END {
+            for (p in total) {
+              run_count = running[p] ? running[p] : 0
+              if (run_count < total[p]) {
+                printf "%s (%d/%d运行中) ", p, run_count, total[p]
+              }
+            }
+          }
+        ')"
+        if [ -n "$bad_projects" ]; then
+          echo "- Compose 项目有容器已停止: $bad_projects"
+          echo "  建议: 运行 ua docker 并选择 8 进入项目管理，对该项目进行一键 Compose Up 重启拉起。"
+          found=1
+        fi
       fi
     else
       echo "- Docker 服务未运行或不可访问"
@@ -3568,7 +4379,10 @@ EOF
   fi
 
   if has_cmd systemctl; then
-    for svc in caddy nezha-agent; do
+    local _monitor_svcs
+    _monitor_svcs="${UA_MONITOR_SERVICES:-caddy}"
+    # shellcheck disable=SC2086
+    for svc in $_monitor_svcs; do
       list_has_word "$svc" "$UA_IGNORE_SERVICES" && continue
       if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
         ! systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -3580,35 +4394,37 @@ EOF
   fi
 
   if has_cmd rclone; then
-    local _rclone_count
-    _rclone_count="$(rclone listremotes 2>/dev/null | wc -l)"
-    if [ "$_rclone_count" -gt 0 ]; then
-      echo -e "${gl_huang}检测 ${_rclone_count} 个 rclone remote，每个最多等待 ${check_timeout}s，请稍候...${gl_bai}"
-    fi
-    failed_remotes=""
-    while IFS= read -r remote; do
-      [ -z "$remote" ] && continue
-      list_has_word "$remote" "$UA_IGNORE_RCLONE_REMOTES" && continue
-      if has_cmd timeout; then
-        output="$(timeout "$check_timeout" rclone lsd "${remote}:" 2>&1 >/dev/null)"
-        rc=$?
-        [ "$rc" -eq 124 ] && status="timeout" || status="fail"
-      else
-        output="$(rclone lsd "${remote}:" 2>&1 >/dev/null)"
-        rc=$?
-        status="fail"
+    if [ "${UA_STATUS_SKIP_RCLONE:-0}" = "1" ]; then
+      echo "- rclone remote 检测已跳过（UA_STATUS_SKIP_RCLONE=1）"
+    else
+      local _rclone_count
+      _rclone_count="$(rclone listremotes 2>/dev/null | wc -l)"
+      if [ "$_rclone_count" -gt 0 ]; then
+        echo -e "${gl_huang}检测 ${_rclone_count} 个 rclone remote，每个最多等待 ${check_timeout}s，请稍候...${gl_bai}"
       fi
-      if [ "$rc" -ne 0 ]; then
-        failed_remotes="${failed_remotes}${remote}(${status}) "
+      failed_remotes=""
+      while IFS= read -r remote; do
+        [ -z "$remote" ] && continue
+        list_has_word "$remote" "$UA_IGNORE_RCLONE_REMOTES" && continue
+        if has_cmd timeout; then
+          output="$(timeout "$check_timeout" rclone lsd "${remote}:" 2>&1 >/dev/null)"
+          rc=$?
+          [ "$rc" -eq 124 ] && status="timeout" || status="fail"
+        else
+          output="$(rclone lsd "${remote}:" 2>&1 >/dev/null)"
+          rc=$?
+          status="fail"
+        fi
+        if [ "$rc" -ne 0 ]; then
+          failed_remotes="${failed_remotes}${remote}(${status}) "
+        fi
+      done < <(rclone listremotes 2>/dev/null | sed 's/:$//')
+      if [ -n "$failed_remotes" ]; then
+        echo "- rclone remote 连接异常: $failed_remotes"
+        echo "  连接测试超时: ${check_timeout}s/remote"
+        echo "  建议: 执行 ua rclone 检测配置；确认不用的 remote 可执行 ua ignore rclone <名称>。"
+        found=1
       fi
-    done <<EOF
-$(rclone listremotes 2>/dev/null | sed 's/:$//')
-EOF
-    if [ -n "$failed_remotes" ]; then
-      echo "- rclone remote 连接异常: $failed_remotes"
-      echo "  连接测试超时: ${check_timeout}s/remote"
-      echo "  建议: 执行 ua rclone 检测配置；确认不用的 remote 可执行 ua ignore rclone <名称>。"
-      found=1
     fi
   fi
 
@@ -3632,9 +4448,7 @@ ua_status() {
   echo -e "${gl_kjlan}rclone:       ${gl_bai}$(installed_status rclone)"
   echo -e "${gl_kjlan}curl:         ${gl_bai}$(installed_status curl)"
   echo -e "${gl_kjlan}wget:         ${gl_bai}$(installed_status wget)"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
-  echo -e "${gl_kjlan}Nezha Agent:  ${gl_bai}$(svc_status_short nezha-agent)"
-
+  echo -e "${gl_kjlan}Caddy:        ${gl_bai}$(installed_status caddy)"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   ua_abnormal_summary
   echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -3918,7 +4732,6 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua clean               系统清理
   ua tools               打开常用工具菜单
   ua panel               打开面板工具
-  ua nezha               打开哪吒探针管理
 
   ua docker              打开 Docker 管理
   ua work                打开工作区模块
@@ -4020,9 +4833,6 @@ case "${1:-}" in
     ;;
   panel|panels|面板|面板工具)
     panel_tools_menu
-    ;;
-  nezha|nazha|哪吒)
-    nezha_menu
     ;;
 
   docker|dk|容器)

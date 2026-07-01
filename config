@@ -3,6 +3,12 @@
 
 DEFAULT_WORKSPACE_PREFIX="work"
 DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
+UA_BOX_UPDATE_URL=""
+UA_IGNORE_CONTAINERS="ms-oauth2-proxy"
+UA_IGNORE_SERVICES=""
+UA_IGNORE_RCLONE_REMOTES=""
+UA_STATUS_DISK_WARN=80
+UA_STATUS_DISK_CRIT=90
 
 NEZHA_SCRIPT_CN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh"
 NEZHA_SCRIPT_EN="https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install_en.sh"
@@ -15,7 +21,6 @@ RCLONE_INSTALL_SCRIPT="https://rclone.org/install.sh"
 YABS_SCRIPT="https://raw.githubusercontent.com/masonr/yet-another-bench-script/master/yabs.sh"
 BENCH_SCRIPT="https://bench.sh"
 
-UA_BOX_UPDATE_URL=""
 OPENAI_CHECK_SCRIPT="https://cdn.jsdelivr.net/gh/missuo/OpenAI-Checker/openai.sh"
 REGION_UNLOCK_SCRIPT="https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh"
 YEAHWU_UNLOCK_SCRIPT="https://github.com/yeahwu/check/raw/main/check.sh"
