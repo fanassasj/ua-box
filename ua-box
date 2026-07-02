@@ -3532,27 +3532,87 @@ system_reinstall_menu() {
   echo -e "${gl_hong}一键重装系统会清空当前系统环境，请先备份数据。${gl_bai}"
   echo "脚本来源: $REINSTALL_SCRIPT"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
-  echo "1. Debian 12"
-  echo "2. Debian 11"
-  echo "3. Ubuntu 22.04"
-  echo "4. Ubuntu 20.04"
-  echo "5. 自定义 reinstall.sh 参数"
+  echo "1. Debian 13 (新 - Trixie)"
+  echo "2. Debian 12 (稳定版)"
+  echo "3. Ubuntu 24.04 LTS (新)"
+  echo "4. Ubuntu 22.04 LTS"
+  echo "5. Alpine Linux (轻量极速)"
+  echo "6. 自定义 reinstall.sh 参数"
   echo "0. 取消"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   read -r -e -p "请输入你的选择: " choice
 
-  local args
+  local args=""
+  local pwd_input=""
+  local port_input=""
+  local key_input=""
+  local username_input=""
   case "$choice" in
-    1) args="debian 12" ;;
-    2) args="debian 11" ;;
-    3) args="ubuntu 22.04" ;;
-    4) args="ubuntu 20.04" ;;
-    5) read -r -e -p "请输入 reinstall.sh 参数: " args ;;
+    1) args="debian 13" ;;
+    2) args="debian 12" ;;
+    3) args="ubuntu 24.04" ;;
+    4) args="ubuntu 22.04" ;;
+    5) args="alpine" ;;
+    6)
+      read -r -e -p "请输入 reinstall.sh 完整参数 (如: debian 12 --password mypass): " args
+      ;;
     0) return 0 ;;
     *) echo "无效输入"; return 1 ;;
   esac
 
-  if confirm_danger "即将重装系统，当前系统数据可能丢失" "bash $UA_BOX_TMP_DIR/reinstall.sh $args"; then
+  # 如果不是自定义完整参数，则提供便捷引导配置用户名/公钥/密码与端口
+  if [ "$choice" -ge 1 ] && [ "$choice" -le 5 ]; then
+    echo -e "\n${gl_huang}[可选便捷配置]${gl_bai}"
+
+    # 1. 引导设置登录用户名
+    read -r -e -p "请输入新系统的登录用户名 (直接回车默认为 root / administrator): " username_input
+    if [ -n "$username_input" ]; then
+      args="$args --username \"$username_input\""
+    fi
+    
+    # 2. 优先引导密钥对登录，提高安全性并做格式校验
+    while true; do
+      read -r -e -p "请输入新系统的 SSH 公钥 (如 ssh-rsa...，直接回车则使用密码登录): " key_input
+      if [ -z "$key_input" ]; then
+        break
+      fi
+      # 校验公钥格式
+      if echo "$key_input" | grep -Eq '^(ssh-rsa|ssh-dss|ecdsa-sha2-nistp[0-9]+|ssh-ed25519|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp[0-9]+@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]]+.+)?$'; then
+        args="$args --ssh-key \"$key_input\""
+        break
+      else
+        echo -e "${gl_hong}公钥格式不正确，请重新输入（应以 ssh-rsa / ssh-ed25519 等开头，后接 Base64 编码）。${gl_bai}"
+      fi
+    done
+
+    # 3. 如果配置了公钥，则默认不强制配置密码（跳过密码输入）；如果未配置公钥，则引导设置 Root 密码
+    if [ -z "$key_input" ]; then
+      read -r -e -s -p "请输入新系统的 Root 密码 (直接回车表示使用脚本默认/随机生成): " pwd_input
+      echo ""
+      if [ -n "$pwd_input" ]; then
+        args="$args --password \"$pwd_input\""
+      fi
+    else
+      echo -e "${gl_lv}已检测到有效公钥，系统将默认采用密钥认证登录（跳过设置密码）。${gl_bai}"
+    fi
+    
+    # 4. 引导配置 SSH 端口
+    read -r -e -p "请输入新系统的 SSH 端口 (直接回车默认为 22): " port_input
+    if [ -n "$port_input" ] && printf '%s\n' "$port_input" | grep -Eq '^[0-9]+$'; then
+      args="$args --ssh-port $port_input"
+    fi
+  fi
+
+  # 安全脱敏，避免在二次确认中明文打印密码和公钥
+  local display_args="$args"
+  if [ -n "$pwd_input" ]; then
+    display_args="${display_args/\"$pwd_input\"/********}"
+  fi
+  if [ -n "$key_input" ]; then
+    display_args="${display_args/\"$key_input\"/[SSH-KEY]}"
+  fi
+
+  if confirm_danger "即将重装系统，当前系统所有数据将彻底丢失" "reinstall.sh $display_args"; then
     download_to "$REINSTALL_SCRIPT" "$UA_BOX_TMP_DIR"/reinstall.sh || return 1
     chmod +x "$UA_BOX_TMP_DIR"/reinstall.sh
     log_action "reinstall system $args"
