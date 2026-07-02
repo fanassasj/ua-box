@@ -4083,7 +4083,7 @@ system_init_optimize() {
   echo -e "  ${gl_kjlan}[3]${gl_bai} 设置 Swap 为内存的 2 倍 (${swap_mb}MB，当前内存 ${mem_mb}MB)"
   echo -e "  ${gl_kjlan}[4]${gl_bai} 安装 Docker"
   echo -e "  ${gl_kjlan}[5]${gl_bai} 修改 hostname（可选，默认跳过）"
-  echo -e "  ${gl_kjlan}[6]${gl_bai} 开启网络内核协议栈高级优化"
+  echo -e "  ${gl_kjlan}[6]${gl_bai} 开启内核网络优化与系统环境调优 (含文件数限制/SSH加速/NTP)"
   echo -e "  ${gl_kjlan}[7]${gl_bai} 默认开启 BBR 拥塞控制"
   echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
 
@@ -4223,27 +4223,53 @@ system_init_optimize() {
     echo -e "$step_skip hostname 已跳过（保持 ${current_hostname}）"
   fi
 
-  # ── [6] TCP 协议栈网络高级优化 ───────────────────────────
-  echo -e "\n${gl_kjlan}[6/7] 开启网络内核协议栈高级优化...${gl_bai}"
+  # ── [6] 系统环境与 TCP 协议栈高级优化 ──────────────────
+  echo -e "\n${gl_kjlan}[6/7] 开启网络内核协议栈与系统环境调优...${gl_bai}"
   local r_tcptune=0
-  local sysctl_tcp_conf="/etc/sysctl.d/99-ua-tcp-tune.conf"
-  cat > "$sysctl_tcp_conf" <<'TCPTUNE'
+  (
+    # 1. TCP 协议栈调优
+    local sysctl_tcp_conf="/etc/sysctl.d/99-ua-tcp-tune.conf"
+    cat > "$sysctl_tcp_conf" <<'TCPTUNE'
 # UA Box TCP High Performance Tuning
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_syn_backlog = 16384
+net.core.netdev_max_backlog = 25000
 net.ipv4.tcp_max_tw_buckets = 5000
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
 net.core.somaxconn = 4096
 TCPTUNE
-  if sysctl -p "$sysctl_tcp_conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1; then
-    r_tcptune=1
-    echo -e "$step_ok TCP 调优配置已成功加载"
+    sysctl -p "$sysctl_tcp_conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1
+
+    # 2. 提升文件描述符上限 (Ulimit nofile)
+    if ! grep -q "soft nofile 65535" /etc/security/limits.conf 2>/dev/null; then
+      cat >> /etc/security/limits.conf << 'EOF'
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
+    fi
+    sed -i 's/^#\?DefaultLimitNOFILE.*/DefaultLimitNOFILE=65535/g' /etc/systemd/system.conf 2>/dev/null || true
+    sed -i 's/^#\?DefaultLimitNOFILE.*/DefaultLimitNOFILE=65535/g' /etc/systemd/user.conf 2>/dev/null || true
+
+    # 3. 提升 SSH 登录速度 (UseDNS / GSSAPI)
+    if [ -f /etc/ssh/sshd_config ]; then
+      sed -i -e 's/^#\?UseDNS.*/UseDNS no/g' -e 's/^#\?GSSAPIAuthentication.*/GSSAPIAuthentication no/g' /etc/ssh/sshd_config
+      systemctl restart ssh sshd 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || true
+    fi
+
+    # 4. 自动开启 NTP 时间同步
+    timedatectl set-ntp true 2>/dev/null || true
+  ) && r_tcptune=1
+  
+  if [ "$r_tcptune" -eq 1 ]; then
+    echo -e "$step_ok 系统环境与 TCP 调优配置已成功应用"
   else
-    echo -e "$step_fail TCP 调优配置加载失败"
+    echo -e "$step_fail 系统环境与 TCP 调优配置应用失败"
   fi
 
   # ── [7] 默认开启 BBR 拥塞控制 ─────────────────────────────
@@ -4321,7 +4347,7 @@ SYSCTL
   fi
 
   # TCP 协议栈调优
-  [ "$r_tcptune" -eq 1 ] && echo -e "  $step_ok TCP 协议栈高级优化已生效" || echo -e "  $step_fail TCP 协议栈高级优化"
+  [ "$r_tcptune" -eq 1 ] && echo -e "  $step_ok TCP/文件描述符/SSH加速/时间同步优化已生效" || echo -e "  $step_fail 系统环境与网络优化"
 
   # BBR 拥塞控制
   if [ "$r_bbr" -eq 1 ]; then
