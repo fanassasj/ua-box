@@ -2,7 +2,8 @@
 
 UA_BOX_VERSION="0.6.0"
 UA_BOX_NAME="UA Box"
-UA_BOX_HOME="${UA_BOX_HOME:-/root/ua-box}"
+SCRIPT_REAL_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+UA_BOX_HOME="$(cd "$(dirname "$SCRIPT_REAL_PATH")" && pwd)"
 UA_BOX_CONFIG="${UA_BOX_CONFIG:-$UA_BOX_HOME/config}"
 UA_BOX_LOG_DIR="${UA_BOX_LOG_DIR:-$UA_BOX_HOME/logs}"
 UA_BOX_LOG_FILE="${UA_BOX_LOG_FILE:-$UA_BOX_LOG_DIR/ua-box.log}"
