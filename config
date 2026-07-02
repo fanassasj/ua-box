@@ -3,7 +3,7 @@
 
 DEFAULT_WORKSPACE_PREFIX="work"
 DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
-UA_BOX_UPDATE_URL=""
+UA_BOX_UPDATE_URL="https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-box"
 UA_IGNORE_CONTAINERS="ms-oauth2-proxy"
 UA_IGNORE_SERVICES=""
 UA_IGNORE_RCLONE_REMOTES=""
