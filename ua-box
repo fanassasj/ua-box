@@ -238,6 +238,19 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+is_pkg_installed() {
+  local pkg="$1"
+  if has_cmd dpkg; then
+    dpkg -s "$pkg" 2>/dev/null | grep -q "Status: install ok installed" && return 0
+  elif has_cmd rpm; then
+    rpm -q "$pkg" >/dev/null 2>&1 && return 0
+  elif has_cmd apk; then
+    apk info -e "$pkg" >/dev/null 2>&1 && return 0
+  fi
+  has_cmd "$pkg" && return 0
+  return 1
+}
+
 is_port_taken() {
   local port="$1"
   if has_cmd ss; then
@@ -349,11 +362,25 @@ install_pkg() {
   need_root || return 1
   log_action "install_pkg $*"
 
-  local pm orphans
+  local pm
   pm="$(pkg_manager)"
   if [ -z "$pm" ]; then
     echo -e "${gl_hong}未知包管理器，无法安装。${gl_bai}"
     return 1
+  fi
+
+  # 过滤出未安装的包
+  local pkgs_to_install=""
+  local pkg
+  for pkg in "$@"; do
+    if ! is_pkg_installed "$pkg"; then
+      pkgs_to_install="$pkgs_to_install $pkg"
+    fi
+  done
+
+  if [ -z "$pkgs_to_install" ]; then
+    echo "所有请求的软件包已安装。"
+    return 0
   fi
 
   case "$pm" in
@@ -4059,12 +4086,29 @@ system_init_optimize() {
   local step_skip="${gl_huang}–${gl_bai}"
   local step_fail="${gl_hong}✗${gl_bai}"
 
-  # ── 采集当前内存，计算 2× swap ──────────────────────────
+  # ── 采集当前内存与硬盘空间，计算安全的 swap 大小 ──────
   mem_mb="$(free -m | awk '/^Mem:/ {print $2}')"
   if ! printf '%s' "$mem_mb" | grep -Eq '^[0-9]+$' || [ "$mem_mb" -lt 64 ]; then
     mem_mb=1024
   fi
+  
+  # 获取 / 目录剩余空间 (MB)
+  local free_kb free_mb
+  free_kb="$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')"
+  free_mb=$(( free_kb / 1024 ))
+  [ -z "$free_mb" ] || ! printf '%s' "$free_mb" | grep -Eq '^[0-9]+$' && free_mb=0
+
   swap_mb=$(( mem_mb * 2 ))
+  # 限制最大 Swap 建议值不超过 8GB，且必须保留至少 2GB 硬盘空余空间以防爆盘
+  if [ "$swap_mb" -gt 8192 ]; then
+    swap_mb=8192
+  fi
+  if [ $(( free_mb - swap_mb )) -lt 2048 ]; then
+    swap_mb=$(( free_mb - 2048 ))
+  fi
+  if [ "$swap_mb" -lt 256 ]; then
+    swap_mb=0
+  fi
 
   # ── 要安装的工具包 ───────────────────────────────────────
   local INIT_TOOLS="curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lsof net-tools ca-certificates"
@@ -4134,76 +4178,97 @@ system_init_optimize() {
 
   # ── [2] 安装常用工具 ─────────────────────────────────────
   echo -e "\n${gl_kjlan}[2/5] 安装常用工具...${gl_bai}"
-  local pm tool_pkg _batch_ok
+  local pm tool_pkg _batch_ok TOOLS_TO_INSTALL=""
   pm="$(pkg_manager)"
 
-  # 先整体批量安装，减少 apt lock 次数
-  echo "  批量安装中..."
-  # shellcheck disable=SC2086
-  case "$pm" in
-    apt)    apt install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ; touch /tmp/.ua-apt-updated 2>/dev/null || true ;;
-    dnf)    dnf install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
-    yum)    yum install -y $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
-    apk)    apk add $INIT_TOOLS > /dev/null 2>&1       ; _batch_ok=$? ;;
-    pacman) pacman -S --noconfirm $INIT_TOOLS > /dev/null 2>&1 ; _batch_ok=$? ;;
-    zypper) zypper install -y $INIT_TOOLS > /dev/null 2>&1     ; _batch_ok=$? ;;
-    *)      _batch_ok=1 ;;
-  esac
-
-  # 逐包校验：has_cmd 可检测则直接确认，否则单独重试并用退出码判断
+  # 1. 预先检测哪些工具尚未安装
   for tool_pkg in $INIT_TOOLS; do
-    if has_cmd "$tool_pkg"; then
-      tools_ok="$tools_ok $tool_pkg"
+    if ! is_pkg_installed "$tool_pkg"; then
+      TOOLS_TO_INSTALL="$TOOLS_TO_INSTALL $tool_pkg"
     else
-      # 命令不可检测（如 ca-certificates）或批量未成功，单独重试
-      local _retry_ok=0
-      case "$pm" in
-        apt)    apt install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
-        dnf)    dnf install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
-        yum)    yum install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
-        apk)    apk add "$tool_pkg" > /dev/null 2>&1        && _retry_ok=1 ;;
-        pacman) pacman -S --noconfirm "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
-        zypper) zypper install -y "$tool_pkg" > /dev/null 2>&1     && _retry_ok=1 ;;
-      esac
-      if has_cmd "$tool_pkg" || [ "$_retry_ok" -eq 1 ]; then
-        tools_ok="$tools_ok $tool_pkg"
-      else
-        tools_failed="$tools_failed $tool_pkg"
-      fi
+      tools_ok="$tools_ok $tool_pkg"
     fi
   done
 
-
-  if [ -z "$tools_failed" ]; then
+  # 2. 执行安装（仅针对未安装的工具）
+  if [ -z "$TOOLS_TO_INSTALL" ]; then
     r_tools=1
+    echo -e "$step_ok 所有常用工具已处于最新状态，无需安装"
+  else
+    echo "  正在安装未就绪的工具: $TOOLS_TO_INSTALL ..."
+    # shellcheck disable=SC2086
+    case "$pm" in
+      apt)    apt install -y $TOOLS_TO_INSTALL > /dev/null 2>&1 ; _batch_ok=$? ; touch /tmp/.ua-apt-updated 2>/dev/null || true ;;
+      dnf)    dnf install -y $TOOLS_TO_INSTALL > /dev/null 2>&1 ; _batch_ok=$? ;;
+      yum)    yum install -y $TOOLS_TO_INSTALL > /dev/null 2>&1 ; _batch_ok=$? ;;
+      apk)    apk add $TOOLS_TO_INSTALL > /dev/null 2>&1       ; _batch_ok=$? ;;
+      pacman) pacman -S --noconfirm $TOOLS_TO_INSTALL > /dev/null 2>&1 ; _batch_ok=$? ;;
+      zypper) zypper install -y $TOOLS_TO_INSTALL > /dev/null 2>&1     ; _batch_ok=$? ;;
+      *)      _batch_ok=1 ;;
+    esac
+
+    # 逐包最终校验：如果批量安装失败，尝试针对失败的包进行单独重试
+    for tool_pkg in $TOOLS_TO_INSTALL; do
+      if is_pkg_installed "$tool_pkg"; then
+        tools_ok="$tools_ok $tool_pkg"
+      else
+        local _retry_ok=0
+        case "$pm" in
+          apt)    apt install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+          dnf)    dnf install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+          yum)    yum install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+          apk)    apk add "$tool_pkg" > /dev/null 2>&1        && _retry_ok=1 ;;
+          pacman) pacman -S --noconfirm "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+          zypper) zypper install -y "$tool_pkg" > /dev/null 2>&1     && _retry_ok=1 ;;
+        esac
+        if is_pkg_installed "$tool_pkg" || [ "$_retry_ok" -eq 1 ]; then
+          tools_ok="$tools_ok $tool_pkg"
+        else
+          tools_failed="$tools_failed $tool_pkg"
+        fi
+      fi
+    done
+
+    if [ -z "$tools_failed" ]; then
+      r_tools=1
+      echo -e "$step_ok 常用工具安装完成"
+    else
+      echo -e "$step_fail 部分常用工具安装失败"
+    fi
   fi
   log_action "init_optimize install tools: ok=[$tools_ok] fail=[$tools_failed]"
 
   # ── [3] 设置 Swap ────────────────────────────────────────
-  echo -e "\n${gl_kjlan}[3/5] 设置 Swap 为 ${swap_mb}MB...${gl_bai}"
-  local swap_result=0
-  (
-    swapoff /swapfile 2>/dev/null || true
-    sed -i '\|/swapfile swap swap|d' /etc/fstab 2>/dev/null || true
-    rm -f /swapfile
-    if has_cmd fallocate; then
-      fallocate -l "${swap_mb}M" /swapfile 2>/dev/null || \
-        dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
-    else
-      dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
-    fi
-    chmod 600 /swapfile
-    mkswap /swapfile > /dev/null
-    swapon /swapfile
-    grep -q '/swapfile swap swap' /etc/fstab || \
-      echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
-  ) && swap_result=1
-  if [ "$swap_result" -eq 1 ]; then
-    r_swap=1
-    log_action "init_optimize swap ${swap_mb}MB"
-    echo -e "$step_ok Swap 已设置为 ${swap_mb}MB"
+  if [ "$swap_mb" -eq 0 ]; then
+    echo -e "\n${gl_kjlan}[3/5] 设置 Swap...${gl_bai}"
+    echo -e "$step_skip 磁盘剩余空间不足（当前剩余 ${free_mb}MB，安全限制需留 2GB），已跳过 Swap 创建。"
+    r_swap=2
   else
-    echo -e "$step_fail Swap 设置失败"
+    echo -e "\n${gl_kjlan}[3/5] 设置 Swap 为 ${swap_mb}MB...${gl_bai}"
+    local swap_result=0
+    (
+      swapoff /swapfile 2>/dev/null || true
+      sed -i '\|/swapfile swap swap|d' /etc/fstab 2>/dev/null || true
+      rm -f /swapfile
+      if has_cmd fallocate; then
+        fallocate -l "${swap_mb}M" /swapfile 2>/dev/null || \
+          dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
+      else
+        dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
+      fi
+      chmod 600 /swapfile
+      mkswap /swapfile > /dev/null
+      swapon /swapfile
+      grep -q '/swapfile swap swap' /etc/fstab || \
+        echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+    ) && swap_result=1
+    if [ "$swap_result" -eq 1 ]; then
+      r_swap=1
+      log_action "init_optimize swap ${swap_mb}MB"
+      echo -e "$step_ok Swap 已设置为 ${swap_mb}MB"
+    else
+      echo -e "$step_fail Swap 设置失败"
+    fi
   fi
 
   # ── [4] 安装 Docker ──────────────────────────────────────
@@ -4226,11 +4291,12 @@ system_init_optimize() {
   # ── [6] 系统环境与 TCP 协议栈高级优化 ──────────────────
   echo -e "\n${gl_kjlan}[6/7] 开启网络内核协议栈与系统环境调优...${gl_bai}"
   local r_tcptune=0
+  local has_changes=0
   (
+    local _local_changes=0
     # 1. TCP 协议栈调优
     local sysctl_tcp_conf="/etc/sysctl.d/99-ua-tcp-tune.conf"
-    cat > "$sysctl_tcp_conf" <<'TCPTUNE'
-# UA Box TCP High Performance Tuning
+    local target_tcp_conf="# UA Box TCP High Performance Tuning
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 600
@@ -4240,9 +4306,23 @@ net.ipv4.tcp_max_tw_buckets = 5000
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
-net.core.somaxconn = 4096
-TCPTUNE
-    sysctl -p "$sysctl_tcp_conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1
+net.core.somaxconn = 4096"
+    
+    local tcp_needs_write=1
+    if [ -f "$sysctl_tcp_conf" ]; then
+      local cur_strip target_strip
+      cur_strip="$(grep -v '^#' "$sysctl_tcp_conf" 2>/dev/null | tr -d '[[:space:]]')"
+      target_strip="$(echo "$target_tcp_conf" | grep -v '^#' | tr -d '[[:space:]]')"
+      if [ "$cur_strip" = "$target_strip" ]; then
+        tcp_needs_write=0
+      fi
+    fi
+
+    if [ "$tcp_needs_write" -eq 1 ]; then
+      echo "$target_tcp_conf" > "$sysctl_tcp_conf"
+      sysctl -p "$sysctl_tcp_conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1
+      _local_changes=1
+    fi
 
     # 2. 提升文件描述符上限 (Ulimit nofile)
     if ! grep -q "soft nofile 65535" /etc/security/limits.conf 2>/dev/null; then
@@ -4252,22 +4332,47 @@ TCPTUNE
 root soft nofile 65535
 root hard nofile 65535
 EOF
+      _local_changes=1
     fi
-    sed -i 's/^#\?DefaultLimitNOFILE.*/DefaultLimitNOFILE=65535/g' /etc/systemd/system.conf 2>/dev/null || true
-    sed -i 's/^#\?DefaultLimitNOFILE.*/DefaultLimitNOFILE=65535/g' /etc/systemd/user.conf 2>/dev/null || true
+    
+    if ! grep -q "DefaultLimitNOFILE=65535" /etc/systemd/system.conf 2>/dev/null; then
+      sed -i 's/^#\?DefaultLimitNOFILE.*/DefaultLimitNOFILE=65535/g' /etc/systemd/system.conf 2>/dev/null || true
+      _local_changes=1
+    fi
+    if ! grep -q "DefaultLimitNOFILE=65535" /etc/systemd/user.conf 2>/dev/null; then
+      sed -i 's/^#\?DefaultLimitNOFILE.*/DefaultLimitNOFILE=65535/g' /etc/systemd/user.conf 2>/dev/null || true
+      _local_changes=1
+    fi
 
     # 3. 提升 SSH 登录速度 (UseDNS / GSSAPI)
+    local ssh_needs_update=0
     if [ -f /etc/ssh/sshd_config ]; then
+      if ! grep -Eq '^UseDNS[[:space:]]+no' /etc/ssh/sshd_config || ! grep -Eq '^GSSAPIAuthentication[[:space:]]+no' /etc/ssh/sshd_config; then
+        ssh_needs_update=1
+      fi
+    fi
+
+    if [ "$ssh_needs_update" -eq 1 ]; then
       sed -i -e 's/^#\?UseDNS.*/UseDNS no/g' -e 's/^#\?GSSAPIAuthentication.*/GSSAPIAuthentication no/g' /etc/ssh/sshd_config
       systemctl restart ssh sshd 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || true
+      _local_changes=1
     fi
 
     # 4. 自动开启 NTP 时间同步
     timedatectl set-ntp true 2>/dev/null || true
+    
+    echo "$_local_changes" > /tmp/.ua-tcptune-has-changes
   ) && r_tcptune=1
   
   if [ "$r_tcptune" -eq 1 ]; then
-    echo -e "$step_ok 系统环境与 TCP 调优配置已成功应用"
+    local _ch
+    _ch="$(cat /tmp/.ua-tcptune-has-changes 2>/dev/null)"
+    rm -f /tmp/.ua-tcptune-has-changes
+    if [ "$_ch" = "1" ]; then
+      echo -e "$step_ok 系统环境与 TCP 调优配置已成功应用"
+    else
+      echo -e "$step_skip 系统环境与 TCP 配置已是最新状态，无需重复调优"
+    fi
   else
     echo -e "$step_fail 系统环境与 TCP 调优配置应用失败"
   fi
@@ -4280,24 +4385,36 @@ EOF
   if [ "$virt_type" = "OPENVZ" ] || [ "$virt_type" = "LXC" ]; then
     echo -e "$step_skip 架构为 ${virt_type}，不支持开启 BBR"
   else
-    local kver major minor
-    kver="$(uname -r)"
-    major="$(printf '%s' "$kver" | cut -d. -f1)"
-    minor="$(printf '%s' "$kver" | cut -d. -f2)"
-    if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
-      echo -e "$step_fail 当前内核 $kver 不支持 BBR（需要 >= 4.9）"
+    local sysctl_conf="/etc/sysctl.d/99-ua-bbr.conf"
+    local bbr_active=0
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+      if [ -f "$sysctl_conf" ] && grep -q "tcp_congestion_control=bbr" "$sysctl_conf" 2>/dev/null; then
+        bbr_active=1
+      fi
+    fi
+
+    if [ "$bbr_active" -eq 1 ]; then
+      r_bbr=1
+      echo -e "$step_skip BBR 拥塞控制已启用，无需重复配置"
     else
-      modprobe tcp_bbr 2>/dev/null || true
-      local sysctl_conf="/etc/sysctl.d/99-ua-bbr.conf"
-      cat > "$sysctl_conf" <<'SYSCTL'
+      local kver major minor
+      kver="$(uname -r)"
+      major="$(printf '%s' "$kver" | cut -d. -f1)"
+      minor="$(printf '%s' "$kver" | cut -d. -f2)"
+      if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+        echo -e "$step_fail 当前内核 $kver 不支持 BBR（需要 >= 4.9）"
+      else
+        modprobe tcp_bbr 2>/dev/null || true
+        cat > "$sysctl_conf" <<'SYSCTL'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 SYSCTL
-      if sysctl -p "$sysctl_conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1; then
-        r_bbr=1
-        echo -e "$step_ok BBR 拥塞控制已成功开启"
-      else
-        echo -e "$step_fail BBR 开启失败"
+        if sysctl -p "$sysctl_conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1; then
+          r_bbr=1
+          echo -e "$step_ok BBR 拥塞控制已成功开启"
+        else
+          echo -e "$step_fail BBR 开启失败"
+        fi
       fi
     fi
   fi
@@ -4326,6 +4443,8 @@ SYSCTL
     local cur_swap
     cur_swap="$(free -m | awk '/^Swap:/ {print $2}')MB"
     echo -e "  $step_ok Swap 设置为 ${swap_mb}MB（当前: $cur_swap）"
+  elif [ "$r_swap" -eq 2 ]; then
+    echo -e "  $step_skip Swap 设置已跳过（磁盘空间不足）"
   else
     echo -e "  $step_fail Swap 设置"
   fi
