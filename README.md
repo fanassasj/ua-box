@@ -25,8 +25,8 @@ wget -qO- https://raw.githubusercontent.com/fanassasj/ua-box/main/install.sh | b
 ```bash
 git clone https://github.com/fanassasj/ua-box.git /root/ua-box
 cd /root/ua-box
-chmod +x ua-box install-local.sh
-./install-local.sh
+chmod +x ua-box
+./ua-box install-links
 ua
 ```
 
@@ -98,8 +98,10 @@ curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lso
 - Caddy 反代管理（支持宿主机原生部署与 Docker 容器化部署，双栈自适应管理）
 - Nginx Proxy Manager 可视化面板
 - it-tools 工具箱
+- **File Browser 文件浏览器** (支持可视化管理和传输服务器本地全盘文件)
+- **OpenList 网盘系统** (AList 社区开源分支，支持 Docker 和 Docker Compose 双模部署，内置管理员密码一键重置与日志提取)
 
-面板工具顶部会显示统一状态页，包括安装状态、运行状态、端口和访问地址（实时读取 Compose 状态比率）。Nginx Proxy Manager 会自动识别容器名，例如 `npm` 或 `nginx-proxy-manager`，避免后续管理混淆。
+面板工具顶部会显示统一状态页，包括安装状态、运行状态、端口和访问地址（实时读取 Compose 状态比率，支持公网 IP 智能替换与本地会话缓存）。Nginx Proxy Manager 会自动识别容器名，例如 `npm` 或 `nginx-proxy-manager`，避免后续管理混淆。
 
 ### Docker 管理
 
@@ -179,6 +181,8 @@ ua update          # 按配置 URL 更新脚本
 ua init            # 一键初始化优化（更新+工具+Swap+Docker）
 ua bbr             # BBR 拥塞控制管理
 ua fw              # 防火墙管理
+ua fb              # 打开 File Browser 文件浏览器管理
+ua ol              # 打开 OpenList 网盘系统管理
 ua install curl jq # 安装指定工具
 ```
 
@@ -220,7 +224,7 @@ UA_STATUS_DISK_CRIT=90
 ```bash
 cd /root/ua-box
 git pull
-./install-local.sh
+./ua-box install-links
 ```
 
 也可以在配置文件里设置 `UA_BOX_UPDATE_URL`，然后执行：
@@ -269,6 +273,14 @@ UA Box 只在选择对应菜单项时下载并执行外部脚本：
 - 新增「工作区退出常驻向导」：Tmux 会话右下角以红底白字高亮常驻退出快捷键（`退出: Ctrl+B, D`），彻底防止会话误杀。
 - 新增「RClone 开机挂载防死循环」：Systemd 自启服务内置启动频率限制（300秒限5次），防 CPU 空转。
 - 新增「RClone 配置文件手动编辑」：增加一键编辑 `rclone.conf` 入口（附带精确时间戳自动备份）。
+- 新增「File Browser 文件浏览器」：一键在宿主机部署极简 Web 文件管理器，支持服务器全盘文件可视化上传、下载与分享。
+- 新增「OpenList 网盘系统」：集成 OpenList (AList 分支) 部署，提供 Docker Run 与 Docker Compose 双模部署，并支持管理员初始密码日志提取与一键重置。
+- 新增「系统虚拟化细节友好映射」：自动识别并美化输出显示（如将 `google` 映射为 `GOOGLE CLOUD (GCP)`）。
+- 新增「全局软链接安装逻辑内置」：将原 install-local.sh 的配置逻辑直接整合至 ua-box install-links 命令行，同时在 ua update 更新后自动修复环境。
+- 优化「BBR 拥塞控制」：增加对 LXC/OpenVZ 架构容器的自动拦截，防止写入无效内核配置；增加系统可用算法双重校验；并扩展了半连接队列等高级网络调优参数。
+- 优化「防火墙与 NPM 管理权限」：全局或关键模块加入 root 前置提权校验，防止非 root 账号执行产生无用报错。
+- 优化「主菜单布局与视觉观感」：主界面重构为极简双栏网格，对中英文字符进行了像素级对齐，并统一规范了分割线。
+- 优化「工作区删除控制」：工作区删除选项支持了通过活跃会话编号、工作区后缀数字进行快速输入与匹配。
 - 优化 Docker 容器列表，清晰区分普通 `docker run` 与 `Docker Compose` 状态。
 - 彻底移除老旧的哪吒探针管理模块与外部脚本。
 

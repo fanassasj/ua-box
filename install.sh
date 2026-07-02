@@ -29,7 +29,6 @@ need_root
 mkdir -p "$INSTALL_DIR"
 
 download "$REPO_RAW/ua-box" "$INSTALL_DIR/ua-box"
-download "$REPO_RAW/install-local.sh" "$INSTALL_DIR/install-local.sh"
 download "$REPO_RAW/README.md" "$INSTALL_DIR/README.md"
 download "$REPO_RAW/.gitignore" "$INSTALL_DIR/.gitignore"
 
@@ -39,7 +38,7 @@ else
   echo "检测到已有配置文件，保留: $INSTALL_DIR/config"
 fi
 
-chmod +x "$INSTALL_DIR/ua-box" "$INSTALL_DIR/install-local.sh"
-"$INSTALL_DIR/install-local.sh"
+chmod +x "$INSTALL_DIR/ua-box"
+"$INSTALL_DIR/ua-box" install-links
 
 echo "安装完成，运行 ua 打开面板。"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-UA_BOX_VERSION="0.5.0"
+UA_BOX_VERSION="0.6.0"
 UA_BOX_NAME="UA Box"
 UA_BOX_HOME="${UA_BOX_HOME:-/root/ua-box}"
 UA_BOX_CONFIG="${UA_BOX_CONFIG:-$UA_BOX_HOME/config}"
@@ -128,6 +128,25 @@ backup_self() {
   echo "已备份到: $dst"
 }
 
+create_local_links() {
+  local srcTarget
+  srcTarget="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  local target="/usr/local/bin/ua"
+
+  chmod +x "$srcTarget"
+  ln -sf "$srcTarget" /usr/local/bin/ua-box
+
+  if [ -e "$target" ] && [ ! -L "$target" ]; then
+    echo "检测到 $target 已存在且不是符号链接。"
+    echo "为避免覆盖已有命令，未自动设置 ua。"
+    echo "确认要替换时，可先备份原文件，再执行：ln -sf $srcTarget $target"
+  else
+    ln -sf "$srcTarget" "$target"
+    echo "已设置/修复全局命令: ua"
+  fi
+  echo "备用命令仍可使用: ua-box"
+}
+
 update_self() {
   local src
   local tmp
@@ -155,6 +174,7 @@ update_self() {
   chmod +x "$src"
   rm -f "$tmp"
   log_action "update_self from $UA_BOX_UPDATE_URL"
+  create_local_links >/dev/null 2>&1 || true
   echo "UA Box 已更新。"
 }
 
@@ -460,6 +480,15 @@ public_ip() {
   fi
 }
 
+get_display_ip() {
+  if [ -z "${_UA_DISPLAY_IP:-}" ]; then
+    _UA_DISPLAY_IP="$(public_ip)"
+    [ -z "$_UA_DISPLAY_IP" ] && _UA_DISPLAY_IP="$(local_ip)"
+    [ -z "$_UA_DISPLAY_IP" ] && _UA_DISPLAY_IP="服务器IP"
+  fi
+  echo "$_UA_DISPLAY_IP"
+}
+
 public_ipv6() {
   if has_cmd curl; then
     curl -6 -fsS --max-time 3 https://api64.ipify.org 2>/dev/null || curl -6 -fsS --max-time 3 https://ip.sb 2>/dev/null
@@ -472,7 +501,23 @@ get_virt() {
   local virt="未知"
   if has_cmd systemd-detect-virt; then
     virt="$(systemd-detect-virt 2>/dev/null)"
-    [ "$virt" = "none" ] && virt="物理机"
+    case "$virt" in
+      none) virt="物理机" ;;
+      kvm) virt="KVM" ;;
+      qemu) virt="QEMU" ;;
+      vmware) virt="VMware" ;;
+      microsoft) virt="Hyper-V" ;;
+      oracle) virt="VirtualBox" ;;
+      xen) virt="Xen" ;;
+      openvz) virt="OpenVZ" ;;
+      lxc) virt="LXC" ;;
+      lxc-libvirt) virt="LXC (Libvirt)" ;;
+      docker) virt="Docker" ;;
+      wsl) virt="WSL" ;;
+      google|gce) virt="Google Cloud (GCP)" ;;
+      amazon|aws) virt="Amazon EC2 (AWS)" ;;
+      *) virt="$(echo "$virt" | tr '[:lower:]' '[:upper:]')" ;;
+    esac
   elif [ -f /proc/user_beancounters ]; then
     virt="OpenVZ"
   elif [ -d /proc/xen ] || grep -q "control_d" /proc/xen/capabilities 2>/dev/null; then
@@ -1012,7 +1057,8 @@ npm_container_name() {
 }
 
 panel_status_overview() {
-  local npm_name npm_status it_status caddy_line warp_line npm_url it_url caddy_file
+  local npm_name npm_status it_status fb_status openlist_status caddy_line warp_line npm_url it_url fb_url openlist_url caddy_file ip
+  ip="$(get_display_ip)"
 
   npm_name="$(npm_container_name)"
   if has_cmd warp || has_cmd warp-cli || ip addr show CloudflareWARP >/dev/null 2>&1 || ip addr show warp >/dev/null 2>&1; then
@@ -1042,8 +1088,8 @@ panel_status_overview() {
     else
       npm_status="${gl_huang}已停止${gl_bai}"
     fi
-    npm_url="$(docker port "$npm_name" 81/tcp 2>/dev/null | head -n 1 | awk -F: '{print "http://服务器IP:"$NF}')"
-    [ -z "$npm_url" ] && npm_url="http://服务器IP:81"
+    npm_url="$(docker port "$npm_name" 81/tcp 2>/dev/null | head -n 1 | awk -F: -v ip="$ip" '{print "http://"ip":"$NF}')"
+    [ -z "$npm_url" ] && npm_url="http://${ip}:81"
   else
     npm_status="${gl_hui}未安装${gl_bai}"
     npm_url="-"
@@ -1055,11 +1101,37 @@ panel_status_overview() {
     else
       it_status="${gl_huang}已停止${gl_bai}"
     fi
-    it_url="$(docker port it-tools 80/tcp 2>/dev/null | head -n 1 | awk -F: '{print "http://服务器IP:"$NF}')"
+    it_url="$(docker port it-tools 80/tcp 2>/dev/null | head -n 1 | awk -F: -v ip="$ip" '{print "http://"ip":"$NF}')"
     [ -z "$it_url" ] && it_url="-"
   else
     it_status="${gl_hui}未安装${gl_bai}"
     it_url="-"
+  fi
+
+  if has_cmd docker && docker_container_exists filebrowser; then
+    if docker_container_running filebrowser; then
+      fb_status="${gl_lv}运行中${gl_bai}"
+    else
+      fb_status="${gl_huang}已停止${gl_bai}"
+    fi
+    fb_url="$(docker port filebrowser 80/tcp 2>/dev/null | head -n 1 | awk -F: -v ip="$ip" '{print "http://"ip":"$NF}')"
+    [ -z "$fb_url" ] && fb_url="-"
+  else
+    fb_status="${gl_hui}未安装${gl_bai}"
+    fb_url="-"
+  fi
+
+  if has_cmd docker && docker_container_exists openlist; then
+    if docker_container_running openlist; then
+      openlist_status="${gl_lv}运行中${gl_bai}"
+    else
+      openlist_status="${gl_huang}已停止${gl_bai}"
+    fi
+    openlist_url="$(docker port openlist 5244/tcp 2>/dev/null | head -n 1 | awk -F: -v ip="$ip" '{print "http://"ip":"$NF}')"
+    [ -z "$openlist_url" ] && openlist_url="-"
+  else
+    openlist_status="${gl_hui}未安装${gl_bai}"
+    openlist_url="-"
   fi
 
   echo -e "${gl_kjlan}工具状态总览${gl_bai}"
@@ -1067,6 +1139,8 @@ panel_status_overview() {
   printf "%-24s %-18b %-28s\n" "Caddy" "$caddy_line" "$caddy_file"
   printf "%-24s %-18b %-28s\n" "Nginx Proxy Manager" "$npm_status" "$npm_url"
   printf "%-24s %-18b %-28s\n" "it-tools" "$it_status" "$it_url"
+  printf "%-24s %-18b %-28s\n" "File Browser" "$fb_status" "$fb_url"
+  printf "%-24s %-18b %-28s\n" "OpenList" "$openlist_status" "$openlist_url"
   echo "NPM 识别到容器名: $npm_name"
   echo -e "Compose项目状态:  ${gl_lv}$(get_compose_projects_summary)${gl_bai}"
 }
@@ -1112,7 +1186,7 @@ npm_install() {
     -v /root/nginx-proxy-manager/data:/data \
     -v /root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt \
     jc21/nginx-proxy-manager:latest
-  echo "Nginx Proxy Manager 已部署。如果映射了非标准端口，请访问对应的映射端口，例如管理后台: http://服务器IP:$port_81"
+  echo "Nginx Proxy Manager 已部署。如果映射了非标准端口，请访问对应的映射端口，例如管理后台: http://$(get_display_ip):$port_81"
 }
 
 npm_tools_menu() {
@@ -1144,6 +1218,7 @@ npm_tools_menu() {
       3) docker_require && docker restart "$name"; pause ;;
       4) docker_require && docker stop "$name"; pause ;;
       5)
+        need_root || { pause; continue; }
         if confirm_danger "删除 Nginx Proxy Manager 容器和 /root/nginx-proxy-manager 数据" "$name"; then
           docker rm -f "$name" 2>/dev/null || true
           rm -rf /root/nginx-proxy-manager
@@ -1183,7 +1258,7 @@ it_tools_install() {
     --restart unless-stopped \
     -p "$port":80 \
     corentinth/it-tools:latest
-  echo "it-tools 已部署。访问: http://服务器IP:$port"
+  echo "it-tools 已部署。访问: http://$(get_display_ip):$port"
 }
 
 it_tools_menu() {
@@ -1223,6 +1298,241 @@ it_tools_menu() {
   done
 }
 
+filebrowser_install() {
+  need_root || return 1
+  docker_require || install_docker || return 1
+
+  if docker_container_exists filebrowser; then
+    docker start filebrowser
+    echo "File Browser 容器已存在并已启动。"
+    return 0
+  fi
+
+  local port
+  read -r -e -p "请输入 Web 端口，回车默认 8082: " port
+  port="${port:-8082}"
+  if ! printf '%s\n' "$port" | grep -Eq '^[0-9]+$'; then
+    echo "端口必须是数字。"
+    return 1
+  fi
+  if is_port_taken "$port"; then
+    echo -e "${gl_hong}错误:${gl_bai} 端口 $port 已被系统占用，请先释放该端口，或者指定其他端口。"
+    return 1
+  fi
+
+  mkdir -p /root/filebrowser
+  log_action "install filebrowser port=$port"
+  docker run -d \
+    --name filebrowser \
+    --restart unless-stopped \
+    -v /:/srv \
+    -v /root/filebrowser:/database \
+    -p "$port":80 \
+    filebrowser/filebrowser:latest
+  echo "File Browser 已部署。访问: http://$(get_display_ip):$port"
+  echo "默认用户名和密码为: admin / admin"
+}
+
+filebrowser_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}File Browser 文件浏览器${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    if has_cmd docker && docker_container_exists filebrowser; then
+      docker ps -a --filter "name=^/filebrowser$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    else
+      echo "容器: 未安装"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 File Browser"
+    echo -e "${gl_kjlan}2.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}3.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}4.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}5.   ${gl_bai}删除容器和配置数据"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) filebrowser_install; pause ;;
+      2) docker_require && docker logs --tail 120 filebrowser; pause ;;
+      3) docker_require && docker restart filebrowser; pause ;;
+      4) docker_require && docker stop filebrowser; pause ;;
+      5)
+        need_root || { pause; continue; }
+        if confirm_danger "删除 File Browser 容器和数据库配置文件" "filebrowser"; then
+          docker rm -f filebrowser 2>/dev/null || true
+          rm -rf /root/filebrowser
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+openlist_install() {
+  need_root || return 1
+  docker_require || install_docker || return 1
+
+  if docker_container_exists openlist; then
+    docker start openlist
+    echo "OpenList 容器已存在并已启动。"
+    return 0
+  fi
+
+  local deploy_mode port port_dav data_dir
+  echo "请选择部署方式："
+  echo "1) Docker Run (普通容器部署)"
+  echo "2) Docker Compose (项目部署)"
+  read -r -e -p "请输入选择 (1 或 2，默认 1): " deploy_mode
+  deploy_mode="${deploy_mode:-1}"
+
+  read -r -e -p "请输入 Web 端口 (5244)，回车默认 5244: " port
+  port="${port:-5244}"
+  read -r -e -p "请输入 WebDAV 端口 (5245，可选)，回车默认 5245: " port_dav
+  port_dav="${port_dav:-5245}"
+
+  for p in "$port" "$port_dav"; do
+    if ! printf '%s\n' "$p" | grep -Eq '^[0-9]+$'; then
+      echo "端口必须是纯数字。"
+      return 1
+    fi
+    if is_port_taken "$p"; then
+      echo -e "${gl_hong}错误:${gl_bai} 端口 $p 已被占用，请先释放端口或指定其他映射端口。"
+      return 1
+    fi
+  done
+
+  data_dir="/root/openlist"
+  mkdir -p "$data_dir/data"
+
+  if [ "$deploy_mode" = "2" ]; then
+    if ! docker compose version >/dev/null 2>&1 && ! has_cmd docker-compose; then
+      echo "未检测到 docker compose，将自动尝试安装..."
+      install_pkg docker-compose-plugin || install_pkg docker-compose || { echo "安装 docker-compose 失败。"; return 1; }
+    fi
+
+    cat > "$data_dir/docker-compose.yml" <<EOF
+version: '3.3'
+services:
+  openlist:
+    image: openlistteam/openlist:latest
+    container_name: openlist
+    restart: always
+    ports:
+      - "$port:5244"
+      - "$port_dav:5245"
+    volumes:
+      - ./data:/opt/openlist/data
+    environment:
+      - UMASK=022
+      - TZ=Asia/Shanghai
+    user: "0:0"
+EOF
+
+    log_action "install OpenList (Docker Compose, port=$port, port_dav=$port_dav)"
+    local compose_cmd="docker compose"
+    if ! docker compose version >/dev/null 2>&1; then
+      compose_cmd="docker-compose"
+    fi
+    (cd "$data_dir" && $compose_cmd up -d)
+    echo "OpenList 已使用 Docker Compose 部署。"
+  else
+    log_action "install OpenList (Docker Run, port=$port, port_dav=$port_dav)"
+    docker run -d \
+      --name openlist \
+      --restart always \
+      -p "$port":5244 \
+      -p "$port_dav":5245 \
+      -v "$data_dir/data":/opt/openlist/data \
+      -e UMASK=022 \
+      -e TZ=Asia/Shanghai \
+      --user "0:0" \
+      openlistteam/openlist:latest
+    echo "OpenList 已使用 Docker Run 部署。"
+  fi
+
+  echo "正在等待容器启动并获取初始密码..."
+  sleep 6
+  local init_pwd
+  init_pwd="$(docker logs openlist 2>&1 | grep "Successfully created the admin user and the password is" | awk -F'is ' '{print $2}' | tr -d '\r\n ')"
+  
+  if [ -z "$init_pwd" ]; then
+    init_pwd="$(docker exec -i openlist ./openlist admin random 2>/dev/null | grep "password:" | awk '{print $2}' | tr -d '\r\n ')"
+  fi
+  if [ -z "$init_pwd" ]; then
+    init_pwd="$(docker exec -i openlist ./alist admin random 2>/dev/null | grep "password:" | awk '{print $2}' | tr -d '\r\n ')"
+  fi
+
+  echo "OpenList 已部署。访问: http://$(get_display_ip):$port"
+  if [ -n "$init_pwd" ]; then
+    echo "管理员初始密码: $init_pwd"
+    echo "请尽快登录后台修改密码。"
+  else
+    echo "提示: 未能在日志中截获初始密码，您可以运行以下命令手动获取/重置密码："
+    echo "  docker exec -it openlist ./openlist admin random"
+  fi
+}
+
+openlist_tools_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}OpenList 网盘系统${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    if has_cmd docker && docker_container_exists openlist; then
+      docker ps -a --filter "name=^/openlist$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    else
+      echo "容器: 未安装"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 OpenList"
+    echo -e "${gl_kjlan}2.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}3.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}4.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}5.   ${gl_bai}获取/重置管理员密码"
+    echo -e "${gl_kjlan}6.   ${gl_bai}删除容器和配置数据"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) openlist_install; pause ;;
+      2) docker_require && docker logs --tail 120 openlist; pause ;;
+      3) docker_require && docker restart openlist; pause ;;
+      4) docker_require && docker stop openlist; pause ;;
+      5)
+        if docker_container_running openlist; then
+          local new_pwd
+          new_pwd="$(docker exec -i openlist ./openlist admin random 2>/dev/null | grep "password:" | awk '{print $2}' | tr -d '\r\n ')"
+          if [ -z "$new_pwd" ]; then
+            new_pwd="$(docker exec -i openlist ./alist admin random 2>/dev/null | grep "password:" | awk '{print $2}' | tr -d '\r\n ')"
+          fi
+          if [ -n "$new_pwd" ]; then
+            echo "成功重置随机密码: $new_pwd"
+          else
+            echo "无法通过命令获取，请查看日志中是否包含初始密码。"
+          fi
+        else
+          echo "容器未运行，请先启动 OpenList。"
+        fi
+        pause
+        ;;
+      6)
+        need_root || { pause; continue; }
+        if confirm_danger "删除 OpenList 容器和所有配置数据" "openlist"; then
+          docker rm -f openlist 2>/dev/null || true
+          rm -rf /root/openlist
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
 panel_tools_menu() {
   while true; do
     clear
@@ -1234,6 +1544,8 @@ panel_tools_menu() {
     echo -e "${gl_kjlan}2.   ${gl_bai}Caddy 反代管理"
     echo -e "${gl_kjlan}3.   ${gl_bai}Nginx Proxy Manager 可视化面板"
     echo -e "${gl_kjlan}4.   ${gl_bai}it-tools 工具箱"
+    echo -e "${gl_kjlan}5.   ${gl_bai}File Browser 文件浏览器"
+    echo -e "${gl_kjlan}6.   ${gl_bai}OpenList 网盘系统"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
@@ -1243,6 +1555,8 @@ panel_tools_menu() {
       2) caddy_tools_menu ;;
       3) npm_tools_menu ;;
       4) it_tools_menu ;;
+      5) filebrowser_menu ;;
+      6) openlist_tools_menu ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -2179,26 +2493,26 @@ workspace_menu() {
     echo -e "${gl_kjlan}7.   ${gl_bai}7号工作区                     ${gl_kjlan}8.   ${gl_bai}8号工作区"
     echo -e "${gl_kjlan}9.   ${gl_bai}9号工作区                     ${gl_kjlan}10.  ${gl_bai}10号工作区"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}21.  ${gl_bai}SSH 常驻模式"
-    echo -e "${gl_kjlan}22.  ${gl_bai}创建/进入自定义工作区"
-    echo -e "${gl_kjlan}23.  ${gl_bai}后台运行命令"
-    echo -e "${gl_kjlan}24.  ${gl_bai}删除工作区"
-    echo -e "${gl_kjlan}25.  ${gl_bai}重命名工作区"
-    echo -e "${gl_kjlan}26.  ${gl_bai}查看工作区列表"
-    echo -e "${gl_kjlan}31.  ${gl_bai}安装 tmux"
+    echo -e "${gl_kjlan}11.  ${gl_bai}SSH 常驻模式"
+    echo -e "${gl_kjlan}12.  ${gl_bai}创建/进入自定义工作区"
+    echo -e "${gl_kjlan}13.  ${gl_bai}后台运行命令"
+    echo -e "${gl_kjlan}14.  ${gl_bai}删除工作区"
+    echo -e "${gl_kjlan}15.  ${gl_bai}重命名工作区"
+    echo -e "${gl_kjlan}16.  ${gl_bai}查看工作区列表"
+    echo -e "${gl_kjlan}17.  ${gl_bai}安装 tmux"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice
 
     case "$choice" in
       [1-9]|10) tmux_open_session "${DEFAULT_WORKSPACE_PREFIX}${choice}"; pause ;;
-      21) tmux_ssh_persistent_menu ;;
-      22)
+      11) tmux_ssh_persistent_menu ;;
+      12)
         read -r -e -p "请输入工作区名称，如 1001 kj001 work1: " name
         tmux_open_session "$name"
         pause
         ;;
-      23)
+      13)
         tmux_require || { pause; continue; }
         read -r -e -p "请输入工作区名称: " name
         read -r -e -p "请输入要后台执行的命令: " cmd
@@ -2211,24 +2525,60 @@ workspace_menu() {
         fi
         pause
         ;;
-      24)
+      14)
         tmux_require || { pause; continue; }
-        read -r -e -p "请输入要删除的工作区名称: " name
+        local sessions=()
+        local i=1
+        local name=""
+        if tmux list-sessions >/dev/null 2>&1; then
+          echo "当前活跃的工作区列表："
+          while IFS= read -r sname; do
+            if [ -n "$sname" ]; then
+              sessions+=("$sname")
+              echo "  $i) $sname"
+              i=$((i + 1))
+            fi
+          done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+        fi
+
+        if [ ${#sessions[@]} -eq 0 ]; then
+          echo "暂无活跃的工作区。"
+          read -r -e -p "请输入要删除的自定义工作区名称（回车取消）: " name
+          [ -z "$name" ] && continue
+        else
+          local input
+          read -r -e -p "请输入要删除的序号或工作区名称: " input
+          [ -z "$input" ] && continue
+          if printf '%s\n' "$input" | grep -Eq '^[0-9]+$'; then
+            if [ "$input" -ge 1 ] && [ "$input" -le ${#sessions[@]} ]; then
+              name="${sessions[$((input - 1))]}"
+            else
+              if tmux has-session -t "${DEFAULT_WORKSPACE_PREFIX}${input}" 2>/dev/null; then
+                name="${DEFAULT_WORKSPACE_PREFIX}${input}"
+              else
+                name="$input"
+              fi
+            fi
+          else
+            name="$input"
+          fi
+        fi
+
         if confirm_danger "删除 tmux 工作区" "$name"; then
           log_action "tmux kill-session $name"
           tmux kill-session -t "$name"
         fi
         pause
         ;;
-      25)
+      15)
         tmux_require || { pause; continue; }
         read -r -e -p "请输入当前工作区名称: " old_name
         read -r -e -p "请输入新工作区名称: " new_name
         tmux rename-session -t "$old_name" "$new_name"
         pause
         ;;
-      26) tmux_require && tmux ls; pause ;;
-      31) install_pkg tmux; pause ;;
+      16) tmux_require && tmux ls; pause ;;
+      17) install_pkg tmux; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -3912,6 +4262,12 @@ system_bbr_menu() {
     case "$choice" in
       1)
         need_root || { pause; continue; }
+        local virt_type
+        virt_type="$(get_virt)"
+        if [ "$virt_type" = "OPENVZ" ] || [ "$virt_type" = "LXC" ]; then
+          echo -e "${gl_hong}架构为 ${virt_type}，不支持在容器内开启 BBR（需在宿主机开启）。${gl_bai}"
+          pause; continue
+        fi
         local kver major minor
         kver="$(uname -r)"
         major="$(printf '%s' "$kver" | cut -d. -f1)"
@@ -3920,7 +4276,13 @@ system_bbr_menu() {
           echo -e "${gl_hong}当前内核 $kver 不支持 BBR（需要 >= 4.9）${gl_bai}"
           pause; continue
         fi
-        modprobe tcp_bbr 2>/dev/null || true
+        if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
+          modprobe tcp_bbr 2>/dev/null || true
+        fi
+        if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
+          echo -e "${gl_hong}内核目前不支持或无法加载 BBR 模块。${gl_bai}"
+          pause; continue
+        fi
         local sysctl_conf="/etc/sysctl.d/99-ua-bbr.conf"
         cat > "$sysctl_conf" <<'SYSCTL'
 net.core.default_qdisc=fq
@@ -3954,12 +4316,13 @@ SYSCTL
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_syn_backlog = 16384
 net.ipv4.tcp_max_tw_buckets = 5000
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
 net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 25000
 TCPTUNE
         sysctl -p "$sysctl_tcp_conf" > /dev/null 2>&1 || sysctl --system > /dev/null 2>&1 || true
         log_action "TCP kernel parameters optimized"
@@ -3981,6 +4344,7 @@ TCPTUNE
 }
 
 system_firewall_menu() {
+  need_root || return 1
   local fw
   if has_cmd ufw; then
     fw=ufw
@@ -4052,17 +4416,26 @@ system_firewall_menu() {
           1) firewall-cmd --list-ports; pause ;;
           2)
             read -r -e -p "请输入要放行的 TCP 端口: " port
-            [ -n "$port" ] && firewall-cmd --permanent --add-port="${port}/tcp" && firewall-cmd --reload && log_action "firewalld add ${port}/tcp"
+            if [ -n "$port" ]; then
+              port="${port//:/-}"
+              firewall-cmd --permanent --add-port="${port}/tcp" && firewall-cmd --reload && log_action "firewalld add ${port}/tcp"
+            fi
             pause
             ;;
           3)
             read -r -e -p "请输入要放行的 UDP 端口: " port
-            [ -n "$port" ] && firewall-cmd --permanent --add-port="${port}/udp" && firewall-cmd --reload && log_action "firewalld add ${port}/udp"
+            if [ -n "$port" ]; then
+              port="${port//:/-}"
+              firewall-cmd --permanent --add-port="${port}/udp" && firewall-cmd --reload && log_action "firewalld add ${port}/udp"
+            fi
             pause
             ;;
           4)
             read -r -e -p "请输入要移除的端口（格式如 8080/tcp）: " portproto
-            [ -n "$portproto" ] && firewall-cmd --permanent --remove-port="$portproto" && firewall-cmd --reload
+            if [ -n "$portproto" ]; then
+              portproto="${portproto//:/-}"
+              firewall-cmd --permanent --remove-port="$portproto" && firewall-cmd --reload
+            fi
             pause
             ;;
           0) return 0 ;;
@@ -4752,32 +5125,27 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua install <pkg>       安装指定软件包
   ua remove <pkg>        卸载指定软件包
   ua help                显示帮助
+  ua-box install-links   设置/修复全局软链接(ua/ua-box)
 EOF
 }
 
 main_menu() {
   while true; do
     clear
-    echo -e "${gl_kjlan}"
-    echo "╦ ╦╔═╗   ╔╗ ╔═╗═╗ ╦"
-    echo "║ ║╠═╣───╠╩╗║ ║╔╩╦╝"
-    echo "╚═╝╩ ╩   ╚═╝╚═╝╩ ╚═"
-    echo -e "${UA_BOX_NAME} v${UA_BOX_VERSION}${gl_bai}"
-    echo -e "命令行输入 ${gl_huang}ua${gl_bai} 可快速启动脚本"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}1.   ${gl_bai}系统信息显示"
-    echo -e "${gl_kjlan}2.   ${gl_bai}系统工具"
-    echo -e "${gl_kjlan}3.   ${gl_bai}常用工具安装"
-    echo -e "${gl_kjlan}4.   ${gl_bai}面板工具"
-    echo -e "${gl_kjlan}5.   ${gl_bai}一键初始化优化"
-    echo -e "${gl_kjlan}6.   ${gl_bai}Docker 管理"
-    echo -e "${gl_kjlan}7.   ${gl_bai}工作区模块"
-    echo -e "${gl_kjlan}8.   ${gl_bai}rclone 管理"
-    echo -e "${gl_kjlan}9.   ${gl_bai}测试脚本"
-    echo -e "${gl_kjlan}10.  ${gl_bai}UA Box 设置"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}0.   ${gl_bai}退出脚本"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}╦ ╦╔═╗   ╔╗ ╔═╗═╗ ╦${gl_bai}"
+    echo -e "${gl_kjlan}║ ║╠═╣───╠╩╗║ ║╔╩╦╝  ${gl_lv}UA Box v${UA_BOX_VERSION}${gl_bai}"
+    echo -e "${gl_kjlan}╚═╝╩ ╩   ╚═╝╚═╝╩ ╚═  ${gl_hui}轻量级 Linux 命令行运维面板${gl_bai}"
+    echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
+    echo -e "快捷启动: 终端输入 ${gl_huang}ua${gl_bai} 可快速启动面板"
+    echo -e "${gl_kjlan}-----------------------[ 核心功能 ]------------------------${gl_bai}"
+    echo -e "  ${gl_kjlan}1.  ${gl_bai}系统信息显示            ${gl_kjlan}6.  ${gl_bai}Docker 管理${gl_bai}"
+    echo -e "  ${gl_kjlan}2.  ${gl_bai}系统工具运维            ${gl_kjlan}7.  ${gl_bai}工作区模块${gl_bai}"
+    echo -e "  ${gl_kjlan}3.  ${gl_bai}常用工具安装            ${gl_kjlan}8.  ${gl_bai}rclone 管理${gl_bai}"
+    echo -e "  ${gl_kjlan}4.  ${gl_bai}面板工具集成            ${gl_kjlan}9.  ${gl_bai}测试脚本集${gl_bai}"
+    echo -e "  ${gl_kjlan}5.  ${gl_bai}一键初始化优化          ${gl_kjlan}10. ${gl_bai}UA Box 设置${gl_bai}"
+    echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
+    echo -e "  ${gl_hong}0.  ${gl_bai}退出脚本"
+    echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice
 
     case "$choice" in
@@ -4834,6 +5202,12 @@ case "${1:-}" in
   panel|panels|面板|面板工具)
     panel_tools_menu
     ;;
+  filebrowser|fb|文件浏览器)
+    filebrowser_menu
+    ;;
+  openlist|ol|网盘)
+    openlist_tools_menu
+    ;;
 
   docker|dk|容器)
     docker_menu
@@ -4869,6 +5243,9 @@ case "${1:-}" in
     ;;
   update|更新)
     update_self
+    ;;
+  install-links|setup-links)
+    create_local_links
     ;;
   settings|setting|设置)
     ua_settings_menu
