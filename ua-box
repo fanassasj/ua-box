@@ -148,23 +148,61 @@ create_local_links() {
 }
 
 update_self() {
-  local src
-  local tmp
+  local src tmp update_url up_choice update_git
 
-  if [ -z "$UA_BOX_UPDATE_URL" ]; then
-    echo -e "${gl_hong}未配置 UA_BOX_UPDATE_URL。${gl_bai}"
-    echo ""
-    echo "推荐设置（GitHub 官方源）:"
-    echo "  UA_BOX_UPDATE_URL=\"https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-box\""
-    echo ""
-    echo "请运行 ${gl_huang}ua config${gl_bai} 将上面的地址写入配置文件，然后重新执行 ua update。"
-    return 1
+  # 1. 检测是否为 Git 仓库并提示通过 Git 更新
+  if [ -d "$UA_BOX_HOME/.git" ]; then
+    echo -e "检测到当前项目是通过 ${gl_lv}Git 克隆${gl_bai} 安装的。"
+    read -r -e -p "是否通过 Git 拉取最新代码进行更新？[Y/n]: " update_git
+    update_git="${update_git:-y}"
+    if [ "$update_git" = "y" ] || [ "$update_git" = "Y" ]; then
+      echo "开始通过 Git 更新..."
+      log_action "update via git pull"
+      backup_self || return 1
+      if (cd "$UA_BOX_HOME" && git pull); then
+        create_local_links >/dev/null 2>&1 || true
+        echo -e "${gl_lv}Git 更新成功！${gl_bai}"
+      else
+        echo -e "${gl_hong}Git 拉取失败，请检查网络或本地修改。${gl_bai}"
+      fi
+      return 0
+    fi
   fi
 
+  # 2. 交互式选择更新源（包含手动输入选项）
+  echo "请选择更新源："
+  echo -e "1) 使用配置的 URL 进行更新 [ ${gl_lv}${UA_BOX_UPDATE_URL:-未配置}${gl_bai} ]"
+  echo "2) 手动输入自定义 URL 进行更新"
+  echo "0) 取消"
+  read -r -e -p "请输入选择 (0-2): " up_choice
+  [ -z "$up_choice" ] && return 0
+
+  case "$up_choice" in
+    1)
+      if [ -z "$UA_BOX_UPDATE_URL" ]; then
+        echo -e "${gl_hong}错误: 配置文件中未设置 UA_BOX_UPDATE_URL。${gl_bai}"
+        return 1
+      fi
+      update_url="$UA_BOX_UPDATE_URL"
+      ;;
+    2)
+      read -r -e -p "请输入更新脚本的完整 URL: " update_url
+      if [ -z "$update_url" ]; then
+        echo "URL 不能为空。"
+        return 1
+      fi
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  # 3. 下载并覆盖更新
   src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
   tmp="$UA_BOX_TMP_DIR/ua-box-update.$$"
   backup_self || return 1
-  download_to "$UA_BOX_UPDATE_URL" "$tmp" || return 1
+  echo "正在从 $update_url 下载最新版本..."
+  download_to "$update_url" "$tmp" || return 1
   bash -n "$tmp" || {
     echo "下载的新脚本语法校验失败，已取消更新。"
     rm -f "$tmp"
@@ -173,9 +211,9 @@ update_self() {
   cp "$tmp" "$src"
   chmod +x "$src"
   rm -f "$tmp"
-  log_action "update_self from $UA_BOX_UPDATE_URL"
+  log_action "update_self from $update_url"
   create_local_links >/dev/null 2>&1 || true
-  echo "UA Box 已更新。"
+  echo -e "${gl_lv}UA Box 已更新成功！${gl_bai}"
 }
 
 init_ua_box
@@ -5034,36 +5072,38 @@ ua_settings_menu() {
   while true; do
     clear
     echo -e "${gl_kjlan}UA Box 设置${gl_bai}"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}1.   ${gl_bai}查看状态检查"
-    echo -e "${gl_kjlan}2.   ${gl_bai}编辑配置文件"
-    echo -e "${gl_kjlan}3.   ${gl_bai}查看最近日志"
-    echo -e "${gl_kjlan}4.   ${gl_bai}清空日志"
-    echo -e "${gl_kjlan}5.   ${gl_bai}备份当前脚本"
-    echo -e "${gl_kjlan}6.   ${gl_bai}查看备份列表"
-    echo -e "${gl_kjlan}7.   ${gl_bai}按配置 URL 更新脚本"
-    echo -e "${gl_kjlan}8.   ${gl_bai}异常忽略管理"
-    echo -e "${gl_kjlan}9.   ${gl_bai}从备份恢复脚本"
-    echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}-----------------------[ 状态与日志 ]------------------------${gl_bai}"
+    echo -e "  ${gl_kjlan}1.  ${gl_bai}查看状态检查"
+    echo -e "  ${gl_kjlan}2.  ${gl_bai}查看最近运行日志"
+    echo -e "  ${gl_kjlan}3.  ${gl_bai}清空运行日志"
+    echo -e "${gl_kjlan}-----------------------[ 配置与备份 ]------------------------${gl_bai}"
+    echo -e "  ${gl_kjlan}4.  ${gl_bai}编辑配置文件"
+    echo -e "  ${gl_kjlan}5.  ${gl_bai}备份当前脚本"
+    echo -e "  ${gl_kjlan}6.  ${gl_bai}查看已备份列表"
+    echo -e "  ${gl_kjlan}7.  ${gl_bai}从备份恢复脚本"
+    echo -e "${gl_kjlan}--------------------[ 系统管理与更新 ]----------------------${gl_bai}"
+    echo -e "  ${gl_kjlan}8.  ${gl_bai}异常忽略管理"
+    echo -e "  ${gl_kjlan}9.  ${gl_bai}检查与更新脚本 (支持 Git/配置URL/自定义URL)"
+    echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
+    echo -e "  ${gl_hong}0.  ${gl_bai}返回主菜单"
+    echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice
 
     case "$choice" in
       1) ua_status; pause ;;
-      2) "${EDITOR:-nano}" "$UA_BOX_CONFIG"; pause ;;
-      3) tail -n 80 "$UA_BOX_LOG_FILE" 2>/dev/null || echo "暂无日志。"; pause ;;
-      4)
+      2) tail -n 80 "$UA_BOX_LOG_FILE" 2>/dev/null || echo "暂无日志。"; pause ;;
+      3)
         if confirm_danger "清空 UA Box 日志" "$UA_BOX_LOG_FILE"; then
           : > "$UA_BOX_LOG_FILE"
           log_action "clear log"
+          echo "日志已清空。"
         fi
         pause
         ;;
+      4) "${EDITOR:-nano}" "$UA_BOX_CONFIG"; pause ;;
       5) backup_self; pause ;;
       6) ls -lh "$UA_BOX_BACKUP_DIR" 2>/dev/null || echo "暂无备份。"; pause ;;
-      7) update_self; pause ;;
-      8) ua_ignore_menu ;;
-      9)
+      7)
         ls -lh "$UA_BOX_BACKUP_DIR" 2>/dev/null || echo "暂无备份。"
         read -r -e -p "请输入要恢复的备份文件名: " bak
         if [ -z "$bak" ]; then
@@ -5082,6 +5122,8 @@ ua_settings_menu() {
         fi
         pause
         ;;
+      8) ua_ignore_menu ;;
+      9) update_self; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
