@@ -3567,21 +3567,29 @@ system_reinstall_menu() {
   echo "6. 自定义 reinstall.sh 参数"
   echo "0. 取消"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
+  local choice
   read -r -e -p "请输入你的选择: " choice
 
-  local args=""
+  local args=()
   local pwd_input=""
   local port_input=""
   local key_input=""
   local username_input=""
   case "$choice" in
-    1) args="debian 13" ;;
-    2) args="debian 12" ;;
-    3) args="ubuntu 24.04" ;;
-    4) args="ubuntu 22.04" ;;
-    5) args="alpine" ;;
+    1) args=(debian 13) ;;
+    2) args=(debian 12) ;;
+    3) args=(ubuntu 24.04) ;;
+    4) args=(ubuntu 22.04) ;;
+    5) args=(alpine) ;;
     6)
-      read -r -e -p "请输入 reinstall.sh 完整参数 (如: debian 12 --password mypass): " args
+      local custom_args=""
+      read -r -e -p "请输入 reinstall.sh 完整参数 (如: debian 12 --password mypass): " custom_args
+      if [ -z "$custom_args" ]; then
+        echo "未输入参数，已取消。"
+        return 1
+      fi
+      # shellcheck disable=SC2206
+      args=($custom_args)
       ;;
     0) return 0 ;;
     *) echo "无效输入"; return 1 ;;
@@ -3594,7 +3602,11 @@ system_reinstall_menu() {
     # 1. 引导设置登录用户名
     read -r -e -p "请输入新系统的登录用户名 (直接回车默认为 root / administrator): " username_input
     if [ -n "$username_input" ]; then
-      args="$args --username \"$username_input\""
+      if printf '%s\n' "$username_input" | grep -Eq '^[a-z_][a-z0-9_-]*$'; then
+        args+=(--username "$username_input")
+      else
+        echo -e "${gl_huang}用户名格式不合法（仅允许小写字母、数字、下划线、连字符，且不能以数字或连字符开头），已忽略。${gl_bai}"
+      fi
     fi
     
     # 2. 优先引导密钥对登录，提高安全性并做格式校验
@@ -3604,8 +3616,8 @@ system_reinstall_menu() {
         break
       fi
       # 校验公钥格式
-      if echo "$key_input" | grep -Eq '^(ssh-rsa|ssh-dss|ecdsa-sha2-nistp[0-9]+|ssh-ed25519|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp[0-9]+@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]]+.+)?$'; then
-        args="$args --ssh-key \"$key_input\""
+      if grep -Eq '^(ssh-rsa|ssh-dss|ecdsa-sha2-nistp[0-9]+|ssh-ed25519|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp[0-9]+@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]]+.+)?$' <<< "$key_input"; then
+        args+=(--ssh-key "$key_input")
         break
       else
         echo -e "${gl_hong}公钥格式不正确，请重新输入（应以 ssh-rsa / ssh-ed25519 等开头，后接 Base64 编码）。${gl_bai}"
@@ -3617,7 +3629,7 @@ system_reinstall_menu() {
       read -r -e -s -p "请输入新系统的 Root 密码 (直接回车表示使用脚本默认/随机生成): " pwd_input
       echo ""
       if [ -n "$pwd_input" ]; then
-        args="$args --password \"$pwd_input\""
+        args+=(--password "$pwd_input")
       fi
     else
       echo -e "${gl_lv}已检测到有效公钥，系统将默认采用密钥认证登录（跳过设置密码）。${gl_bai}"
@@ -3626,25 +3638,28 @@ system_reinstall_menu() {
     # 4. 引导配置 SSH 端口
     read -r -e -p "请输入新系统的 SSH 端口 (直接回车默认为 22): " port_input
     if [ -n "$port_input" ] && printf '%s\n' "$port_input" | grep -Eq '^[0-9]+$'; then
-      args="$args --ssh-port $port_input"
+      if [ "$port_input" -ge 1 ] && [ "$port_input" -le 65535 ]; then
+        args+=(--ssh-port "$port_input")
+      else
+        echo -e "${gl_huang}端口范围应为 1-65535，已忽略该配置。${gl_bai}"
+      fi
     fi
   fi
 
   # 安全脱敏，避免在二次确认中明文打印密码和公钥
-  local display_args="$args"
+  local display_args="${args[*]}"
   if [ -n "$pwd_input" ]; then
-    display_args="${display_args/\"$pwd_input\"/********}"
+    display_args="${display_args/$pwd_input/********}"
   fi
   if [ -n "$key_input" ]; then
-    display_args="${display_args/\"$key_input\"/[SSH-KEY]}"
+    display_args="${display_args/$key_input/[SSH-KEY]}"
   fi
 
   if confirm_danger "即将重装系统，当前系统所有数据将彻底丢失" "reinstall.sh $display_args"; then
     download_to "$REINSTALL_SCRIPT" "$UA_BOX_TMP_DIR"/reinstall.sh || return 1
     chmod +x "$UA_BOX_TMP_DIR"/reinstall.sh
-    log_action "reinstall system $args"
-    # shellcheck disable=SC2086
-    bash "$UA_BOX_TMP_DIR"/reinstall.sh $args
+    log_action "reinstall system $display_args"
+    bash "$UA_BOX_TMP_DIR"/reinstall.sh "${args[@]}"
   fi
 }
 
