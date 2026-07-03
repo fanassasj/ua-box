@@ -9,7 +9,7 @@ UA_BOX_LOG_DIR="${UA_BOX_LOG_DIR:-$UA_BOX_HOME/logs}"
 UA_BOX_LOG_FILE="${UA_BOX_LOG_FILE:-$UA_BOX_LOG_DIR/ua-box.log}"
 UA_BOX_BACKUP_DIR="${UA_BOX_BACKUP_DIR:-$UA_BOX_HOME/backups}"
 UA_BOX_TMP_DIR="${UA_BOX_TMP_DIR:-$(mktemp -d /tmp/ua-box.XXXXXX)}"
-trap 'rm -rf "$UA_BOX_TMP_DIR"' EXIT
+trap 'rm -rf "$UA_BOX_TMP_DIR"' EXIT INT TERM
 gl_hui='\033[37m'
 gl_hong='\033[31m'
 gl_lv='\033[32m'
@@ -36,7 +36,7 @@ GB5_SCRIPT="https://raw.githubusercontent.com/i-abc/GB5/main/gb5-test.sh"
 REINSTALL_SCRIPT="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
 BESTTRACE_SCRIPT="https://raw.githubusercontent.com/zhanghanyun/backtrace/main/install.sh"
 SUPERSPEED_SCRIPT="https://raw.githubusercontent.com/uxh/superspeed/master/superspeed.sh"
-LIMIT_SHUTDOWN_SCRIPT="/root/ua-box/limit-shutdown.sh"
+LIMIT_SHUTDOWN_SCRIPT="${UA_BOX_HOME}/limit-shutdown.sh"
 DEFAULT_WORKSPACE_PREFIX="work"
 DEFAULT_RCLONE_MOUNT_ARGS="--vfs-cache-mode writes"
 UA_BOX_UPDATE_URL="https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-box"
@@ -52,7 +52,7 @@ UA_STATUS_SKIP_RCLONE=0
 init_ua_box() {
   mkdir -p "$UA_BOX_HOME" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR"
   if [ ! -f "$UA_BOX_CONFIG" ]; then
-    cat > "$UA_BOX_CONFIG" <<EOF
+    cat > "$UA_BOX_CONFIG" <<'EOF'
 # UA Box 配置文件
 # 修改后重新运行 ua 生效。
 
@@ -150,6 +150,7 @@ create_local_links() {
 
 update_self() {
   local src tmp update_url up_choice update_git
+  src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
   # 1. 检测是否为 Git 仓库并提示通过 Git 更新
   if [ -d "$UA_BOX_HOME/.git" ]; then
@@ -162,7 +163,9 @@ update_self() {
       backup_self || return 1
       if (cd "$UA_BOX_HOME" && git pull); then
         create_local_links >/dev/null 2>&1 || true
-        echo -e "${gl_lv}Git 更新成功！${gl_bai}"
+        echo -e "${gl_lv}Git 更新成功！正在自动为您重新加载新版本...${gl_bai}"
+        sleep 1.5
+        exec bash "$src"
       else
         echo -e "${gl_hong}Git 拉取失败，请检查网络或本地修改。${gl_bai}"
       fi
@@ -199,7 +202,6 @@ update_self() {
   esac
 
   # 3. 下载并覆盖更新
-  src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
   tmp="$UA_BOX_TMP_DIR/ua-box-update.$$"
   backup_self || return 1
   echo "正在从 $update_url 下载最新版本..."
@@ -209,12 +211,17 @@ update_self() {
     rm -f "$tmp"
     return 1
   }
-  cp "$tmp" "$src"
+  local dest_dir atomic_tmp
+  dest_dir="$(dirname "$src")"
+  atomic_tmp="$(mktemp "${src}.tmp.XXXXXX")" || return 1
+  cp "$tmp" "$atomic_tmp" && mv "$atomic_tmp" "$src"
   chmod +x "$src"
   rm -f "$tmp"
   log_action "update_self from $update_url"
   create_local_links >/dev/null 2>&1 || true
-  echo -e "${gl_lv}UA Box 已更新成功！${gl_bai}"
+  echo -e "${gl_lv}UA Box 已更新成功！正在自动为您重新加载新版本...${gl_bai}"
+  sleep 1.5
+  exec bash "$src"
 }
 
 init_ua_box
@@ -391,7 +398,7 @@ install_pkg() {
         apt update -y
         touch /tmp/.ua-apt-updated
       fi
-      apt install -y "$@"
+      DEBIAN_FRONTEND=noninteractive apt install -y "$@"
       ;;
     dnf)
       dnf install -y "$@"
@@ -431,7 +438,7 @@ remove_pkg() {
   local pm orphans
   pm="$(pkg_manager)"
   case "$pm" in
-    apt) apt purge -y "$@" ;;
+    apt) DEBIAN_FRONTEND=noninteractive apt purge -y "$@" ;;
     dnf) dnf remove -y "$@" ;;
     yum) yum remove -y "$@" ;;
     apk) apk del "$@" ;;
@@ -644,7 +651,7 @@ system_info() {
   load="$(awk '{print $1" "$2" "$3}' /proc/loadavg 2>/dev/null)"
   mem="$(free -m | awk '/^Mem:/ {printf "%dM/%dM (%d%%)", $3, $2, $3*100/$2}')"
   swap="$(free -m | awk '/^Swap:/ {if ($2==0) printf "0M/0M (0%%)"; else printf "%dM/%dM (%d%%)", $3, $2, $3*100/$2}')"
-  disk="$(df -h / | awk 'NR==2 {print $3"/"$2" ("$5")"}')"
+  disk="$(df -Ph / | awk 'NR==2 {print $3"/"$2" ("$5")"}')"
   uptime="$(human_uptime)"
   dns="$(awk '/^nameserver/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)"
   ipv4="$(local_ip)"
@@ -687,6 +694,7 @@ system_info() {
 }
 
 common_tools_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}常用工具安装${gl_bai}"
@@ -823,6 +831,7 @@ warp_status() {
 }
 
 warp_tools_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}WARP 管理${gl_bai}"
@@ -1041,7 +1050,7 @@ caddy_tools_menu() {
       1) install_pkg caddy; pause ;;
       2) caddy_docker_install; pause ;;
       3)
-        local cfg_file
+        local cfg_file choice
         if docker_container_exists caddy; then
           cfg_file="/root/caddy/Caddyfile"
         else
@@ -1258,7 +1267,7 @@ npm_install() {
 npm_tools_menu() {
   while true; do
     clear
-    local name
+    local name choice
     name="$(npm_container_name)"
     echo -e "${gl_kjlan}Nginx Proxy Manager${gl_bai}"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -1328,6 +1337,7 @@ it_tools_install() {
 }
 
 it_tools_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}it-tools 工具箱${gl_bai}"
@@ -1400,6 +1410,7 @@ filebrowser_install() {
 }
 
 filebrowser_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}File Browser 文件浏览器${gl_bai}"
@@ -1570,7 +1581,7 @@ openlist_tools_menu() {
       4) docker_require && docker stop openlist; pause ;;
       5)
         if docker_container_running openlist; then
-          local new_pwd
+          local new_pwd choice
           new_pwd="$(docker exec -i openlist ./openlist admin random 2>/dev/null | grep "password:" | awk '{print $2}' | tr -d '\r\n ')"
           if [ -z "$new_pwd" ]; then
             new_pwd="$(docker exec -i openlist ./alist admin random 2>/dev/null | grep "password:" | awk '{print $2}' | tr -d '\r\n ')"
@@ -1600,6 +1611,7 @@ openlist_tools_menu() {
 }
 
 panel_tools_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}面板工具${gl_bai}"
@@ -1664,7 +1676,7 @@ install_docker() {
   fi
 
   if has_cmd apt; then
-    apt install -y docker-compose-plugin >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt install -y docker-compose-plugin >/dev/null 2>&1 || true
   elif has_cmd dnf; then
     dnf install -y docker-compose-plugin >/dev/null 2>&1 || true
   elif has_cmd yum; then
@@ -1676,6 +1688,9 @@ install_docker() {
   if has_cmd docker; then
     echo "Docker 安装完成。"
     docker --version
+    if ! docker info >/dev/null 2>&1; then
+      echo -e "${gl_huang}警告: Docker 命令已存在，但 Docker 守护进程未正常启动或无法访问。${gl_bai}"
+    fi
     if docker compose version >/dev/null 2>&1; then
       docker compose version
     else
@@ -1756,6 +1771,7 @@ docker_global_status() {
 }
 
 docker_network_menu() {
+  local choice
   while true; do
     clear
     docker_require || { pause; return; }
@@ -1803,6 +1819,7 @@ docker_network_menu() {
 }
 
 docker_volume_menu() {
+  local choice
   while true; do
     clear
     docker_require || { pause; return; }
@@ -2071,6 +2088,7 @@ docker_container_rename() {
 }
 
 docker_container_menu() {
+  local choice
   while true; do
     clear
     docker_require || { pause; return; }
@@ -2135,7 +2153,7 @@ docker_container_menu() {
 }
 
 docker_compose_project_control() {
-  local dir="$1"
+  local dir="$1" op_choice
   local cmd_prefix
   if docker compose version >/dev/null 2>&1; then
     cmd_prefix="docker compose"
@@ -2216,7 +2234,7 @@ docker_compose_project_control() {
 docker_compose_menu() {
   docker_require || { pause; return; }
 
-  local proj_dirs=()
+  local proj_dirs=() choice
   local dir
 
   # 1. 优先从容器 Labels 中直接秒级抓取已被 Docker 记录的 Compose 工作目录，完全免去 find 扫描
@@ -2449,7 +2467,7 @@ docker_menu() {
       11) docker_edit_daemon; pause ;;
       12)
         docker_require || { pause; continue; }
-        local dcount
+        local dcount choice
         dcount="$(docker images -f dangling=true -q 2>/dev/null | wc -l)"
         if [ "$dcount" -eq 0 ]; then
           echo "无悬空镜像。"
@@ -2500,7 +2518,7 @@ tmux_open_session() {
 tmux_ssh_persistent_menu() {
   while true; do
     clear
-    local status
+    local status choice
     if grep -q 'tmux attach-session -t sshd || tmux new-session -s sshd' ~/.bashrc 2>/dev/null; then
       status="${gl_lv}开启${gl_bai}"
     else
@@ -2593,7 +2611,7 @@ workspace_menu() {
         ;;
       14)
         tmux_require || { pause; continue; }
-        local sessions=()
+        local sessions=() choice
         local i=1
         local name=""
         if tmux list-sessions >/dev/null 2>&1; then
@@ -2955,7 +2973,7 @@ rclone_menu() {
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     if has_cmd rclone; then
       if has_cmd timeout; then
-        local rclone_ver
+        local rclone_ver choice
         rclone_ver="$(timeout 2 rclone version 2>/dev/null | head -n 1)"
         echo "${rclone_ver:-rclone 已安装，版本检测超时。}"
       else
@@ -2993,6 +3011,10 @@ rclone_menu() {
       4)
         rclone_require || { pause; continue; }
         read -r -e -p "请输入路径，如 googlexr: 或 googlexr:目录，若只输入 Name 会自动补冒号: " path
+        if [[ "$path" =~ ^- ]]; then
+          echo "错误：路径不能以 - 开头。"
+          pause; continue
+        fi
         path="$(rclone_normalize_path "$path")" || { echo "路径不能为空。"; pause; continue; }
         rclone lsd "$path"
         pause
@@ -3001,6 +3023,10 @@ rclone_menu() {
         rclone_require || { pause; continue; }
         read -r -e -p "请输入源路径: " src
         read -r -e -p "请输入目标路径: " dst
+        if [[ "$src" =~ ^- ]] || [[ "$dst" =~ ^- ]]; then
+          echo "错误：路径不能以 - 开头。"
+          pause; continue
+        fi
         rclone copy "$src" "$dst" -P
         pause
         ;;
@@ -3008,6 +3034,10 @@ rclone_menu() {
         rclone_require || { pause; continue; }
         read -r -e -p "请输入源路径: " src
         read -r -e -p "请输入目标路径: " dst
+        if [[ "$src" =~ ^- ]] || [[ "$dst" =~ ^- ]]; then
+          echo "错误：路径不能以 - 开头。"
+          pause; continue
+        fi
         if confirm_danger "rclone sync 会让目标与源一致，可能删除目标多余文件" "$src -> $dst"; then
           log_action "rclone sync $src $dst"
           rclone sync "$src" "$dst" -P
@@ -3018,6 +3048,10 @@ rclone_menu() {
         rclone_require || { pause; continue; }
         read -r -e -p "请输入远程路径，如 remote:path : " remote_path
         read -r -e -p "请输入本地挂载点: " mount_point
+        if [[ "$remote_path" =~ ^- ]] || [[ "$mount_point" =~ ^- ]]; then
+          echo "错误：路径不能以 - 开头。"
+          pause; continue
+        fi
         read -r -e -p "额外参数，回车使用默认: " extra
         [ -z "$extra" ] && extra="$DEFAULT_RCLONE_MOUNT_ARGS"
         mkdir -p "$mount_point"
@@ -3111,6 +3145,7 @@ run_speed_io_test() {
 }
 
 test_scripts_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}测试脚本合集${gl_bai}"
@@ -3217,10 +3252,12 @@ test_scripts_menu() {
       41)
         read -r -e -p "请输入脚本 URL: " url
         read -r -e -p "请输入脚本参数，回车跳过: " args
+        local args_arr=()
+        # shellcheck disable=SC2206
+        args_arr=($args)
         if [ -n "$url" ]; then
           download_to "$url" "$UA_BOX_TMP_DIR"/ua-box-custom-test.sh && chmod +x "$UA_BOX_TMP_DIR"/ua-box-custom-test.sh
-          # shellcheck disable=SC2086
-          bash "$UA_BOX_TMP_DIR"/ua-box-custom-test.sh $args
+          bash "$UA_BOX_TMP_DIR"/ua-box-custom-test.sh "${args_arr[@]}"
         fi
         pause
         ;;
@@ -3344,7 +3381,7 @@ system_install_python_version() {
   case "$pm" in
     apt)
       apt update -y
-      apt install -y "$pkg" "${pkg}-venv" "${pkg}-dev" || {
+      DEBIAN_FRONTEND=noninteractive apt install -y "$pkg" "${pkg}-venv" "${pkg}-dev" || {
         echo "包管理器未提供 $pkg。若已安装 pyenv，可改用 pyenv 安装。"
         if has_cmd pyenv; then
           read -r -e -p "是否尝试 pyenv install $version ? 输入 yes 确认: " answer
@@ -3366,7 +3403,7 @@ ssh_set_global_option() {
   local value="$3"
   local tmp
 
-  tmp="$(mktemp)" || return 1
+  tmp="$(mktemp "${file}.tmp.XXXXXX")" || return 1
   awk -v key="$key" -v value="$value" '
     BEGIN {
       done = 0
@@ -3529,6 +3566,7 @@ system_check_admin_key_login() {
 }
 
 system_ssh_login_security_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}SSH 登录安全${gl_bai}"
@@ -3733,7 +3771,7 @@ system_user_password_generator() {
 system_timezone_menu() {
   need_root || return 1
 
-  local tz
+  local tz choice
   echo "当前时区: $(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo 未知)"
   echo "1. Asia/Shanghai"
   echo "2. UTC"
@@ -3781,6 +3819,7 @@ system_change_mirror() {
 }
 
 system_cron_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}定时任务管理${gl_bai}"
@@ -3819,7 +3858,7 @@ system_cron_menu() {
 system_set_swap() {
   need_root || return 1
 
-  local current new_swap
+  local current new_swap choice
   current="$(free -m | awk '/^Swap:/ {printf "%dMB/%dMB", $3, $2}')"
   echo "当前虚拟内存: ${current:-未知}"
   echo "1. 分配 1024MB"
@@ -3851,6 +3890,18 @@ system_set_swap() {
     return 1
   fi
 
+  local free_kb free_mb
+  free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')"
+  free_mb=$(( free_kb / 1024 ))
+  if [ "$new_swap" -gt "$free_mb" ]; then
+    echo "错误：自定义大小 ${new_swap}MB 超出可用磁盘空间 ${free_mb}MB。"
+    return 1
+  fi
+  if [ $(( free_mb - new_swap )) -lt 1024 ]; then
+    echo "错误：分配 ${new_swap}MB 虚拟内存后剩余磁盘空间不足 1024MB，已阻止以防系统崩溃。"
+    return 1
+  fi
+
   if confirm_danger "重建 /swapfile 并设置虚拟内存为 ${new_swap}MB" "/swapfile"; then
     log_action "set swap ${new_swap}MB"
     swapoff /swapfile 2>/dev/null || true
@@ -3870,7 +3921,7 @@ system_set_swap() {
 }
 
 system_history_menu() {
-  local hist_file
+  local hist_file choice
   hist_file="${HISTFILE:-$HOME/.bash_history}"
 
   echo "命令行历史文件: $hist_file"
@@ -3975,7 +4026,7 @@ system_limit_shutdown_menu() {
 
   case "$choice" in
     1)
-      local rx_limit tx_limit reset_day
+      local rx_limit tx_limit reset_day choice
       read -r -e -p "请输入进站流量阈值 GB: " rx_limit
       read -r -e -p "请输入出站流量阈值 GB: " tx_limit
       read -r -e -p "每月几号重置基准，回车默认 1: " reset_day
@@ -4109,7 +4160,7 @@ system_init_optimize() {
   
   # 获取 / 目录剩余空间 (MB)
   local free_kb free_mb
-  free_kb="$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')"
+  free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')"
   free_mb=$(( free_kb / 1024 ))
   [ -z "$free_mb" ] || ! printf '%s' "$free_mb" | grep -Eq '^[0-9]+$' && free_mb=0
 
@@ -4213,7 +4264,7 @@ system_init_optimize() {
     echo "  正在安装未就绪的工具: $TOOLS_TO_INSTALL ..."
     # shellcheck disable=SC2086
     case "$pm" in
-      apt)    apt install -y $TOOLS_TO_INSTALL > /dev/null 2>&1 ; _batch_ok=$? ; touch /tmp/.ua-apt-updated 2>/dev/null || true ;;
+      apt)    DEBIAN_FRONTEND=noninteractive apt install -y $TOOLS_TO_INSTALL > /dev/null 2>&1 ; _batch_ok=$? ; touch /tmp/.ua-apt-updated 2>/dev/null || true ;;
       dnf)    dnf install -y $TOOLS_TO_INSTALL > /dev/null 2>&1 ; _batch_ok=$? ;;
       yum)    yum install -y $TOOLS_TO_INSTALL > /dev/null 2>&1 ; _batch_ok=$? ;;
       apk)    apk add $TOOLS_TO_INSTALL > /dev/null 2>&1       ; _batch_ok=$? ;;
@@ -4229,7 +4280,7 @@ system_init_optimize() {
       else
         local _retry_ok=0
         case "$pm" in
-          apt)    apt install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
+          apt)    DEBIAN_FRONTEND=noninteractive apt install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
           dnf)    dnf install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
           yum)    yum install -y "$tool_pkg" > /dev/null 2>&1 && _retry_ok=1 ;;
           apk)    apk add "$tool_pkg" > /dev/null 2>&1        && _retry_ok=1 ;;
@@ -4604,7 +4655,7 @@ TCPTUNE
 
 system_firewall_menu() {
   need_root || return 1
-  local fw
+  local fw choice
   if has_cmd ufw; then
     fw=ufw
   elif has_cmd firewall-cmd; then
@@ -4765,6 +4816,7 @@ system_firewall_menu() {
 # ── /BBR + 防火墙管理 ────────────────────────────────────────
 
 system_tools_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}系统工具${gl_bai}"
@@ -5330,7 +5382,7 @@ ua_settings_menu() {
         if [ -z "$bak" ]; then
           echo "已取消。"
         else
-          local _bak_path="$UA_BOX_BACKUP_DIR/$bak"
+          local _bak_path="$UA_BOX_BACKUP_DIR/$bak" choice
           if [ ! -f "$_bak_path" ]; then
             echo -e "${gl_hong}未找到备份文件: $_bak_path${gl_bai}"
           elif confirm_danger "从备份覆盖当前脚本" "$_bak_path"; then
@@ -5393,6 +5445,7 @@ EOF
 }
 
 main_menu() {
+  local choice
   while true; do
     clear
     echo -e "${gl_kjlan}╦ ╦╔═╗   ╔╗ ╔═╗═╗ ╦${gl_bai}"
