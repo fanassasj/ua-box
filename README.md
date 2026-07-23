@@ -2,7 +2,7 @@
 
 UA Box 是一个轻量 Linux 命令行运维面板，整合系统管理、Docker、rclone、面板工具、网络测试和常用脚本入口。
 
-当前版本：**v0.6.0**
+当前版本：**v0.6.1**
 
 适合 VPS、独服、轻量服务器的日常管理。脚本以 Bash 编写，尽量减少依赖；部分系统级操作需要 root 权限。
 
@@ -66,8 +66,7 @@ cd /root/ua-box
 ### 系统工具
 
 - 系统更新、系统清理
-- 查看端口占用状态
-- ROOT 密码登录模式
+- **查看端口占用状态** (内置 awk 引擎智能排版过滤长路径噪音，纯净展示协议/端口/进程)
 - 用户/密码生成器
 - 系统时区调整
 - 切换系统更新源
@@ -77,6 +76,7 @@ cd /root/ua-box
 - **修改 hostname**
 - **BBR 拥塞控制**（一键开启/关闭，自动检测内核版本，写入 sysctl 永久生效）
 - **防火墙管理**（自动识别 ufw / firewalld / iptables，支持查看规则、放行/删除端口）
+- **SSH 安全加固与防暴破**（支持修改默认端口 + 防火墙自动放行、一键导入/抓取 GitHub 密钥公钥、全系统用户 SSH 权限智能诊断、当前活跃 SSH 会话/连接追踪、Fail2ban 防暴破与解封、密码/Root 登录管理）
 - **一键初始化优化**（系统更新 + 常用工具批量安装 + Swap 自动设为内存 2 倍 + Docker + 可选 hostname）
 - 一键重装系统
 - 开放所有端口
@@ -170,6 +170,8 @@ ua docker          # Docker 管理
 ua work            # 工作区管理
 ua rclone          # rclone 管理
 ua test            # 测试脚本合集
+ua top             # 打开动态 Live 实时系统监控控制台 (CPU/内存/网络网速/容器)
+ua fzf             # 打开 fzf 全功能交互式模糊搜索导航面板
 ua status          # UA 状态检查
 ua ignore          # 异常忽略管理
 ua ignore current  # 忽略当前异常项
@@ -181,6 +183,10 @@ ua update          # 按配置 URL 更新脚本
 ua init            # 一键初始化优化（更新+工具+Swap+Docker）
 ua bbr             # BBR 拥塞控制管理
 ua fw              # 防火墙管理
+ua ssh             # SSH 安全加固与防暴破
+ua ssh-port        # 修改 SSH 监听端口
+ua ssh-key         # 导入/安装 SSH 密钥公钥
+ua f2b             # Fail2ban 防暴破管理
 ua fb              # 打开 File Browser 文件浏览器管理
 ua ol              # 打开 OpenList 网盘系统管理
 ua install curl jq # 安装指定工具
@@ -263,6 +269,12 @@ UA Box 只在选择对应菜单项时下载并执行外部脚本：
 - 融合怪: `https://gitlab.com/spiritysdx/za`
 
 ## 更新日志
+
+### v0.6.1
+
+- 新增「系统端口占用美化排版」：重写端口状态查看逻辑，智能过滤 `ss` / `netstat` 输出中的长路径 (如 docker-proxy、Cgroup) 噪音，干净整洁地提取并对齐协议、地址、端口与纯净进程名 (PID)。
+- 新增「全系统用户 SSH 权限诊断」：SSH 安全面板新增全范围用户（Root + UID≥1000 正常 shell 用户）扫描，以直观表格形式输出 Home 目录、.ssh、authorized_keys 的严格权限 (StrictModes) 验证结果及状态警告。
+- 新增「SSH 活跃连接追踪」：SSH 安全面板新增活跃终端查看功能，双维度整合系统 `who` 登录会话与底层 `ss` (ESTABLISHED) 状态网络连接，精准排查连接来源。
 
 ### v0.6.0
 

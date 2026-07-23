@@ -14,9 +14,7 @@ gl_hui='\033[37m'
 gl_hong='\033[31m'
 gl_lv='\033[32m'
 gl_huang='\033[33m'
-gl_lan='\033[34m'
 gl_bai='\033[0m'
-gl_zi='\033[35m'
 gl_kjlan='\033[96m'
 
 WARP_MANAGER_SCRIPT="https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh"
@@ -129,6 +127,106 @@ backup_self() {
   echo "已备份到: $dst"
 }
 
+select_with_fzf_or_menu() {
+  local prompt_msg="$1"
+  shift
+  local input_items=("$@")
+  
+  if [ "${#input_items[@]}" -eq 0 ]; then
+    return 1
+  fi
+
+  if has_cmd fzf && [ -t 0 ]; then
+    printf '%s\n' "${input_items[@]}" | fzf --prompt="${prompt_msg}: " --height=40% --layout=reverse --border --ansi
+    return $?
+  fi
+
+  local i item_count="${#input_items[@]}"
+  echo -e "${gl_kjlan}${prompt_msg}${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  for ((i=0; i<item_count; i++)); do
+    echo -e "${gl_kjlan}$((i+1)). ${gl_bai}${input_items[$i]}"
+  done
+  echo -e "${gl_kjlan}0. 取消${gl_bai}"
+  echo -e "${gl_kjlan}------------------------${gl_bai}"
+
+  local choice
+  read -r -e -p "请输入序号选择 (0-$item_count): " choice
+  if [ -z "$choice" ] || ! printf '%s\n' "$choice" | grep -Eq '^[0-9]+$' || [ "$choice" -eq 0 ] || [ "$choice" -gt "$item_count" ]; then
+    return 1
+  fi
+
+  echo "${input_items[$((choice-1))]}"
+}
+
+install_shell_completion() {
+  local completion_dir="/etc/bash_completion.d"
+  local completion_script="${completion_dir}/ua"
+
+  mkdir -p "$completion_dir" 2>/dev/null || true
+
+  cat > "$completion_script" <<'EOF'
+# UA Box Pure Bash Completion
+_ua_completion() {
+  local cur prev main_commands
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  main_commands="ps info sys system ssh ssh-port ssh-key f2b fail2ban tools panel docker dk work rclone test status ignore config log backup update init bbr fw fb ol top monitor fzf search find install remove"
+
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    mapfile -t COMPREPLY < <(compgen -W "${main_commands}" -- "${cur}")
+    return 0
+  fi
+
+  case "${prev}" in
+    docker|dk)
+      mapfile -t COMPREPLY < <(compgen -W "ps start stop restart logs rm inspect prune compose" -- "${cur}")
+      return 0
+      ;;
+    rclone)
+      local remotes=""
+      if command -v rclone >/dev/null 2>&1; then
+        remotes="$(rclone listremotes 2>/dev/null | tr -d ':\r' | tr '\n' ' ')"
+      fi
+      mapfile -t COMPREPLY < <(compgen -W "ls copy sync mount unmount ncdu config ${remotes}" -- "${cur}")
+      return 0
+      ;;
+    ignore)
+      mapfile -t COMPREPLY < <(compgen -W "current rclone container service reset" -- "${cur}")
+      return 0
+      ;;
+    install|remove)
+      mapfile -t COMPREPLY < <(compgen -W "curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lsof net-tools fail2ban ufw" -- "${cur}")
+      return 0
+      ;;
+    logs|start|stop|restart|rm|inspect)
+      if [ "${COMP_WORDS[1]}" = "docker" ] || [ "${COMP_WORDS[1]}" = "dk" ]; then
+        local containers=""
+        if command -v docker >/dev/null 2>&1; then
+          containers="$(docker ps -a --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')"
+        fi
+        mapfile -t COMPREPLY < <(compgen -W "${containers}" -- "${cur}")
+        return 0
+      fi
+      ;;
+  esac
+}
+complete -o default -F _ua_completion ua ua-box
+EOF
+  chmod 644 "$completion_script" 2>/dev/null || true
+
+  local user_rc="${HOME:-/root}/.bashrc"
+  if [ -f "$user_rc" ]; then
+    if ! grep -Fq "$completion_script" "$user_rc" 2>/dev/null; then
+      echo "[ -f $completion_script ] && . $completion_script" >> "$user_rc"
+    fi
+  fi
+
+  echo "已自动配置命令行 Tab 自动补全: $completion_script"
+}
+
 create_local_links() {
   local srcTarget
   srcTarget="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -146,6 +244,225 @@ create_local_links() {
     echo "已设置/修复全局命令: ua"
   fi
   echo "备用命令仍可使用: ua-box"
+  install_shell_completion
+}
+
+system_live_monitor() {
+  trap 'tput cnorm 2>/dev/null; clear; return 0' INT TERM
+  tput civis 2>/dev/null || true
+
+  local num_cpus
+  num_cpus="$(nproc 2>/dev/null || echo 1)"
+
+  get_cpu_stat() {
+    grep '^cpu ' /proc/stat 2>/dev/null | awk '{total=$2+$3+$4+$5+$6+$7+$8; printf "%.0f %.0f\n", total, $5}'
+  }
+
+  get_net_bytes() {
+    awk -F':| +' '
+      NR > 2 {
+        if ($1 ~ /^(lo|docker|br-|veth)/ || $2 ~ /^(lo|docker|br-|veth)/) next;
+        for (i=1; i<=NF; i++) {
+          if ($i ~ /^[0-9]+$/) {
+            rx += $i
+            tx += $(i+8)
+            break
+          }
+        }
+      }
+      END { printf "%.0f %.0f\n", rx, tx }
+    ' /proc/net/dev 2>/dev/null
+  }
+
+  calc_net_speed() {
+    local prx="$1" ptx="$2" crx="$3" ctx="$4" sec="${5:-1.5}"
+    awk -v prx="$prx" -v ptx="$ptx" -v crx="$crx" -v ctx="$ctx" -v sec="$sec" '
+      BEGIN {
+        drx = (crx - prx) / sec
+        dtx = (ctx - ptx) / sec
+        if (drx < 0) drx = 0
+        if (dtx < 0) dtx = 0
+
+        if (drx >= 1048576) {
+          s_rx = sprintf("%.2f MB/s", drx / 1048576)
+        } else {
+          s_rx = sprintf("%.1f KB/s", drx / 1024)
+        }
+
+        if (dtx >= 1048576) {
+          s_tx = sprintf("%.2f MB/s", dtx / 1048576)
+        } else {
+          s_tx = sprintf("%.1f KB/s", dtx / 1024)
+        }
+
+        print s_rx "|" s_tx
+      }
+    '
+  }
+
+  calc_cpu_usage() {
+    local ptot="$1" pidle="$2" ctot="$3" cidle="$4"
+    awk -v ptot="$ptot" -v pidle="$pidle" -v ctot="$ctot" -v cidle="$cidle" '
+      BEGIN {
+        dtot = ctot - ptot
+        didle = cidle - pidle
+        if (dtot <= 0) {
+          print 0
+        } else {
+          u = 100 * (dtot - didle) / dtot
+          if (u < 0) u = 0
+          if (u > 100) u = 100
+          printf "%.0f\n", u
+        }
+      }
+    '
+  }
+
+  local prev_cpu prev_idle prev_rx prev_tx
+  read -r prev_cpu prev_idle < <(get_cpu_stat)
+  read -r prev_rx prev_tx < <(get_net_bytes)
+
+  sleep 1
+
+  while true; do
+    local curr_cpu curr_idle curr_rx curr_tx
+    read -r curr_cpu curr_idle < <(get_cpu_stat)
+    read -r curr_rx curr_tx < <(get_net_bytes)
+
+    local cpu_usage
+    cpu_usage="$(calc_cpu_usage "$prev_cpu" "$prev_idle" "$curr_cpu" "$curr_idle")"
+
+    local rx_speed tx_speed
+    IFS="|" read -r rx_speed tx_speed < <(calc_net_speed "$prev_rx" "$prev_tx" "$curr_rx" "$curr_tx" 1.5)
+
+    prev_rx="$curr_rx"
+    prev_tx="$curr_tx"
+    prev_cpu="$curr_cpu"
+    prev_idle="$curr_idle"
+
+    local mem_total mem_avail mem_used mem_percent
+    mem_total="$(grep MemTotal /proc/meminfo | awk '{print $2}')"
+    mem_avail="$(grep MemAvailable /proc/meminfo | awk '{print $2}')"
+    if [ -n "$mem_total" ] && [ "$mem_total" -gt 0 ]; then
+      mem_used=$((mem_total - mem_avail))
+      mem_percent=$((100 * mem_used / mem_total))
+      local mem_total_mb=$((mem_total / 1024))
+      local mem_used_mb=$((mem_used / 1024))
+    else
+      mem_percent=0
+      mem_total_mb=0
+      mem_used_mb=0
+    fi
+
+    local disk_info disk_usage disk_total disk_used
+    disk_info="$(df -h / | awk 'NR==2 {print $2, $3, $5}')"
+    read -r disk_total disk_used disk_usage <<< "$disk_info"
+
+    draw_bar() {
+      local pct="${1:-0}"
+      local width=20
+      local filled=$((pct * width / 100))
+      local empty=$((width - filled))
+      local bar=""
+      for ((i=0; i<filled; i++)); do bar+="#"; done
+      for ((i=0; i<empty; i++)); do bar+="-"; done
+      echo "[$bar] $pct%"
+    }
+
+    local cpu_bar mem_bar
+    cpu_bar="$(draw_bar "$cpu_usage")"
+    mem_bar="$(draw_bar "$mem_percent")"
+
+    tput clear 2>/dev/null || clear
+    echo -e "${gl_kjlan}====================================================${gl_bai}"
+    echo -e "         ${gl_lv}UA Box 动态 Live 系统监控控制台${gl_bai}  (按 Q 键退出)"
+    echo -e "${gl_kjlan}====================================================${gl_bai}"
+    echo -e "  主机名: ${gl_bai}$(hostname)${gl_bai} | 内核: ${gl_bai}$(uname -r)${gl_bai} | Uptime: ${gl_bai}$(uptime -p 2>/dev/null || uptime)${gl_bai}"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+    echo -e "  CPU 使用率  ($num_cpus 核): ${gl_huang}${cpu_bar}${gl_bai}"
+    echo -e "  内存 使用率 (${mem_used_mb}M/${mem_total_mb}M): ${gl_huang}${mem_bar}${gl_bai}"
+    echo -e "  根磁盘 占用 (/):        ${gl_kjlan}${disk_used} / ${disk_total} (${disk_usage})${gl_bai}"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+    echo -e "  网络实时下载 (RX): ${gl_lv}${rx_speed}${gl_bai} | 实时上传 (TX): ${gl_lv}${tx_speed}${gl_bai}"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+
+    if has_cmd docker && docker info >/dev/null 2>&1; then
+      echo -e "${gl_kjlan}Top 运行中 Docker 容器 (按 CPU 排序):${gl_bai}"
+      docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" 2>/dev/null | sort -k2 -hr | head -n 5 | awk -F'\t' '
+        BEGIN { printf "%-20s %-8s %-20s %-8s %-20s %s\n", "NAME", "CPU %", "MEM USAGE", "MEM %", "NET I/O", "BLOCK I/O" }
+        { printf "%-20.20s %-8s %-20s %-8s %-20s %s\n", $1, $2, $3, $4, $5, $6 }
+      '
+    else
+      echo -e "${gl_kjlan}Top 高 CPU 占用进程 (Processes):${gl_bai}"
+      ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | head -n 6
+    fi
+    echo -e "${gl_kjlan}====================================================${gl_bai}"
+    echo "提示: 画面每 1.5 秒自动刷新，按 Q 键返回菜单。"
+
+    read -r -t 1.5 -n 1 input_key || true
+    if [[ "$input_key" == "q" ]] || [[ "$input_key" == "Q" ]]; then
+      tput cnorm 2>/dev/null || true
+      clear
+      return 0
+    fi
+  done
+}
+
+system_fzf_interactive_menu() {
+  if ! has_cmd fzf; then
+    echo -e "${gl_huang}检测到系统未安装 fzf 搜索工具。${gl_bai}"
+    read -r -e -p "是否立刻自动安装 fzf？[Y/n]: " inst_fzf
+    inst_fzf="${inst_fzf:-y}"
+    if [[ "$inst_fzf" =~ ^[Yy]$ ]]; then
+      install_pkg fzf || return 1
+    else
+      return 0
+    fi
+  fi
+
+  local options=(
+    "1. 📊 动态 Live 系统监控控制台 (ua top)"
+    "2. 🔒 SSH 安全加固与防暴破 (ua ssh)"
+    "3. 🔑 配置 SSH 密钥登录 / 导入公钥 (ua ssh-key)"
+    "4. 🛡 修改 SSH 默认监听端口 (ua ssh-port)"
+    "5. 🚫 Fail2ban 防暴破管理 (ua f2b)"
+    "6. 🐳 Docker 容器管理 (ua docker)"
+    "7. 📦 Docker Compose 项目控制台 (ua docker compose)"
+    "8. ☁️ rclone 远程盘管理 (ua rclone)"
+    "9. 📁 File Browser 文件浏览器管理 (ua fb)"
+    "10. 🗂 OpenList 网盘系统管理 (ua ol)"
+    "11. 🔥 防火墙放行与规则管理 (ua fw)"
+    "12. 🚀 BBR 拥塞控制管理 (ua bbr)"
+    "13. 🛠 常用运维工具一键安装 (ua tools)"
+    "14. ⚡ 一键系统初始化与优化 (ua init)"
+    "15. 🧪 综合性能/解锁/网络测试脚本合集 (ua test)"
+    "16. 🏥 UA 系统健康状态检查 (ua status)"
+    "17. ⚙️ 编辑 UA Box 配置文件 (ua config)"
+  )
+
+  local selected
+  selected="$(printf '%s\n' "${options[@]}" | fzf --prompt="🔍 请搜索或选择 UA Box 功能: " --height=50% --layout=reverse --border --ansi)"
+  [ -z "$selected" ] && return 0
+
+  case "$selected" in
+    *"1. 📊"*) system_live_monitor ;;
+    *"2. 🔒"*) system_ssh_login_security_menu ;;
+    *"3. 🔑"*) system_import_ssh_key ;;
+    *"4. 🛡"*) system_change_ssh_port ;;
+    *"5. 🚫"*) system_fail2ban_menu ;;
+    *"6. 🐳"*) docker_menu ;;
+    *"7. 📦"*) docker_compose_menu ;;
+    *"8. ☁️"*) rclone_menu ;;
+    *"9. 📁"*) filebrowser_menu ;;
+    *"10. 🗂"*) openlist_tools_menu ;;
+    *"11. 🔥"*) system_firewall_menu ;;
+    *"12. 🚀"*) system_bbr_menu ;;
+    *"13. 🛠"*) common_tools_menu ;;
+    *"14. ⚡"*) system_init_optimize ;;
+    *"15. 🧪"*) test_scripts_menu ;;
+    *"16. 🏥"*) system_status_check; pause ;;
+    *"17. ⚙️"*) "${EDITOR:-nano}" "$UA_BOX_CONFIG" ;;
+  esac
 }
 
 update_self() {
@@ -211,8 +528,7 @@ update_self() {
     rm -f "$tmp"
     return 1
   }
-  local dest_dir atomic_tmp
-  dest_dir="$(dirname "$src")"
+  local atomic_tmp
   atomic_tmp="$(mktemp "${src}.tmp.XXXXXX")" || return 1
   cp "$tmp" "$atomic_tmp" && mv "$atomic_tmp" "$src"
   chmod +x "$src"
@@ -2116,20 +2432,34 @@ docker_container_menu() {
 
     case "$choice" in
       1) docker_container_create; pause ;;
-      2) read -r -e -p "请输入容器名/ID，多个用空格分隔: " names; docker_container_action start "$names"; pause ;;
-      3) read -r -e -p "请输入容器名/ID，多个用空格分隔: " names; docker_container_action stop "$names"; pause ;;
+      2)
+        read -r -e -p "请输入容器名/ID (直接回车打开搜索列表): " names
+        [ -z "$names" ] && names="$(docker_select_container '选择要启动的容器')"
+        [ -n "$names" ] && docker_container_action start "$names"
+        pause
+        ;;
+      3)
+        read -r -e -p "请输入容器名/ID (直接回车打开搜索列表): " names
+        [ -z "$names" ] && names="$(docker_select_container '选择要停止的容器')"
+        [ -n "$names" ] && docker_container_action stop "$names"
+        pause
+        ;;
       4)
-        read -r -e -p "请输入容器名/ID，多个用空格分隔: " names
-        if [ -z "$names" ]; then
-          echo "未输入容器名/ID。"
-        elif confirm_danger "删除指定 Docker 容器" "$names"; then
+        read -r -e -p "请输入容器名/ID (直接回车打开搜索列表): " names
+        [ -z "$names" ] && names="$(docker_select_container '选择要删除的容器')"
+        if [ -n "$names" ] && confirm_danger "删除指定 Docker 容器" "$names"; then
           log_action "docker rm -f $names"
           # shellcheck disable=SC2086
           docker rm -f $names
         fi
         pause
         ;;
-      5) read -r -e -p "请输入容器名/ID，多个用空格分隔: " names; docker_container_action restart "$names"; pause ;;
+      5)
+        read -r -e -p "请输入容器名/ID (直接回车打开搜索列表): " names
+        [ -z "$names" ] && names="$(docker_select_container '选择要重启的容器')"
+        [ -n "$names" ] && docker_container_action restart "$names"
+        pause
+        ;;
       6) docker_container_all_action start; pause ;;
       7) docker_container_all_action stop; pause ;;
       8)
@@ -2139,8 +2469,18 @@ docker_container_menu() {
         pause
         ;;
       9) docker_container_all_action restart; pause ;;
-      11) read -r -e -p "请输入容器名/ID: " name; docker_container_shell "$name"; pause ;;
-      12) read -r -e -p "请输入容器名/ID: " name; docker_container_logs "$name"; pause ;;
+      11)
+        read -r -e -p "请输入容器名/ID (直接回车打开搜索列表): " name
+        [ -z "$name" ] && name="$(docker_select_container '选择要进入的容器')"
+        [ -n "$name" ] && docker_container_shell "$name"
+        pause
+        ;;
+      12)
+        read -r -e -p "请输入容器名/ID (直接回车打开搜索列表): " name
+        [ -z "$name" ] && name="$(docker_select_container '选择要查看日志的容器')"
+        [ -n "$name" ] && docker_container_logs "$name"
+        pause
+        ;;
       13) docker_container_network_overview; pause ;;
       14) docker_container_stats_once; pause ;;
       15) docker_container_port_access open; pause ;;
@@ -2403,6 +2743,7 @@ EOF
   else
     echo -e "${gl_hong}错误: 配置文件 JSON 语法校验失败，已自动恢复备份。${gl_bai}"
     local latest_bak
+    # shellcheck disable=SC2012
     latest_bak="$(ls -t "${daemon_file}.ua-box.bak."* 2>/dev/null | head -n 1)"
     if [ -n "$latest_bak" ] && [ -f "$latest_bak" ]; then
       cp "$latest_bak" "$daemon_file" && echo "已恢复先前配置文件。"
@@ -2840,20 +3181,19 @@ rclone_normalize_path() {
 rclone_choose_remote_lsd() {
   rclone_require || return 1
 
-  local remotes remote_path
-  remotes="$(rclone listremotes 2>/dev/null | sed 's/:$//')"
+  local remotes_list=()
+  mapfile -t remotes_list < <(rclone listremotes 2>/dev/null | sed 's/:$//')
 
-  if [ -z "$remotes" ]; then
+  if [ "${#remotes_list[@]}" -eq 0 ]; then
     echo "当前没有配置 rclone remote。"
     return 1
   fi
 
-  rclone_remote_summary
-  echo ""
-  read -r -e -p "请输入要查看的远程盘 Name，回车只显示列表: " remote_path
-  [ -z "$remote_path" ] && return 0
+  local selected_remote
+  selected_remote="$(select_with_fzf_or_menu '选择要列出目录的远程盘 (rclone remote)' "${remotes_list[@]}")"
+  [ -z "$selected_remote" ] && return 0
 
-  remote_path="$(rclone_normalize_path "$remote_path")" || return 1
+  local remote_path="${selected_remote}:"
   echo "正在列出: $remote_path"
   rclone lsd "$remote_path"
 }
@@ -3528,62 +3868,455 @@ system_disable_all_password_login() {
 }
 
 system_check_admin_key_login() {
-  local user="${1:-admin}"
-  local home_dir
-  local key_file
-  local item
+  echo -e "${gl_kjlan}系统用户 SSH 密钥及权限诊断${gl_bai}"
+  echo -e "${gl_kjlan}-------------------------------------------------------------------------${gl_bai}"
+  printf "%-12s %-16s %-16s %-16s %s\n" "用户" "Home 目录" ".ssh 目录" "auth_keys" "状态"
+  
+  local users
+  users=$(awk -F: '($3 == 0 || $3 >= 1000) && $7 !~ /nologin$|false$|sync$/ {print $1}' /etc/passwd)
+  
+  for u in $users; do
+    local home_dir ssh_dir key_file
+    home_dir="$(getent passwd "$u" | cut -d: -f6)"
+    ssh_dir="$home_dir/.ssh"
+    key_file="$ssh_dir/authorized_keys"
+    
+    local home_stat="缺失"
+    local ssh_stat="缺失"
+    local key_stat="缺失"
+    local status_msg="${gl_lv}正常${gl_bai}"
+    local err_count=0
 
-  if ! getent passwd "$user" >/dev/null 2>&1; then
-    echo "用户不存在: $user"
+    if [ -d "$home_dir" ]; then
+      local h_perm h_owner
+      h_perm=$(stat -c '%a' "$home_dir" 2>/dev/null)
+      h_owner=$(stat -c '%U' "$home_dir" 2>/dev/null)
+      home_stat="${h_owner}:${h_perm}"
+      if [[ "$h_perm" =~ ^.[2367].$|^..[2367]$ ]]; then
+        status_msg="${gl_hong}Home权限过大${gl_bai}"
+        err_count=$((err_count+1))
+      fi
+    fi
+
+    if [ -d "$ssh_dir" ]; then
+      local s_perm s_owner
+      s_perm=$(stat -c '%a' "$ssh_dir" 2>/dev/null)
+      s_owner=$(stat -c '%U' "$ssh_dir" 2>/dev/null)
+      ssh_stat="${s_owner}:${s_perm}"
+      if [[ "$s_perm" != "700" ]]; then
+        status_msg="${gl_hong}.ssh须700${gl_bai}"
+        err_count=$((err_count+1))
+      fi
+    fi
+
+    if [ -f "$key_file" ]; then
+      local k_perm k_owner
+      k_perm=$(stat -c '%a' "$key_file" 2>/dev/null)
+      k_owner=$(stat -c '%U' "$key_file" 2>/dev/null)
+      key_stat="${k_owner}:${k_perm}"
+      if [[ "$k_perm" != "600" && "$k_perm" != "644" && "$k_perm" != "400" ]]; then
+        status_msg="${gl_hong}Key须600${gl_bai}"
+        err_count=$((err_count+1))
+      fi
+    else
+        if [ "$err_count" -eq 0 ]; then
+          status_msg="${gl_hui}无公钥${gl_bai}"
+        fi
+    fi
+    
+    if [ $err_count -gt 1 ]; then
+        status_msg="${gl_hong}多项权限错误${gl_bai}"
+    fi
+
+    printf "%-12s %-16s %-16s %-16s %b\n" "$u" "$home_stat" "$ssh_stat" "$key_stat" "$status_msg"
+  done
+  echo -e "${gl_kjlan}-------------------------------------------------------------------------${gl_bai}"
+  echo "提示: SSH StrictModes 要求 Home 目录不能被其他用户写入，.ssh 必须是 700，authorized_keys 必须是 600/644。"
+  echo "一键修复参考 (以 root 为例): chown -R root:root /root/.ssh && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys"
+}
+
+system_view_ssh_connections() {
+  echo -e "${gl_kjlan}当前 SSH 连接会话${gl_bai}"
+  echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
+  echo "当前登录用户 (who):"
+  who
+  echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
+  echo "SSH 网络连接状态:"
+  if has_cmd ss; then
+    ss -tnpa 2>/dev/null | awk '
+      BEGIN {printf "%-25s %-25s %s\n", "LOCAL_ADDRESS", "REMOTE_ADDRESS", "PROCESS"}
+      /sshd/ && /ESTAB/ {
+        proc = "-"
+        for(i=6;i<=NF;i++) {
+            if($i ~ /^users:/) {
+                proc=$i
+                sub(/^users:\(\("/, "", proc)
+                sub(/".*/, "", proc)
+                break
+            }
+        }
+        printf "%-25s %-25s %s\n", $4, $5, proc
+      }'
+  else
+    echo "未安装 ss 命令"
+  fi
+}
+
+ssh_get_current_port() {
+  local port=""
+  if has_cmd sshd; then
+    port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+  fi
+  if [ -z "$port" ] && [ -f /etc/ssh/sshd_config ]; then
+    port="$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config | head -n1 | awk '{print $2}')"
+  fi
+  echo "${port:-22}"
+}
+
+ssh_allow_port_firewall() {
+  local port="$1"
+  [ -z "$port" ] && return 0
+  if has_cmd ufw && ufw status 2>/dev/null | grep -q "active"; then
+    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+    log_action "firewall allow SSH port ${port}/tcp (ufw)"
+  elif has_cmd firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    log_action "firewall allow SSH port ${port}/tcp (firewalld)"
+  elif has_cmd iptables; then
+    iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+    log_action "firewall allow SSH port ${port}/tcp (iptables)"
+  fi
+}
+
+system_change_ssh_port() {
+  need_root || return 1
+  local cur_port new_port backup
+  cur_port="$(ssh_get_current_port)"
+  
+  echo -e "当前 SSH 监听端口为: ${gl_lv}${cur_port}${gl_bai}"
+  echo -e "${gl_huang}警告: 修改端口后系统会自动在防火墙放行新端口，但请务必确认主机的云服务商安全组规则中已放行！${gl_bai}"
+  echo ""
+  read -r -e -p "请输入新的 SSH 端口 (1-65535，直接回车取消): " new_port
+  
+  if [ -z "$new_port" ]; then
+    echo "操作已取消。"
+    return 0
+  fi
+
+  if ! printf '%s\n' "$new_port" | grep -Eq '^[0-9]+$' || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+    echo -e "${gl_hong}端口必须为 1 到 65535 之间的数字！${gl_bai}"
     return 1
   fi
 
-  home_dir="$(getent passwd "$user" | cut -d: -f6)"
-  key_file="$home_dir/.ssh/authorized_keys"
-  echo "检查用户: $user"
-  echo "Home: $home_dir"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
-
-  for item in "$home_dir" "$home_dir/.ssh" "$key_file"; do
-    if [ -e "$item" ]; then
-      stat -c '%n  %U:%G  %a' "$item"
-    else
-      echo "缺失: $item"
-    fi
-  done
-
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
-  if has_cmd sshd; then
-    sshd -T -C user="$user",host=localhost,addr=127.0.0.1 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|strictmodes|authorizedkeysfile)' || true
+  if [ "$new_port" -eq "$cur_port" ]; then
+    echo "输入端口与当前端口相同，无需修改。"
+    return 0
   fi
 
-  echo ""
-  echo "建议权限:"
-  echo "  chown $user:$user $home_dir $home_dir/.ssh $key_file"
-  echo "  chmod 755 $home_dir"
-  echo "  chmod 700 $home_dir/.ssh"
-  echo "  chmod 600 $key_file"
+  if [ "$new_port" -eq 80 ] || [ "$new_port" -eq 443 ] || [ "$new_port" -eq 3306 ] || [ "$new_port" -eq 6379 ]; then
+    echo -e "${gl_huang}提醒: 端口 ${new_port} 常用于 Web/数据库服务，是否确定要设置为 SSH 端口？${gl_bai}"
+    if ! confirm_danger "修改 SSH 端口为 $new_port" "Port $new_port"; then
+      return 0
+    fi
+  fi
+
+  backup="/etc/ssh/sshd_config.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+  cp /etc/ssh/sshd_config "$backup" || return 1
+
+  echo "1. 正在通过防火墙放行新端口 ${new_port}/tcp..."
+  ssh_allow_port_firewall "$new_port"
+
+  echo "2. 正在修改 /etc/ssh/sshd_config..."
+  if ! ssh_set_global_option /etc/ssh/sshd_config Port "$new_port"; then
+    cp "$backup" /etc/ssh/sshd_config
+    echo -e "${gl_hong}写入 SSH 配置失败，已自动回滚。${gl_bai}"
+    return 1
+  fi
+
+  echo "3. 正在校验 SSH 语法..."
+  if ! sshd -t; then
+    cp "$backup" /etc/ssh/sshd_config
+    echo -e "${gl_hong}SSH 配置语法测试失败，已自动回滚备份！${gl_bai}"
+    return 1
+  fi
+
+  echo "4. 正在重启 SSH 服务..."
+  if ! ssh_restart_service; then
+    cp "$backup" /etc/ssh/sshd_config
+    ssh_restart_service >/dev/null 2>&1 || true
+    echo -e "${gl_hong}SSH 服务重启失败，已自动回滚备份！${gl_bai}"
+    return 1
+  fi
+
+  log_action "change ssh port from ${cur_port} to ${new_port}"
+  echo -e "\n${gl_lv}🎉 SSH 端口成功修改为: ${new_port}${gl_bai}"
+  echo -e "${gl_huang}特别提醒: 请务必保留当前终端，并打开一个新终端测试新端口连接：${gl_bai}"
+  echo "  ssh root@<你的服务器IP> -p $new_port"
 }
 
-system_ssh_login_security_menu() {
-  local choice
+system_import_ssh_key() {
+  need_root || return 1
+  local target_user key_source key_content github_user home_dir ssh_dir auth_keys_file
+  
+  read -r -e -p "请输入要配置公钥的目标用户名 (直接回车默认为 root): " target_user
+  target_user="${target_user:-root}"
+
+  if ! getent passwd "$target_user" >/dev/null 2>&1; then
+    echo -e "${gl_hong}系统不存在用户: ${target_user}${gl_bai}"
+    return 1
+  fi
+
+  home_dir="$(getent passwd "$target_user" | cut -d: -f6)"
+  ssh_dir="$home_dir/.ssh"
+  auth_keys_file="$ssh_dir/authorized_keys"
+
+  echo -e "\n请选择公钥获取来源:"
+  echo "1. 手动粘贴公钥字符串 (以 ssh-rsa / ssh-ed25519 等开头)"
+  echo "2. 从 GitHub 抓取公钥 (https://github.com/username.keys)"
+  read -r -e -p "请输入你的选择 (1/2): " key_source
+
+  case "$key_source" in
+    1)
+      read -r -e -p "请粘贴你的 SSH 公钥: " key_content
+      if [ -z "$key_content" ]; then
+        echo "公钥为空，操作取消。"
+        return 1
+      fi
+      ;;
+    2)
+      read -r -e -p "请输入你的 GitHub 用户名: " github_user
+      if [ -z "$github_user" ]; then
+        echo "用户名为空，操作取消。"
+        return 1
+      fi
+      echo "正在从 GitHub 抓取 https://github.com/${github_user}.keys..."
+      key_content="$(curl -fsSL "https://github.com/${github_user}.keys" 2>/dev/null)"
+      if [ -z "$key_content" ]; then
+        echo -e "${gl_hong}未能从 GitHub 获取到有效公钥，请检查用户名是否正确或公钥是否存在。${gl_bai}"
+        return 1
+      fi
+      echo -e "${gl_lv}成功抓取到 GitHub 公钥！${gl_bai}"
+      ;;
+    *)
+      echo "无效选择。"
+      return 1
+      ;;
+  esac
+
+  mkdir -p "$ssh_dir"
+  touch "$auth_keys_file"
+
+  local added_count=0
+  local line
+  while IFS= read -r line; do
+    line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+    if [[ "$line" =~ ^(ssh-rsa|ssh-dss|ecdsa-sha2-nistp[0-9]+|ssh-ed25519|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp[0-9]+@openssh\.com) ]]; then
+      if ! grep -Fqx "$line" "$auth_keys_file" 2>/dev/null; then
+        echo "$line" >> "$auth_keys_file"
+        added_count=$((added_count + 1))
+      fi
+    fi
+  done <<< "$key_content"
+
+  local user_group
+  user_group="$(id -gn "$target_user" 2>/dev/null || echo "$target_user")"
+  chown -R "$target_user:$user_group" "$ssh_dir"
+  chmod 700 "$ssh_dir"
+  chmod 600 "$auth_keys_file"
+
+  if [ "$added_count" -gt 0 ]; then
+    log_action "import ssh key for user $target_user (added $added_count keys)"
+    echo -e "${gl_lv}成功为用户 [${target_user}] 导入 ${added_count} 条 SSH 公钥！${gl_bai}"
+    echo "文件位置: $auth_keys_file"
+    echo -e "目录与文件权限已自动修复为 ${gl_lv}700${gl_bai} 与 ${gl_lv}600${gl_bai}。"
+    
+    echo ""
+    read -r -e -p "公钥已就绪！是否顺便禁用 SSH 密码登录（提升系统整体安全性）? (y/N): " dis_pwd
+    if [[ "$dis_pwd" =~ ^[Yy]$ ]]; then
+      system_disable_all_password_login
+    fi
+  else
+    echo -e "${gl_huang}公钥已存在于 $auth_keys_file 中，无需重复追加。${gl_bai}"
+  fi
+}
+
+system_fail2ban_menu() {
+  need_root || return 1
+  local choice f2b_status banned_ips jail_conf
+
+  jail_conf="/etc/fail2ban/jail.local"
+
   while true; do
     clear
-    echo -e "${gl_kjlan}SSH 登录安全${gl_bai}"
+    echo -e "${gl_kjlan}Fail2ban 防暴破管理${gl_bai}"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo "1. 临时开启 ROOT 密码登录"
-    echo "2. 关闭 ROOT 密码登录，保留普通用户密码登录"
-    echo "3. 检查 admin 密钥登录权限"
-    echo "4. 关闭 ROOT 密码登录并禁用所有密码认证"
-    echo "0. 返回"
+
+    if is_pkg_installed fail2ban || has_cmd fail2ban-client; then
+      if systemctl is-active fail2ban >/dev/null 2>&1; then
+        f2b_status="${gl_lv}运行中 (Active)${gl_bai}"
+      else
+        f2b_status="${gl_huang}未启动 (Inactive)${gl_bai}"
+      fi
+    else
+      f2b_state="${gl_hui}未安装 (Not Installed)${gl_bai}"
+    fi
+
+    echo -e "Fail2ban 状态: $f2b_status"
+    if has_cmd fail2ban-client && systemctl is-active fail2ban >/dev/null 2>&1; then
+      banned_ips="$(fail2ban-client status sshd 2>/dev/null | grep -i 'Banned IP list:' | awk -F: '{print $2}' | sed 's/^[[:space:]]*//')"
+      echo -e "SSH 正在封禁 IP: ${gl_hong}${banned_ips:-无}${gl_bai}"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.  ${gl_bai}安装 / 更新 Fail2ban"
+    echo -e "${gl_kjlan}2.  ${gl_bai}一键配置 SSH 防暴破规则 (jail.local)"
+    echo -e "${gl_kjlan}3.  ${gl_bai}查看 SSH 详细被封禁 IP 列表"
+    echo -e "${gl_kjlan}4.  ${gl_bai}手动解封指定 IP (unban)"
+    echo -e "${gl_kjlan}5.  ${gl_bai}启动 / 重启 Fail2ban 服务"
+    echo -e "${gl_kjlan}6.  ${gl_bai}停止 Fail2ban 服务"
+    echo -e "${gl_kjlan}7.  ${gl_bai}卸载 Fail2ban"
+    echo -e "${gl_kjlan}0.  ${gl_bai}返回"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
-      1) system_enable_root_password_login; pause ;;
-      2) system_disable_root_password_login; pause ;;
-      3) system_check_admin_key_login admin; pause ;;
-      4) system_disable_all_password_login; pause ;;
+      1)
+        install_pkg fail2ban
+        systemctl enable fail2ban >/dev/null 2>&1 || true
+        systemctl start fail2ban >/dev/null 2>&1 || true
+        pause
+        ;;
+      2)
+        if ! has_cmd fail2ban-client; then
+          echo -e "${gl_huang}检测到 Fail2ban 未安装，正在先进行自动安装...${gl_bai}"
+          install_pkg fail2ban || return 1
+        fi
+        
+        local max_retry ban_time
+        read -r -e -p "请输入允许失败的最大次数 (直接回车默认为 5): " max_retry
+        max_retry="${max_retry:-5}"
+        read -r -e -p "请输入封禁时长 (分钟，直接回车默认为 60 分钟): " ban_time
+        ban_time="${ban_time:-60}"
+
+        local ban_seconds=$((ban_time * 60))
+
+        cat > "$jail_conf" <<EOF
+# UA Box 自动生成的 Fail2ban 配置文件
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+bantime  = ${ban_seconds}
+findtime = 600
+maxretry = ${max_retry}
+
+[sshd]
+enabled = true
+port    = ssh
+filter  = sshd
+logpath = %(sshd_log)s
+backend = %(sshd_backend)s
+EOF
+
+        systemctl restart fail2ban >/dev/null 2>&1 || systemctl start fail2ban >/dev/null 2>&1
+        systemctl enable fail2ban >/dev/null 2>&1 || true
+        log_action "configure fail2ban sshd jail (maxretry=$max_retry, bantime=${ban_time}m)"
+        echo -e "${gl_lv}Fail2ban SSH 防暴破规则已写入 $jail_conf 并生效！${gl_bai}"
+        echo "策略参数: 10分钟内尝试失败 ${max_retry} 次，封禁 ${ban_time} 分钟。"
+        pause
+        ;;
+      3)
+        if has_cmd fail2ban-client; then
+          fail2ban-client status sshd 2>/dev/null || echo "无法获取 status，请确认 sshd jail 是否已开启。"
+        else
+          echo "Fail2ban 未安装。"
+        fi
+        pause
+        ;;
+      4)
+        if has_cmd fail2ban-client; then
+          local unban_ip
+          read -r -e -p "请输入要解封的 IP 地址: " unban_ip
+          if [ -n "$unban_ip" ]; then
+            fail2ban-client unbanip "$unban_ip" && log_action "fail2ban unbanip $unban_ip"
+          fi
+        else
+          echo "Fail2ban 未安装。"
+        fi
+        pause
+        ;;
+      5)
+        systemctl restart fail2ban && echo -e "${gl_lv}Fail2ban 服务已重启。${gl_bai}"
+        pause
+        ;;
+      6)
+        systemctl stop fail2ban && echo -e "${gl_huang}Fail2ban 服务已停止。${gl_bai}"
+        pause
+        ;;
+      7)
+        if confirm_danger "卸载 Fail2ban 防暴破组件" "apt/yum remove fail2ban"; then
+          systemctl stop fail2ban >/dev/null 2>&1 || true
+          systemctl disable fail2ban >/dev/null 2>&1 || true
+          remove_pkg fail2ban
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+system_ssh_login_security_menu() {
+  need_root || return 1
+  local choice cur_port root_pass_state pwd_auth_state f2b_state
+
+  while true; do
+    clear
+    cur_port="$(ssh_get_current_port)"
+    
+    if has_cmd sshd; then
+      root_pass_state="$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}')"
+      pwd_auth_state="$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')"
+    fi
+
+    if is_pkg_installed fail2ban || has_cmd fail2ban-client; then
+      if systemctl is-active fail2ban >/dev/null 2>&1; then
+        f2b_state="${gl_lv}已运行${gl_bai}"
+      else
+        f2b_state="${gl_huang}未启动${gl_bai}"
+      fi
+    else
+      f2b_state="${gl_hui}未安装${gl_bai}"
+    fi
+
+    echo -e "${gl_kjlan}SSH 安全加固与防暴破${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "当前 SSH 端口:     ${gl_lv}${cur_port}${gl_bai}"
+    echo -e "Root 密码登录:     ${gl_lv}${root_pass_state:-未知}${gl_bai}"
+    echo -e "全局密码认证:     ${gl_lv}${pwd_auth_state:-未知}${gl_bai}"
+    echo -e "Fail2ban 防暴破:   ${f2b_state}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.  ${gl_bai}修改 SSH 默认端口 (防扫描)"
+    echo -e "${gl_kjlan}2.  ${gl_bai}配置 SSH 密钥登录 (导入/安装公钥)"
+    echo -e "${gl_kjlan}3.  ${gl_bai}Fail2ban 防暴破管理"
+    echo -e "${gl_kjlan}4.  ${gl_bai}临时开启 ROOT 密码登录"
+    echo -e "${gl_kjlan}5.  ${gl_bai}关闭 ROOT 密码登录，保留普通用户密码"
+    echo -e "${gl_kjlan}6.  ${gl_bai}关闭 ROOT 密码登录并禁用所有密码认证"
+    echo -e "${gl_kjlan}7.  ${gl_bai}检查用户密钥及 SSH 权限诊断"
+    echo -e "${gl_kjlan}8.  ${gl_bai}查看当前连接的 SSH 终端"
+    echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) system_change_ssh_port; pause ;;
+      2) system_import_ssh_key; pause ;;
+      3) system_fail2ban_menu ;;
+      4) system_enable_root_password_login; pause ;;
+      5) system_disable_root_password_login; pause ;;
+      6) system_disable_all_password_login; pause ;;
+      7) system_check_admin_key_login; pause ;;
+      8) system_view_ssh_connections; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -3705,9 +4438,43 @@ system_port_status() {
   echo -e "${gl_kjlan}端口占用状态${gl_bai}"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   if has_cmd ss; then
-    ss -tulpen
+    ss -tulpen | awk '
+      NR==1 { printf "%-10s %-25s %-30s\n", "PROTO", "LOCAL ADDRESS:PORT", "PROCESS (PID)"; next }
+      {
+        proto = toupper($1)
+        local_addr = $5
+        proc = "-"
+        for (i=6; i<=NF; i++) {
+          if ($i ~ /^users:/) {
+            raw = $i
+            sub(/^users:\(\("/, "", raw)
+            sub(/"?,pid=/, " (PID: ", raw)
+            sub(/,.*/, ")", raw)
+            proc = raw
+            break
+          }
+        }
+        if (local_addr ~ /:[0-9]+$/) {
+            printf "%-10s %-25s %-30s\n", proto, local_addr, proc
+        }
+      }' | sort -k2
   elif has_cmd netstat; then
-    netstat -tulpen
+    netstat -tulpen 2>/dev/null | awk '
+      BEGIN { printf "%-10s %-25s %-30s\n", "PROTO", "LOCAL ADDRESS:PORT", "PROCESS (PID)" }
+      NR>2 {
+        proto = toupper($1)
+        local_addr = $4
+        proc = $NF
+        if (proc ~ /^[0-9]+\//) {
+          split(proc, p, "/")
+          proc = p[2] " (PID: " p[1] ")"
+        } else {
+          proc = "-"
+        }
+        if (proto ~ /^(TCP|UDP)/) {
+            printf "%-10s %-25s %-30s\n", proto, local_addr, proc
+        }
+      }' | sort -k2
   else
     echo "未找到 ss/netstat，可先安装 iproute2 或 net-tools。"
     return 1
@@ -4357,7 +5124,6 @@ system_init_optimize() {
   # ── [6] 系统环境与 TCP 协议栈高级优化 ──────────────────
   echo -e "\n${gl_kjlan}[6/7] 开启网络内核协议栈与系统环境调优...${gl_bai}"
   local r_tcptune=0
-  local has_changes=0
   (
     local _local_changes=0
     # 1. TCP 协议栈调优
@@ -4367,18 +5133,23 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_max_syn_backlog = 16384
-net.core.netdev_max_backlog = 25000
 net.ipv4.tcp_max_tw_buckets = 5000
 net.ipv4.tcp_fastopen = 3
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
-net.core.somaxconn = 4096"
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_syncookies = 1
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 25000"
     
     local tcp_needs_write=1
     if [ -f "$sysctl_tcp_conf" ]; then
       local cur_strip target_strip
-      cur_strip="$(grep -v '^#' "$sysctl_tcp_conf" 2>/dev/null | tr -d '[[:space:]]')"
-      target_strip="$(echo "$target_tcp_conf" | grep -v '^#' | tr -d '[[:space:]]')"
+      cur_strip="$(grep -v '^#' "$sysctl_tcp_conf" 2>/dev/null | tr -d '[:space:]')"
+      target_strip="$(echo "$target_tcp_conf" | grep -v '^#' | tr -d '[:space:]')"
       if [ "$cur_strip" = "$target_strip" ]; then
         tcp_needs_write=0
       fi
@@ -4613,7 +5384,7 @@ SYSCTL
         need_root || { pause; continue; }
         rm -f /etc/sysctl.d/99-ua-bbr.conf
         sysctl -w net.ipv4.tcp_congestion_control=cubic > /dev/null 2>&1 || true
-        sysctl -w net.core.default_qdisc=pfifo_fast > /dev/null 2>&1 || true
+        sysctl -w net.core.default_qdisc=fq_codel > /dev/null 2>&1 || true
         log_action "BBR disabled, restored cubic"
         echo -e "${gl_lv}已恢复 cubic 拥塞控制。${gl_bai}"
         pause
@@ -4629,8 +5400,13 @@ net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_max_syn_backlog = 16384
 net.ipv4.tcp_max_tw_buckets = 5000
 net.ipv4.tcp_fastopen = 3
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_syncookies = 1
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 25000
 TCPTUNE
@@ -4842,6 +5618,7 @@ system_tools_menu() {
     echo -e "${gl_kjlan}18.  ${gl_bai}BBR 拥塞控制"
     echo -e "${gl_kjlan}19.  ${gl_bai}防火墙管理"
     echo -e "${gl_kjlan}20.  ${gl_bai}限流自动关机"
+    echo -e "${gl_kjlan}21.  ${gl_bai}动态 Live 实时监控控制台 (Top/Monitor)"
     echo -e "${gl_kjlan}99.  ${gl_bai}重启服务器"
     echo -e "${gl_kjlan}101. ${gl_bai}卸载 UA Box 脚本"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
@@ -4869,6 +5646,7 @@ system_tools_menu() {
       18) system_bbr_menu; pause ;;
       19) system_firewall_menu; pause ;;
       20) system_limit_shutdown_menu; pause ;;
+      21) system_live_monitor ;;
       99) system_reboot; pause ;;
       101) system_uninstall_ua; pause ;;
       0) break ;;
@@ -5488,11 +6266,26 @@ case "${1:-}" in
   ps|info|系统信息)
     system_info
     ;;
+  top|monitor|监控)
+    system_live_monitor
+    ;;
+  fzf|search|find|搜索)
+    system_fzf_interactive_menu
+    ;;
   sys|system|系统工具)
     system_tools_menu
     ;;
   ssh|ssh-security|ssh安全)
     system_ssh_login_security_menu
+    ;;
+  ssh-port|change-ssh-port)
+    system_change_ssh_port
+    ;;
+  import-key|ssh-key|add-key)
+    system_import_ssh_key
+    ;;
+  fail2ban|f2b|防暴破)
+    system_fail2ban_menu
     ;;
   enable-root-pass|root-pass-on)
     system_enable_root_password_login
