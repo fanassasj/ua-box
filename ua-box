@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-UA_BOX_VERSION="0.6.0"
+UA_BOX_VERSION="0.6.2"
 UA_BOX_NAME="UA Box"
 SCRIPT_REAL_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 UA_BOX_HOME="$(cd "$(dirname "$SCRIPT_REAL_PATH")" && pwd)"
@@ -2753,6 +2753,67 @@ EOF
   fi
 }
 
+docker_setup_ipv6() {
+  need_root || return 1
+  docker_require || return 1
+
+  echo -e "${gl_kjlan}一键配置 Docker IPv6 双栈网络支持${gl_bai}"
+  echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+  echo "将向 /etc/docker/daemon.json 中注入/配置官方推荐的双栈属性："
+  echo "  - \"ipv6\": true"
+  echo "  - \"fixed-cidr-v6\": \"fd00:172:17::/64\""
+  echo "  - \"experimental\": true"
+  echo "  - \"ip6tables\": true"
+  echo "这将开启官方原生的 IPv6 入站/出站及基于 ip6tables 的端口映射与 NAT66 支持。"
+  read -r -e -p "是否确认开启 Docker IPv6 支持？[Y/n]: " ipv6_confirm
+  ipv6_confirm="${ipv6_confirm:-y}"
+  if [[ ! "$ipv6_confirm" =~ ^[Yy]$ ]]; then
+    echo "已取消操作。"
+    return 0
+  fi
+
+  local daemon_file="/etc/docker/daemon.json"
+  mkdir -p /etc/docker
+
+  if [ -f "$daemon_file" ]; then
+    cp "$daemon_file" "${daemon_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+  fi
+
+  if has_cmd jq; then
+    local tmp_json
+    tmp_json="$(mktemp)"
+    if [ -f "$daemon_file" ] && jq . "$daemon_file" >/dev/null 2>&1; then
+      jq '. + {"ipv6": true, "fixed-cidr-v6": "fd00:172:17::/64", "experimental": true, "ip6tables": true}' "$daemon_file" > "$tmp_json"
+    else
+      cat > "$tmp_json" <<EOF
+{
+  "ipv6": true,
+  "fixed-cidr-v6": "fd00:172:17::/64",
+  "experimental": true,
+  "ip6tables": true
+}
+EOF
+    fi
+    mv "$tmp_json" "$daemon_file"
+  else
+    cat > "$daemon_file" <<EOF
+{
+  "ipv6": true,
+  "fixed-cidr-v6": "fd00:172:17::/64",
+  "experimental": true,
+  "ip6tables": true
+}
+EOF
+  fi
+
+  log_action "enable docker ipv6 (daemon.json)"
+  echo "正在重启 Docker 服务以应用 IPv6 配置..."
+  systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null || true
+
+  echo -e "${gl_lv}✓ Docker IPv6 双栈配置已生效！${gl_bai}"
+  echo "默认桥接网络 (bridge) 已分配 IPv6 ULA 段 fd00:172:17::/64，并通过 ip6tables 自动提供 NAT 与 端口映射。"
+}
+
 docker_menu() {
   while true; do
     clear
@@ -2760,6 +2821,9 @@ docker_menu() {
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     if has_cmd docker; then
       docker --version
+      local compose_ver
+      compose_ver="$(docker compose version 2>/dev/null || docker-compose --version 2>/dev/null)"
+      [ -n "$compose_ver" ] && echo "$compose_ver" || echo -e "Docker Compose: ${gl_hui}未安装${gl_bai}"
       echo -n "服务状态: "
       docker_daemon_status
     else
@@ -2778,6 +2842,7 @@ docker_menu() {
     echo -e "${gl_kjlan}11.  ${gl_bai}编辑 daemon.json 并重启"
     echo -e "${gl_kjlan}12.  ${gl_bai}清理悬空镜像（dangling）"
     echo -e "${gl_kjlan}13.  ${gl_bai}限制容器日志大小 (防撑爆磁盘)"
+    echo -e "${gl_kjlan}14.  ${gl_bai}一键开启 Docker IPv6 双栈网络支持 (ip6tables NAT)"
     echo -e "${gl_kjlan}20.  ${gl_bai}卸载 Docker"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -2823,6 +2888,7 @@ docker_menu() {
         pause
         ;;
        13) docker_limit_container_logs; pause ;;
+       14) docker_setup_ipv6; pause ;;
       20) docker_uninstall; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;

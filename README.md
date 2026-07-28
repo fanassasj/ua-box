@@ -2,19 +2,25 @@
 
 UA Box 是一个轻量 Linux 命令行运维面板，整合系统管理、Docker、rclone、面板工具、网络测试和常用脚本入口。
 
-当前版本：**v0.6.1**
+当前版本：**v0.6.2**
 
 适合 VPS、独服、轻量服务器的日常管理。脚本以 Bash 编写，尽量减少依赖；部分系统级操作需要 root 权限。
 
 ## 快速安装
 
-一键安装到 `/root/ua-box`：
+一键安装到 `/root/ua-box`（包含 `curl` 自动前置安装）：
+
+```bash
+apt-get install curl -y && curl -fsSL https://raw.githubusercontent.com/fanassasj/ua-box/main/install.sh | bash
+```
+
+或者使用通用 curl / wget 一键指令：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/fanassasj/ua-box/main/install.sh | bash
 ```
 
-如果没有 `curl`，可以使用：
+如果没有 `curl`，也可以直接使用 `wget`：
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/fanassasj/ua-box/main/install.sh | bash
@@ -97,11 +103,12 @@ curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lso
 - WARP 管理
 - Caddy 反代管理（支持宿主机原生部署与 Docker 容器化部署，双栈自适应管理）
 - Nginx Proxy Manager 可视化面板
-- it-tools 工具箱
-- **File Browser 文件浏览器** (支持可视化管理和传输服务器本地全盘文件)
+- **it-tools 工具箱**（支持 Docker 与 Docker Compose 双模部署）
+- **File Browser 文件浏览器** (支持可视化管理和传输服务器本地全盘文件，支持 Docker 与 Docker Compose 双模部署)
 - **OpenList 网盘系统** (AList 社区开源分支，支持 Docker 和 Docker Compose 双模部署，内置管理员密码一键重置与日志提取)
+- **Uptime Kuma 服务监控面板** (轻量级自建站点与 Docker 健康状态监控，支持 Docker 和 Docker Compose 双模部署)
 
-面板工具顶部会显示统一状态页，包括安装状态、运行状态、端口和访问地址（实时读取 Compose 状态比率，支持公网 IP 智能替换与本地会话缓存）。Nginx Proxy Manager 会自动识别容器名，例如 `npm` 或 `nginx-proxy-manager`，避免后续管理混淆。
+面板工具顶部会显示统一状态页，包含静态与动态端口映射识别。检测到已安装 Caddy 时，部署面板工具后可一键生成 Caddy 反代配置（自动申请 SSL / 隐藏暴露端口），亦支持在各面板控制台随时一键挂载 Caddy 反代。
 
 ### Docker 管理
 
@@ -269,6 +276,16 @@ UA Box 只在选择对应菜单项时下载并执行外部脚本：
 - 融合怪: `https://gitlab.com/spiritysdx/za`
 
 ## 更新日志
+
+### v0.6.2
+
+- 新增「Docker IPv6 双栈原生网络支持」：在 Docker 管理菜单中提供一键配置功能（`"ipv6": true`, `"ip6tables": true`, `"fixed-cidr-v6": "fd00:172:17::/64"`），为桥接网络提供零配置的公网 IPv6 NAT66 出站与端口映射能力。
+- 新增「Uptime Kuma 开源监控面板」：面板工具模块新增 Uptime Kuma 服务与站点健康监控，支持 Docker Run / Docker Compose 双模部署与全自动 Caddy 域名反代联动。
+- 新增「Docker Compose / Docker 引擎版本双显」：Docker 管理面板自动检测并同屏展示 Docker 引擎与 Docker Compose 插件最新版本。
+- 新增「rclone 空配置自动初始化与编辑」：解决当 rclone 未配置或文件为空时 `13. 编辑 rclone.conf` 报错退出的问题，自动创建路径及空白文件，支持智能无伤备份与手工编辑。
+- 优化「`ua top` 动态 Live 监控无闪烁重绘」：使用 ANSI `\033[H` / `\033[K` 光标原地重绘机制替代原有的清屏刷新，消除全屏闪烁；并新增了 Swap 虚拟内存 bar、系统 Load Average、TCP ESTABLISHED 实时连接数统计以及 `C` / `M` 键按 CPU/内存 交互式排序功能。
+- 优化「面板工具全自动 Caddy 反代集成」：所有面板工具在安装成功后及菜单选项中，均支持自动检测/自动一键安装 Caddy 并配置域名 HTTPS 证书。
+- 优化「一键安装脚本与 curl 自动检测」：在安装命令中添加了推荐的 `apt-get install curl -y` 前置保底命令，并在 `install.sh` 中集成了缺失 `curl` 时的多包管理器自动补全安装逻辑。
 
 ### v0.6.1
 
