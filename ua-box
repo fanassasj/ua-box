@@ -1397,6 +1397,16 @@ ask_port_bind_ip() {
   fi
 }
 
+ask_deploy_mode() {
+  local service_name="$1"
+  local deploy_mode
+  echo -e "${gl_kjlan}请选择 ${service_name} 的容器部署方式：${gl_bai}" >&2
+  echo -e "  1) 🐳 ${gl_lv}docker run${gl_bai} (传统单行命令，快捷轻量) [默认]" >&2
+  echo -e "  2) 📄 ${gl_huang}Docker Compose${gl_bai} (自动生成 yml 文件，便于后期维护)" >&2
+  read -r -e -p "请选择部署方式 (1 或 2，默认 1): " deploy_mode
+  echo "${deploy_mode:-1}"
+}
+
 toggle_container_port_bind() {
   local container_name="$1"
   local host_port="$2"
@@ -1431,13 +1441,25 @@ toggle_container_port_bind() {
   fi
 
   echo "正在重构 $container_name 容器端口绑定模式 [$bind_mode_flag] ..."
-  if [ -f "/root/$container_name/docker-compose.yml" ]; then
-    if [ "$t_choice" = "1" ]; then
-      sed -i -E "s/\"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?${host_port}:${container_port}\"?/\"127.0.0.1:${host_port}:${container_port}\"/g" "/root/$container_name/docker-compose.yml"
-    else
-      sed -i -E "s/\"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?${host_port}:${container_port}\"?/\"${host_port}:${container_port}\"/g" "/root/$container_name/docker-compose.yml"
+  local compose_file=""
+  for dir in "/root/$container_name" "/root/nginx-proxy-manager" "/root/uptime-kuma"; do
+    if [ -f "$dir/docker-compose.yml" ]; then
+      if grep -q "container_name:[[:space:]]*['\"]*$container_name['\"]*" "$dir/docker-compose.yml" || [ "$container_name" = "openlist" ]; then
+        compose_file="$dir/docker-compose.yml"
+        break
+      fi
     fi
-    (cd "/root/$container_name" && (docker compose down 2>/dev/null || docker-compose down 2>/dev/null) && (docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null))
+  done
+
+  if [ -n "$compose_file" ]; then
+    if [ "$t_choice" = "1" ]; then
+      sed -i -E "s/\"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?${host_port}:${container_port}\"?/\"127.0.0.1:${host_port}:${container_port}\"/g" "$compose_file"
+    else
+      sed -i -E "s/\"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?${host_port}:${container_port}\"?/\"${host_port}:${container_port}\"/g" "$compose_file"
+    fi
+    local compose_dir
+    compose_dir="$(dirname "$compose_file")"
+    (cd "$compose_dir" && (docker compose down 2>/dev/null || docker-compose down 2>/dev/null) && (docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null))
   else
     local img_name
     img_name="$(docker container inspect --format '{{.Config.Image}}' "$container_name" 2>/dev/null)"
@@ -1450,6 +1472,8 @@ toggle_container_port_bind() {
       docker run -d --name filebrowser --restart unless-stopped -v /:/srv -v /root/filebrowser:/database -p "$new_bind" filebrowser/filebrowser:latest
     elif [ "$container_name" = "kuma" ]; then
       docker run -d --name kuma --restart always -p "$new_bind" -v /root/uptime-kuma:/app/data louislam/uptime-kuma:1
+    elif [ "$container_name" = "openlist" ]; then
+      docker run -d --name openlist --restart always -p "$new_bind" -v /root/openlist/data:/opt/openlist/data -e UMASK=022 -e TZ=Asia/Shanghai --user "0:0" openlistteam/openlist:latest
     fi
   fi
   echo -e "${gl_lv}端口安全模式切换完成！当前模式: ${bind_mode_flag}${gl_bai}"
@@ -2114,14 +2138,16 @@ npm_install() {
     fi
   done
 
-  local bind_ip
+  local bind_ip deploy_mode
   bind_ip="$(ask_port_bind_ip "Nginx Proxy Manager 管理后台 (端口 $port_81)")"
+  deploy_mode="$(ask_deploy_mode "Nginx Proxy Manager")"
 
   mkdir -p /root/nginx-proxy-manager/data /root/nginx-proxy-manager/letsencrypt
   chmod -R 777 /root/nginx-proxy-manager
   log_action "install Nginx Proxy Manager (80:$port_80, 443:$port_443, 81:$port_81)"
   
-  cat > /root/nginx-proxy-manager/docker-compose.yml <<EOF
+  if [ "$deploy_mode" = "2" ]; then
+    cat > /root/nginx-proxy-manager/docker-compose.yml <<EOF
 version: '3.8'
 services:
   app:
@@ -2136,8 +2162,16 @@ services:
       - '/root/nginx-proxy-manager/data:/data'
       - '/root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt'
 EOF
-
-  (cd /root/nginx-proxy-manager && (docker compose up -d 2>/dev/null || docker-compose up -d))
+    (cd /root/nginx-proxy-manager && (docker compose up -d 2>/dev/null || docker-compose up -d))
+  else
+    docker run -d \
+      --name "$name" \
+      --restart unless-stopped \
+      -p "${port_80}:80" -p "${port_443}:443" -p "${bind_ip}${port_81}:81" \
+      -v /root/nginx-proxy-manager/data:/data \
+      -v /root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt \
+      jc21/nginx-proxy-manager:latest
+  fi
 
   if [ "$bind_ip" = "127.0.0.1:" ]; then
     echo -e "Nginx Proxy Manager 已部署。\n本地管理后台端口: http://127.0.0.1:$port_81 (已锁定本地防扫，无法通过外网 IP 直连)"
@@ -2235,15 +2269,31 @@ it_tools_install() {
     return 1
   fi
 
-  local bind_ip
+  local bind_ip deploy_mode
   bind_ip="$(ask_port_bind_ip "it-tools")"
+  deploy_mode="$(ask_deploy_mode "it-tools")"
 
   log_action "install it-tools port=$port"
-  docker run -d \
-    --name it-tools \
-    --restart unless-stopped \
-    -p "${bind_ip}${port}":80 \
-    corentinth/it-tools:latest
+  if [ "$deploy_mode" = "2" ]; then
+    mkdir -p /root/it-tools
+    cat > /root/it-tools/docker-compose.yml <<EOF
+version: '3.8'
+services:
+  app:
+    image: 'corentinth/it-tools:latest'
+    container_name: 'it-tools'
+    restart: unless-stopped
+    ports:
+      - '${bind_ip}${port}:80'
+EOF
+    (cd /root/it-tools && (docker compose up -d 2>/dev/null || docker-compose up -d))
+  else
+    docker run -d \
+      --name it-tools \
+      --restart unless-stopped \
+      -p "${bind_ip}${port}":80 \
+      corentinth/it-tools:latest
+  fi
   echo "it-tools 已部署。访问: http://$(get_display_ip):$port"
   check_and_prompt_caddy_proxy "it-tools" "$port" "it-tools" "80"
 }
@@ -2318,18 +2368,36 @@ filebrowser_install() {
     return 1
   fi
 
-  local bind_ip
+  local bind_ip deploy_mode
   bind_ip="$(ask_port_bind_ip "File Browser")"
+  deploy_mode="$(ask_deploy_mode "File Browser")"
 
   mkdir -p /root/filebrowser
   log_action "install filebrowser port=$port"
-  docker run -d \
-    --name filebrowser \
-    --restart unless-stopped \
-    -v /:/srv \
-    -v /root/filebrowser:/database \
-    -p "${bind_ip}${port}":80 \
-    filebrowser/filebrowser:latest
+  if [ "$deploy_mode" = "2" ]; then
+    cat > /root/filebrowser/docker-compose.yml <<EOF
+version: '3.8'
+services:
+  app:
+    image: 'filebrowser/filebrowser:latest'
+    container_name: 'filebrowser'
+    restart: unless-stopped
+    ports:
+      - '${bind_ip}${port}:80'
+    volumes:
+      - '/:/srv'
+      - '/root/filebrowser:/database'
+EOF
+    (cd /root/filebrowser && (docker compose up -d 2>/dev/null || docker-compose up -d))
+  else
+    docker run -d \
+      --name filebrowser \
+      --restart unless-stopped \
+      -v /:/srv \
+      -v /root/filebrowser:/database \
+      -p "${bind_ip}${port}":80 \
+      filebrowser/filebrowser:latest
+  fi
   echo "File Browser 已部署。访问: http://$(get_display_ip):$port"
   echo "默认用户名和密码为: admin / admin"
   check_and_prompt_caddy_proxy "File Browser" "$port" "filebrowser" "80"
@@ -2396,11 +2464,7 @@ openlist_install() {
   fi
 
   local deploy_mode port port_dav data_dir
-  echo "请选择部署方式："
-  echo "1) Docker Run (普通容器部署)"
-  echo "2) Docker Compose (项目部署)"
-  read -r -e -p "请输入选择 (1 或 2，默认 1): " deploy_mode
-  deploy_mode="${deploy_mode:-1}"
+  deploy_mode="$(ask_deploy_mode "OpenList")"
 
   read -r -e -p "请输入 Web 端口 (5244)，回车默认 5244: " port
   port="${port:-5244}"
@@ -2583,17 +2647,34 @@ uptime_kuma_install() {
     return 1
   fi
 
-  local bind_ip
+  local bind_ip deploy_mode
   bind_ip="$(ask_port_bind_ip "Uptime Kuma")"
+  deploy_mode="$(ask_deploy_mode "Uptime Kuma")"
 
   mkdir -p /root/uptime-kuma
   log_action "install uptime-kuma port=$port"
-  docker run -d \
-    --name kuma \
-    --restart always \
-    -p "${bind_ip}${port}":3001 \
-    -v /root/uptime-kuma:/app/data \
-    louislam/uptime-kuma:1
+  if [ "$deploy_mode" = "2" ]; then
+    cat > /root/uptime-kuma/docker-compose.yml <<EOF
+version: '3.8'
+services:
+  app:
+    image: 'louislam/uptime-kuma:1'
+    container_name: 'kuma'
+    restart: always
+    ports:
+      - '${bind_ip}${port}:3001'
+    volumes:
+      - '/root/uptime-kuma:/app/data'
+EOF
+    (cd /root/uptime-kuma && (docker compose up -d 2>/dev/null || docker-compose up -d))
+  else
+    docker run -d \
+      --name kuma \
+      --restart always \
+      -p "${bind_ip}${port}":3001 \
+      -v /root/uptime-kuma:/app/data \
+      louislam/uptime-kuma:1
+  fi
   if [ "$bind_ip" = "127.0.0.1:" ]; then
     echo -e "Uptime Kuma 已部署。\n本地访问端口: http://127.0.0.1:$port (已锁定本地防扫，无法通过外网 IP 直连)"
   else
