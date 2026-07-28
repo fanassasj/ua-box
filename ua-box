@@ -274,6 +274,35 @@ system_live_monitor() {
     ' /proc/net/dev 2>/dev/null
   }
 
+  get_disk_bytes() {
+    awk '
+      $3 ~ /^(sd[a-z]|hd[a-z]|vd[a-z]|nvme[0-9]n[0-9]|xvd[a-z])$/ {
+        r += $6 * 512
+        w += $10 * 512
+      }
+      END { printf "%.0f %.0f\n", r, w }
+    ' /proc/diskstats 2>/dev/null
+  }
+
+  format_bytes() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" '
+      BEGIN {
+        if (b >= 1099511627776) {
+          printf "%.2f TB", b / 1099511627776
+        } else if (b >= 1073741824) {
+          printf "%.2f GB", b / 1073741824
+        } else if (b >= 1048576) {
+          printf "%.2f MB", b / 1048576
+        } else if (b >= 1024) {
+          printf "%.1f KB", b / 1024
+        } else {
+          printf "%.0f B", b
+        }
+      }
+    '
+  }
+
   calc_net_speed() {
     local prx="$1" ptx="$2" crx="$3" ctx="$4" sec="${5:-1.5}"
     awk -v prx="$prx" -v ptx="$ptx" -v crx="$crx" -v ctx="$ctx" -v sec="$sec" '
@@ -300,6 +329,26 @@ system_live_monitor() {
     '
   }
 
+  calc_disk_speed() {
+    local pr="$1" pw="$2" cr="$3" cw="$4" sec="${5:-1.5}"
+    awk -v pr="$pr" -v pw="$pw" -v cr="$cr" -v cw="$cw" -v sec="$sec" '
+      BEGIN {
+        dr = (cr - pr) / sec
+        dw = (cw - pw) / sec
+        if (dr < 0) dr = 0
+        if (dw < 0) dw = 0
+
+        if (dr >= 1048576) s_r = sprintf("%.2f MB/s", dr / 1048576)
+        else s_r = sprintf("%.1f KB/s", dr / 1024)
+
+        if (dw >= 1048576) s_w = sprintf("%.2f MB/s", dw / 1048576)
+        else s_w = sprintf("%.1f KB/s", dw / 1024)
+
+        print s_r "|" s_w
+      }
+    '
+  }
+
   calc_cpu_usage() {
     local ptot="$1" pidle="$2" ctot="$3" cidle="$4"
     awk -v ptot="$ptot" -v pidle="$pidle" -v ctot="$ctot" -v cidle="$cidle" '
@@ -318,21 +367,41 @@ system_live_monitor() {
     '
   }
 
-  local host_name sys_kernel sort_mode="cpu"
+  get_services_status() {
+    local svcs=("sshd" "docker" "caddy" "nginx" "mysql" "redis")
+    if [ -n "$UA_MONITOR_SERVICES" ]; then
+      read -r -a svcs <<< "$UA_MONITOR_SERVICES"
+    fi
+
+    local res=""
+    for svc in "${svcs[@]}"; do
+      [ -z "$svc" ] && continue
+      if systemctl is-active "$svc" >/dev/null 2>&1 || pgrep -x "$svc" >/dev/null 2>&1; then
+        res+="${svc} [${gl_lv}● 正常${gl_bai}]  "
+      elif systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "${svc}.service" || has_cmd "$svc"; then
+        res+="${svc} [${gl_hong}● 异常${gl_bai}]  "
+      fi
+    done
+    echo -e "${res}"
+  }
+
+  local host_name sys_kernel sort_mode="cpu" view_mode="all"
   host_name="$(hostname 2>/dev/null || echo "$HOSTNAME")"
   sys_kernel="$(uname -r 2>/dev/null || echo "Linux")"
 
-  local prev_cpu prev_idle prev_rx prev_tx
+  local prev_cpu prev_idle prev_rx prev_tx prev_dr prev_dw
   read -r prev_cpu prev_idle < <(get_cpu_stat)
   read -r prev_rx prev_tx < <(get_net_bytes)
+  read -r prev_dr prev_dw < <(get_disk_bytes)
 
   sleep 1
   clear 2>/dev/null || true
 
   while true; do
-    local curr_cpu curr_idle curr_rx curr_tx
+    local curr_cpu curr_idle curr_rx curr_tx curr_dr curr_dw
     read -r curr_cpu curr_idle < <(get_cpu_stat)
     read -r curr_rx curr_tx < <(get_net_bytes)
+    read -r curr_dr curr_dw < <(get_disk_bytes)
 
     local cpu_usage
     cpu_usage="$(calc_cpu_usage "$prev_cpu" "$prev_idle" "$curr_cpu" "$curr_idle")"
@@ -340,8 +409,17 @@ system_live_monitor() {
     local rx_speed tx_speed
     IFS="|" read -r rx_speed tx_speed < <(calc_net_speed "$prev_rx" "$prev_tx" "$curr_rx" "$curr_tx" 1.5)
 
+    local disk_r_speed disk_w_speed
+    IFS="|" read -r disk_r_speed disk_w_speed < <(calc_disk_speed "$prev_dr" "$prev_dw" "$curr_dr" "$curr_dw" 1.5)
+
+    local total_rx total_tx
+    total_rx="$(format_bytes "$curr_rx")"
+    total_tx="$(format_bytes "$curr_tx")"
+
     prev_rx="$curr_rx"
     prev_tx="$curr_tx"
+    prev_dr="$curr_dr"
+    prev_dw="$curr_dw"
     prev_cpu="$curr_cpu"
     prev_idle="$curr_idle"
 
@@ -373,9 +451,10 @@ system_live_monitor() {
     sys_load="$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || echo "0 0 0")"
     tcp_conns="$(ss -t -a state established 2>/dev/null | grep -v '^Recv-Q' | wc -l || echo "0")"
 
-    local disk_info disk_usage disk_total disk_used
+    local disk_info disk_usage disk_total disk_used disk_pct_num=0
     disk_info="$(df -h / | awk 'NR==2 {print $2, $3, $5}')"
     read -r disk_total disk_used disk_usage <<< "$disk_info"
+    disk_pct_num="${disk_usage%\%}"
 
     draw_bar() {
       local pct="${1:-0}"
@@ -385,7 +464,14 @@ system_live_monitor() {
       local bar=""
       for ((i=0; i<filled; i++)); do bar+="#"; done
       for ((i=0; i<empty; i++)); do bar+="-"; done
-      echo "[$bar] $pct%"
+
+      local color="$gl_lv"
+      if [ "$pct" -ge 90 ]; then
+        color="$gl_hong"
+      elif [ "$pct" -ge 80 ]; then
+        color="$gl_huang"
+      fi
+      echo -e "${color}[$bar] ${pct}%${gl_bai}"
     }
 
     local cpu_bar mem_bar swap_bar sys_uptime
@@ -394,6 +480,12 @@ system_live_monitor() {
     swap_bar="$(draw_bar "$swap_percent")"
     sys_uptime="$(uptime -p 2>/dev/null || uptime)"
 
+    local svc_status
+    svc_status="$(get_services_status)"
+
+    local sort_title="CPU"
+    [ "$sort_mode" = "mem" ] && sort_title="内存"
+
     # 使用 ANSI \033[H 原地移动光标重绘，彻底解决清屏闪烁
     printf '\033[H'
     echo -e "${gl_kjlan}====================================================${gl_bai}\033[K"
@@ -401,37 +493,78 @@ system_live_monitor() {
     echo -e "${gl_kjlan}====================================================${gl_bai}\033[K"
     echo -e "  主机名: ${gl_bai}${host_name}${gl_bai} | 内核: ${gl_bai}${sys_kernel}${gl_bai} | Uptime: ${gl_bai}${sys_uptime}${gl_bai}\033[K"
     echo -e "  系统负载 (1/5/15m): ${gl_bai}${sys_load}${gl_bai} | TCP 建立连接: ${gl_lv}${tcp_conns}${gl_bai}\033[K"
+    if [ -n "$svc_status" ]; then
+      echo -e "  关键服务状态: ${svc_status}\033[K"
+    fi
     echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}\033[K"
-    echo -e "  CPU 使用率  ($num_cpus 核): ${gl_huang}${cpu_bar}${gl_bai}\033[K"
-    echo -e "  内存 使用率 (${mem_used_mb}M/${mem_total_mb}M): ${gl_huang}${mem_bar}${gl_bai}\033[K"
+    echo -e "  CPU 使用率  ($num_cpus 核): ${cpu_bar}\033[K"
+    echo -e "  内存 使用率 (${mem_used_mb}M/${mem_total_mb}M): ${mem_bar}\033[K"
     if [ "$swap_total_mb" -gt 0 ]; then
-      echo -e "  Swap 虚拟内存 (${swap_used_mb}M/${swap_total_mb}M): ${gl_hui}${swap_bar}${gl_bai}\033[K"
+      echo -e "  Swap 虚拟内存 (${swap_used_mb}M/${swap_total_mb}M): ${swap_bar}\033[K"
     fi
     echo -e "  根磁盘 占用 (/):        ${gl_kjlan}${disk_used} / ${disk_total} (${disk_usage})${gl_bai}\033[K"
+    echo -e "  磁盘 I/O 读写:          实时 读: ${gl_lv}${disk_r_speed}${gl_bai} | 实时 写: ${gl_lv}${disk_w_speed}${gl_bai}\033[K"
     echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}\033[K"
-    echo -e "  全机实时下载 (RX): ${gl_lv}${rx_speed}${gl_bai} | 实时上传 (TX): ${gl_lv}${tx_speed}${gl_bai}\033[K"
+    echo -e "  全机网络流量: 实时 RX: ${gl_lv}${rx_speed}${gl_bai} (总计: ${gl_kjlan}${total_rx}${gl_bai}) | 实时 TX: ${gl_lv}${tx_speed}${gl_bai} (总计: ${gl_kjlan}${total_tx}${gl_bai})\033[K"
     echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}\033[K"
 
-    if has_cmd docker && docker info >/dev/null 2>&1; then
+    local show_proc=1 show_docker=1 proc_limit=9
+    if [ "$view_mode" = "proc" ]; then
+      show_docker=0
+      proc_limit=16
+    elif [ "$view_mode" = "docker" ]; then
+      show_proc=0
+    fi
+
+    if [ "$show_proc" -eq 1 ]; then
+      echo -e "${gl_kjlan}系统运行进程 (按 ${sort_title} 排序 | 模式: ${view_mode}):${gl_bai}\033[K"
       if [ "$sort_mode" = "mem" ]; then
-        echo -e "${gl_kjlan}Top 运行中 Docker 容器 (按 内存 排序 | 按 C 键按 CPU 排序):${gl_bai}\033[K"
-        docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" 2>/dev/null | sort -k4 -hr | head -n 5 | awk -F'\t' '
+        ps -eo pid,user,%cpu,%mem,args --sort=-%mem 2>/dev/null | head -n "$proc_limit" | awk '
+          BEGIN { printf "%-8s %-10s %-7s %-7s %s\033[K\n", "PID", "USER", "CPU %", "MEM %", "COMMAND" }
+          NR>1 {
+            cmd = ""
+            for (i=5; i<=NF; i++) {
+              cmd = cmd (i==5?"":" ") $i
+            }
+            sub(/^(\/[^\/ ]+)+\//, "", cmd)
+            if (length(cmd) > 35) cmd = substr(cmd, 1, 32) "..."
+            printf "%-8s %-10.10s %-7s %-7s %s\033[K\n", $1, $2, $3, $4, cmd
+          }
+        '
+      else
+        ps -eo pid,user,%cpu,%mem,args --sort=-%cpu 2>/dev/null | head -n "$proc_limit" | awk '
+          BEGIN { printf "%-8s %-10s %-7s %-7s %s\033[K\n", "PID", "USER", "CPU %", "MEM %", "COMMAND" }
+          NR>1 {
+            cmd = ""
+            for (i=5; i<=NF; i++) {
+              cmd = cmd (i==5?"":" ") $i
+            }
+            sub(/^(\/[^\/ ]+)+\//, "", cmd)
+            if (length(cmd) > 35) cmd = substr(cmd, 1, 32) "..."
+            printf "%-8s %-10.10s %-7s %-7s %s\033[K\n", $1, $2, $3, $4, cmd
+          }
+        '
+      fi
+    fi
+
+    if [ "$show_docker" -eq 1 ] && has_cmd docker && docker info >/dev/null 2>&1; then
+      [ "$show_proc" -eq 1 ] && echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}\033[K"
+      echo -e "${gl_kjlan}运行中 Docker 容器 (按 ${sort_title} 排序 | 模式: ${view_mode}):${gl_bai}\033[K"
+      if [ "$sort_mode" = "mem" ]; then
+        docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" 2>/dev/null | sort -k4 -hr | awk -F'\t' '
           BEGIN { printf "%-18s %-8s %-18s %-8s %-20s %s\033[K\n", "NAME", "CPU %", "MEM USAGE", "MEM %", "NET I/O", "BLOCK I/O" }
           { printf "%-18.18s %-8s %-18s %-8s %-20s %s\033[K\n", $1, $2, $3, $4, $5, $6 }
         '
       else
-        echo -e "${gl_kjlan}Top 运行中 Docker 容器 (按 CPU 排序 | 按 M 键按 内存 排序):${gl_bai}\033[K"
-        docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" 2>/dev/null | sort -k2 -hr | head -n 5 | awk -F'\t' '
+        docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" 2>/dev/null | sort -k2 -hr | awk -F'\t' '
           BEGIN { printf "%-18s %-8s %-18s %-8s %-20s %s\033[K\n", "NAME", "CPU %", "MEM USAGE", "MEM %", "NET I/O", "BLOCK I/O" }
           { printf "%-18.18s %-8s %-18s %-8s %-20s %s\033[K\n", $1, $2, $3, $4, $5, $6 }
         '
       fi
-    else
-      echo -e "${gl_kjlan}Top 高 CPU 占用进程 (Processes):${gl_bai}\033[K"
-      ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | head -n 6 | awk '{print $0"\033[K"}'
     fi
+
     echo -e "${gl_kjlan}====================================================${gl_bai}\033[K"
-    echo -e "提示: 1.5s 刷新 | Q: 退出 | C: 按 CPU 排序 | M: 按内存排序\033[K"
+    echo -e "提示: 1.5s 刷新 | Q: 退出 | C: CPU | M: 内存 | A: 全部 | P: 进程 | D: Docker | K: Kill | L: 日志\033[K"
     printf '\033[J'
 
     read -r -t 1.5 -n 1 input_key || true
@@ -446,6 +579,85 @@ system_live_monitor() {
         ;;
       m|M)
         sort_mode="mem"
+        ;;
+      a|A)
+        view_mode="all"
+        ;;
+      p|P)
+        view_mode="proc"
+        ;;
+      d|D)
+        view_mode="docker"
+        ;;
+      k|K)
+        tput cnorm 2>/dev/null || true
+        clear
+        echo -e "${gl_kjlan}=== 快速终止进程 / 停止容器 ===${gl_bai}"
+        echo -e "1. 杀死系统进程 (PID)"
+        echo -e "2. 停止 Docker 容器"
+        echo -e "0. 返回控制台"
+        read -r -p "请选择操作 [0-2]: " kill_opt
+        case "$kill_opt" in
+          1)
+            read -r -p "请输入要终止的进程 PID: " target_pid
+            if [ -n "$target_pid" ] && [[ "$target_pid" =~ ^[0-9]+$ ]]; then
+              read -r -p "确认强制杀死 PID $target_pid ? [y/N]: " confirm_k
+              if [[ "$confirm_k" =~ ^[Yy]$ ]]; then
+                kill -9 "$target_pid" 2>/dev/null && echo -e "${gl_lv}已成功杀死进程 $target_pid${gl_bai}" || echo -e "${gl_hong}杀死进程失败${gl_bai}"
+                sleep 1.5
+              fi
+            fi
+            ;;
+          2)
+            if has_cmd docker && docker info >/dev/null 2>&1; then
+              read -r -p "请输入要停止的 Docker 容器名称/ID: " target_container
+              if [ -n "$target_container" ]; then
+                echo "正在停止容器 $target_container..."
+                docker stop "$target_container" 2>/dev/null && echo -e "${gl_lv}已成功停止容器 $target_container${gl_bai}" || echo -e "${gl_hong}停止容器失败${gl_bai}"
+                sleep 1.5
+              fi
+            else
+              echo "未检测到运行中的 Docker"
+              sleep 1.5
+            fi
+            ;;
+        esac
+        tput civis 2>/dev/null || true
+        clear
+        ;;
+      l|L)
+        tput cnorm 2>/dev/null || true
+        clear
+        echo -e "${gl_kjlan}=== 查看系统 / 容器日志 ===${gl_bai}"
+        echo -e "1. 查看 Docker 容器日志"
+        echo -e "2. 查看 Systemd 服务日志"
+        echo -e "0. 返回控制台"
+        read -r -p "请选择操作 [0-2]: " log_opt
+        case "$log_opt" in
+          1)
+            if has_cmd docker && docker info >/dev/null 2>&1; then
+              read -r -p "请输入 Docker 容器名称/ID: " target_container
+              if [ -n "$target_container" ]; then
+                clear
+                echo -e "${gl_lv}按 Ctrl+C 退出日志查看...${gl_bai}"
+                docker logs --tail 100 -f "$target_container" 2>/dev/null || true
+              fi
+            else
+              echo "未检测到 Docker"
+              sleep 1.5
+            fi
+            ;;
+          2)
+            read -r -p "请输入 Systemd 服务名 (如 caddy / sshd): " target_svc
+            if [ -n "$target_svc" ]; then
+              clear
+              echo -e "${gl_lv}按 Ctrl+C 退出日志查看...${gl_bai}"
+              journalctl -u "$target_svc" -n 100 -f 2>/dev/null || true
+            fi
+            ;;
+        esac
+        tput civis 2>/dev/null || true
+        clear
         ;;
     esac
   done
@@ -855,14 +1067,28 @@ download_to() {
 
   log_action "download $url -> $output"
 
-  if has_cmd curl; then
-    curl --connect-timeout 10 --max-time 60 -fsSL "$url" -o "$output"
-  elif has_cmd wget; then
-    wget --timeout=15 -qO "$output" "$url"
+  try_dl() {
+    local target_url="$1"
+    if has_cmd curl; then
+      curl --connect-timeout 8 --max-time 120 -fsSL "$target_url" -o "$output"
+    elif has_cmd wget; then
+      wget --timeout=10 -qO "$output" "$target_url"
+    else
+      echo "未找到 curl/wget，先安装基础下载工具。"
+      install_pkg curl wget || return 1
+      curl --connect-timeout 8 --max-time 120 -fsSL "$target_url" -o "$output"
+    fi
+  }
+
+  if try_dl "$url"; then
+    return 0
+  fi
+
+  if [[ "$url" =~ github\.com ]] || [[ "$url" =~ raw\.githubusercontent\.com ]]; then
+    echo -e "${gl_huang}直连 GitHub 超时，自动尝试加速代理...${gl_bai}"
+    try_dl "https://ghp.ci/$url"
   else
-    echo "未找到 curl/wget，先安装基础下载工具。"
-    install_pkg curl wget || return 1
-    curl --connect-timeout 10 --max-time 60 -fsSL "$url" -o "$output"
+    return 1
   fi
 }
 
@@ -1115,12 +1341,12 @@ common_tools_menu() {
 
 docker_container_exists() {
   local name="$1"
-  has_cmd docker && docker inspect "$name" >/dev/null 2>&1
+  has_cmd docker && docker container inspect "$name" >/dev/null 2>&1
 }
 
 docker_container_running() {
   local name="$1"
-  has_cmd docker && [ "$(docker inspect --format '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]
+  has_cmd docker && [ "$(docker container inspect --format '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]
 }
 
 docker_container_status() {
@@ -1131,7 +1357,7 @@ docker_container_status() {
   fi
 
   local running
-  running="$(docker inspect --format '{{.State.Running}}' "$name" 2>/dev/null)"
+  running="$(docker container inspect --format '{{.State.Running}}' "$name" 2>/dev/null)"
   local rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ "$running" = "true" ]; then
@@ -1154,6 +1380,79 @@ docker_daemon_status() {
   else
     echo -e "${gl_huang}未运行/不可检测${gl_bai}"
   fi
+}
+
+ask_port_bind_ip() {
+  local service_name="$1"
+  local bind_mode
+  echo -e "${gl_kjlan}请选择 ${service_name} 的端口监听模式：${gl_bai}" >&2
+  echo -e "  1) 🛡️  ${gl_lv}安全防御模式${gl_bai} (仅绑定 127.0.0.1，防外网扫端口，配合 Caddy 反代最安全) [默认]" >&2
+  echo -e "  2) 🌐 ${gl_huang}公网直连模式${gl_bai} (绑定 0.0.0.0，允许外网 IP+端口 直接访问)" >&2
+  read -r -e -p "请选择端口模式 (1:安全防护 127.0.0.1 / 2:公网直连 0.0.0.0，默认 1): " bind_mode
+  bind_mode="${bind_mode:-1}"
+  if [ "$bind_mode" = "2" ]; then
+    echo ""
+  else
+    echo "127.0.0.1:"
+  fi
+}
+
+toggle_container_port_bind() {
+  local container_name="$1"
+  local host_port="$2"
+  local container_port="$3"
+
+  if ! docker_container_exists "$container_name"; then
+    echo "容器 $container_name 未安装。"
+    return 1
+  fi
+
+  local current_ports
+  current_ports="$(docker container inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{$p}} -> {{(index $conf 0).HostIp}}:{{(index $conf 0).HostPort}}{{end}}' "$container_name" 2>/dev/null)"
+  echo -e "当前容器端口映射: ${gl_lv}${current_ports:-0.0.0.0 (全网卡暴露)}${gl_bai}"
+
+  echo ""
+  echo "请选择要切换的端口映射模式："
+  echo "1) 🛡️ 锁定本地 127.0.0.1 (安全模式，禁止外网直连)"
+  echo "2) 🌐 开放公网 0.0.0.0 (公网模式，允许 IP:端口 直连)"
+  read -r -e -p "请输入选择 (1 或 2): " t_choice
+  
+  local new_bind=""
+  local bind_mode_flag=""
+  if [ "$t_choice" = "1" ]; then
+    new_bind="127.0.0.1:${host_port}:${container_port}"
+    bind_mode_flag="127.0.0.1"
+  elif [ "$t_choice" = "2" ]; then
+    new_bind="${host_port}:${container_port}"
+    bind_mode_flag="0.0.0.0"
+  else
+    echo "已取消操作。"
+    return 0
+  fi
+
+  echo "正在重构 $container_name 容器端口绑定模式 [$bind_mode_flag] ..."
+  if [ -f "/root/$container_name/docker-compose.yml" ]; then
+    if [ "$t_choice" = "1" ]; then
+      sed -i -E "s/\"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?${host_port}:${container_port}\"?/\"127.0.0.1:${host_port}:${container_port}\"/g" "/root/$container_name/docker-compose.yml"
+    else
+      sed -i -E "s/\"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?${host_port}:${container_port}\"?/\"${host_port}:${container_port}\"/g" "/root/$container_name/docker-compose.yml"
+    fi
+    (cd "/root/$container_name" && (docker compose down 2>/dev/null || docker-compose down 2>/dev/null) && (docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null))
+  else
+    local img_name
+    img_name="$(docker container inspect --format '{{.Config.Image}}' "$container_name" 2>/dev/null)"
+    docker stop "$container_name" >/dev/null 2>&1 || true
+    docker rm "$container_name" >/dev/null 2>&1 || true
+    
+    if [ "$container_name" = "it-tools" ]; then
+      docker run -d --name it-tools --restart unless-stopped -p "$new_bind" corentinth/it-tools:latest
+    elif [ "$container_name" = "filebrowser" ]; then
+      docker run -d --name filebrowser --restart unless-stopped -v /:/srv -v /root/filebrowser:/database -p "$new_bind" filebrowser/filebrowser:latest
+    elif [ "$container_name" = "kuma" ]; then
+      docker run -d --name kuma --restart always -p "$new_bind" -v /root/uptime-kuma:/app/data louislam/uptime-kuma:1
+    fi
+  fi
+  echo -e "${gl_lv}端口安全模式切换完成！当前模式: ${bind_mode_flag}${gl_bai}"
 }
 
 
@@ -1322,6 +1621,9 @@ EOF
 caddy_add_reverse_proxy() {
   need_root || return 1
 
+  local default_port="$1"
+  local target_container_name="$2"
+  local target_container_port="$3"
   local domain upstream cfg_file
   if docker_container_exists caddy; then
     cfg_file="/root/caddy/Caddyfile"
@@ -1330,7 +1632,15 @@ caddy_add_reverse_proxy() {
   fi
 
   read -r -e -p "请输入域名，如 example.com: " domain
-  read -r -e -p "请输入反代目标，如 http://127.0.0.1:3000: " upstream
+  local default_target=""
+  if [ -n "$default_port" ]; then
+    default_target="http://127.0.0.1:${default_port}"
+    read -r -e -p "请输入反代目标，回车默认 ${default_target}: " upstream
+    upstream="${upstream:-$default_target}"
+  else
+    read -r -e -p "请输入反代目标，如 http://127.0.0.1:3000: " upstream
+  fi
+
   if [ -z "$domain" ] || [ -z "$upstream" ]; then
     echo "域名和反代目标不能为空。"
     return 1
@@ -1363,9 +1673,52 @@ caddy_add_reverse_proxy() {
     echo -e "${gl_lv}✓ DNS 解析校验通过，域名已正确指向本机。${gl_bai}"
   fi
 
+  # ===== 判定模式 1: Docker 容器化 Caddy =====
+  if docker_container_exists caddy; then
+    # 1. 确保共享虚拟网络 ua-net 存在并将 Caddy 容器加入
+    docker network create ua-net >/dev/null 2>&1 || true
+    docker network connect ua-net caddy >/dev/null 2>&1 || true
+
+    local matched_container="" matched_internal_port=""
+    if [ -n "$target_container_name" ] && docker_container_exists "$target_container_name"; then
+      matched_container="$target_container_name"
+      matched_internal_port="${target_container_port:-$default_port}"
+    elif docker_container_exists it-tools && ([ "$default_port" = "8080" ] || [ "$target_container_name" = "it-tools" ]); then
+      matched_container="it-tools"; matched_internal_port="80"
+    elif docker_container_exists filebrowser && ([ "$default_port" = "8082" ] || [ "$target_container_name" = "filebrowser" ]); then
+      matched_container="filebrowser"; matched_internal_port="80"
+    elif docker_container_exists openlist && ([ "$default_port" = "5244" ] || [ "$target_container_name" = "openlist" ]); then
+      matched_container="openlist"; matched_internal_port="5244"
+    elif docker_container_exists kuma && ([ "$default_port" = "3001" ] || [ "$default_port" = "3003" ] || [ "$target_container_name" = "kuma" ]); then
+      matched_container="kuma"; matched_internal_port="3001"
+    elif docker_container_exists "$(npm_container_name)" && ([ "$default_port" = "81" ] || [ "$target_container_name" = "$(npm_container_name)" ]); then
+      matched_container="$(npm_container_name)"; matched_internal_port="81"
+    fi
+
+    if [ -n "$matched_container" ]; then
+      # 2. 自动将目标容器拉入 ua-net 网络，并替换为容器内网直连地址 (http://container_name:internal_port)
+      docker network connect ua-net "$matched_container" >/dev/null 2>&1 || true
+      upstream="http://${matched_container}:${matched_internal_port}"
+      echo -e "${gl_lv}已识别为 [Docker Caddy 模式]，自动优化为 Docker 内网直连代理: ${upstream}${gl_bai}"
+    else
+      upstream="${upstream//127.0.0.1/172.17.0.1}"
+      upstream="${upstream//localhost/172.17.0.1}"
+    fi
+  # ===== 判定模式 2: 原生 Systemd Caddy =====
+  else
+    echo -e "${gl_lv}已识别为 [原生 Systemd Caddy 模式]，保留宿主机回环地址反代: ${upstream}${gl_bai}"
+  fi
+
   mkdir -p "$(dirname "$cfg_file")"
   touch "$cfg_file"
   cp "$cfg_file" "${cfg_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+
+  # 清理旧的重复域名配置块，防止 Caddy 报 Ambiguous site definition 错误崩溃
+  if grep -E "^[[:space:]]*${domain}[[:space:]]*\{" "$cfg_file" >/dev/null 2>&1; then
+    echo "提示: 检测到 Caddyfile 中已存在 $domain 配置，正在覆写更新..."
+    sed -i "/^[[:space:]]*${domain}[[:space:]]*{/,/}/d" "$cfg_file"
+  fi
+
   cat >> "$cfg_file" <<EOF
 
 $domain {
@@ -1377,7 +1730,7 @@ EOF
   if docker_container_exists caddy; then
     if docker_container_running caddy; then
       docker exec -w /etc/caddy caddy caddy fmt --overwrite Caddyfile 2>/dev/null || true
-      docker exec -w /etc/caddy caddy caddy reload
+      docker restart caddy 2>/dev/null || docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
     fi
   elif has_cmd caddy; then
     caddy fmt --overwrite /etc/caddy/Caddyfile 2>/dev/null || true
@@ -1387,6 +1740,137 @@ EOF
   echo "已追加 Caddy 反代配置并重载服务。"
 }
 
+check_and_prompt_caddy_proxy() {
+  local service_name="$1"
+  local target_port="$2"
+  local container_name="$3"
+  local container_port="${4:-$target_port}"
+
+  if docker_container_exists caddy || has_cmd caddy; then
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+    echo -e "${gl_huang}检测到系统已安装 Caddy 反向代理。${gl_bai}"
+    read -r -e -p "是否立刻为 ${service_name} 配置 Caddy 域名反向代理与 HTTPS SSL 证书？[y/N]: " setup_caddy
+    if [[ "$setup_caddy" =~ ^[Yy]$ ]]; then
+      caddy_add_reverse_proxy "$target_port" "$container_name" "$container_port"
+      if [ -n "$container_name" ] && docker_container_exists "$container_name"; then
+        local current_ports
+        current_ports="$(docker container inspect "$container_name" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null)"
+        if [[ "$current_ports" != *"127.0.0.1"* ]]; then
+          echo -e "${gl_huang}为了最高安全性，建议防外网扫端口：${gl_bai}"
+          read -r -e -p "是否自动收紧端口为 127.0.0.1 (仅保留 Caddy 域名安全访问，禁止公网直连)？[Y/n]: " lock_port
+          lock_port="${lock_port:-Y}"
+          if [[ "$lock_port" =~ ^[Yy]$ ]]; then
+            echo "1" | toggle_container_port_bind "$container_name" "$target_port" "$container_port" >/dev/null 2>&1 || true
+            echo -e "${gl_lv}✓ 已成功锁定 $container_name 端口至 127.0.0.1 本地防护模式！${gl_bai}"
+          fi
+        fi
+      fi
+    fi
+  fi
+}
+caddy_delete_reverse_proxy() {
+  need_root || return 1
+
+  local cfg_file
+  if docker_container_exists caddy; then
+    cfg_file="/root/caddy/Caddyfile"
+  else
+    cfg_file="/etc/caddy/Caddyfile"
+  fi
+
+  if [ ! -f "$cfg_file" ]; then
+    echo "未找到 Caddy 配置文件: $cfg_file"
+    return 1
+  fi
+
+  local domains
+  domains="$(grep -E "^[[:space:]]*[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[[:space:]]*\{" "$cfg_file" | awk '{print $1}' | tr -d '{')"
+
+  if [ -z "$domains" ]; then
+    echo "当前 Caddyfile 中未检测到任何已配置的反代域名。"
+    return 0
+  fi
+
+  echo -e "${gl_kjlan}当前已配置的 Caddy 反代站点列表：${gl_bai}"
+  local count=0
+  local domain_array=()
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    count=$((count + 1))
+    domain_array+=("$d")
+    local upstream_target
+    upstream_target="$(sed -n "/^[[:space:]]*${d}[[:space:]]*{/,/}/p" "$cfg_file" | grep "reverse_proxy" | awk '{print $2}')"
+    echo -e "  ${count}) ${gl_lv}${d}${gl_bai} -> ${gl_huang}${upstream_target:-未知}${gl_bai}"
+  done <<< "$domains"
+
+  echo -e "  0) 取消"
+  read -r -e -p "请输入要删除的站点序号或指定域名: " del_input
+
+  if [ -z "$del_input" ] || [ "$del_input" = "0" ]; then
+    echo "已取消。"
+    return 0
+  fi
+
+  local target_domain=""
+  if printf '%s\n' "$del_input" | grep -Eq '^[0-9]+$'; then
+    local idx=$((del_input - 1))
+    if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#domain_array[@]}" ]; then
+      target_domain="${domain_array[$idx]}"
+    else
+      echo "无效序号。"
+      return 1
+    fi
+  else
+    target_domain="$del_input"
+  fi
+
+  if confirm_danger "删除 Caddy 反代站点规则 $target_domain" "$target_domain"; then
+    cp "$cfg_file" "${cfg_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+    sed -i "/^[[:space:]]*${target_domain}[[:space:]]*{/,/}/d" "$cfg_file"
+    echo -e "${gl_lv}已成功删除反代站点 $target_domain 规则。${gl_bai}"
+
+    if docker_container_exists caddy; then
+      if docker_container_running caddy; then
+        docker exec -w /etc/caddy caddy caddy fmt --overwrite Caddyfile 2>/dev/null || true
+        docker restart caddy 2>/dev/null || docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+      fi
+    elif has_cmd caddy; then
+      caddy fmt --overwrite /etc/caddy/Caddyfile 2>/dev/null || true
+      caddy validate --config /etc/caddy/Caddyfile || return 1
+      svc reload caddy 2>/dev/null || svc restart caddy 2>/dev/null || true
+    fi
+    echo "已重载 Caddy 配置生效。"
+  fi
+}
+
+caddy_uninstall() {
+  need_root || return 1
+
+  if ! docker_container_exists caddy && ! has_cmd caddy; then
+    echo "系统未检测到 Caddy 容器或原生服务。"
+    return 0
+  fi
+
+  if confirm_danger "删除 Caddy 容器/服务及相关配置" "caddy"; then
+    if docker_container_exists caddy; then
+      docker rm -f caddy 2>/dev/null || true
+      echo "已删除 Caddy Docker 容器。"
+    fi
+    if has_cmd caddy; then
+      systemctl stop caddy 2>/dev/null || true
+      systemctl disable caddy 2>/dev/null || true
+      apt remove -y caddy 2>/dev/null || yum remove -y caddy 2>/dev/null || true
+      echo "已卸载 Caddy 原生服务。"
+    fi
+    read -r -e -p "是否同时删除 /root/caddy 配置与证书目录？[y/N]: " del_cfg
+    if [[ "$del_cfg" =~ ^[Yy]$ ]]; then
+      rm -rf /root/caddy /root/caddy_data /root/caddy_config /etc/caddy
+      echo "配置数据已清理。"
+    fi
+    echo "Caddy 已成功卸载删除。"
+  fi
+}
+
 caddy_tools_menu() {
   while true; do
     clear
@@ -1394,13 +1878,15 @@ caddy_tools_menu() {
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}1.   ${gl_bai}安装/更新 Caddy (系统原生)"
     echo -e "${gl_kjlan}2.   ${gl_bai}部署 Caddy (Docker 容器)"
-    echo -e "${gl_kjlan}3.   ${gl_bai}编辑 Caddyfile"
-    echo -e "${gl_kjlan}4.   ${gl_bai}新增反代站点"
-    echo -e "${gl_kjlan}5.   ${gl_bai}验证并重载配置"
-    echo -e "${gl_kjlan}6.   ${gl_bai}查看最近日志"
-    echo -e "${gl_kjlan}7.   ${gl_bai}启动 Caddy"
-    echo -e "${gl_kjlan}8.   ${gl_bai}重启 Caddy"
-    echo -e "${gl_kjlan}9.   ${gl_bai}停止 Caddy"
+    echo -e "${gl_kjlan}3.   ${gl_bai}编辑 Caddyfile (高级/手动)"
+    echo -e "${gl_kjlan}4.   ${gl_bai}新增反代站点规则"
+    echo -e "${gl_kjlan}5.   ${gl_bai}删除反代站点规则"
+    echo -e "${gl_kjlan}6.   ${gl_bai}验证并重载配置"
+    echo -e "${gl_kjlan}7.   ${gl_bai}查看最近日志"
+    echo -e "${gl_kjlan}8.   ${gl_bai}启动 Caddy"
+    echo -e "${gl_kjlan}9.   ${gl_bai}重启 Caddy"
+    echo -e "${gl_kjlan}10.  ${gl_bai}停止 Caddy"
+    echo -e "${gl_kjlan}11.  ${gl_bai}删除 Caddy (容器/服务卸载)"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
@@ -1419,7 +1905,8 @@ caddy_tools_menu() {
         pause
         ;;
       4) caddy_add_reverse_proxy; pause ;;
-      5)
+      5) caddy_delete_reverse_proxy; pause ;;
+      6)
         if docker_container_exists caddy; then
           if docker_container_running caddy; then
             docker exec -w /etc/caddy caddy caddy reload && echo "Caddy 容器配置重载成功。"
@@ -1434,7 +1921,7 @@ caddy_tools_menu() {
         fi
         pause
         ;;
-      6)
+      7)
         if docker_container_exists caddy; then
           docker logs --tail 120 caddy
         elif has_cmd journalctl; then
@@ -1444,7 +1931,7 @@ caddy_tools_menu() {
         fi
         pause
         ;;
-      7)
+      8)
         if docker_container_exists caddy; then
           docker start caddy
         elif has_cmd caddy; then
@@ -1454,7 +1941,7 @@ caddy_tools_menu() {
         fi
         pause
         ;;
-      8)
+      9)
         if docker_container_exists caddy; then
           docker restart caddy
         elif has_cmd caddy; then
@@ -1464,7 +1951,7 @@ caddy_tools_menu() {
         fi
         pause
         ;;
-      9)
+      10)
         if docker_container_exists caddy; then
           docker stop caddy
         elif has_cmd caddy; then
@@ -1474,6 +1961,7 @@ caddy_tools_menu() {
         fi
         pause
         ;;
+      11) caddy_uninstall; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -1568,6 +2056,20 @@ panel_status_overview() {
     openlist_url="-"
   fi
 
+  local kuma_status kuma_url
+  if has_cmd docker && docker_container_exists kuma; then
+    if docker_container_running kuma; then
+      kuma_status="${gl_lv}运行中${gl_bai}"
+    else
+      kuma_status="${gl_huang}已停止${gl_bai}"
+    fi
+    kuma_url="$(docker port kuma 3001/tcp 2>/dev/null | head -n 1 | awk -F: -v ip="$ip" '{print "http://"ip":"$NF}')"
+    [ -z "$kuma_url" ] && kuma_url="-"
+  else
+    kuma_status="${gl_hui}未安装${gl_bai}"
+    kuma_url="-"
+  fi
+
   echo -e "${gl_kjlan}工具状态总览${gl_bai}"
   printf "%-24s %-18b %-28s\n" "WARP" "$warp_line" "-"
   printf "%-24s %-18b %-28s\n" "Caddy" "$caddy_line" "$caddy_file"
@@ -1575,6 +2077,7 @@ panel_status_overview() {
   printf "%-24s %-18b %-28s\n" "it-tools" "$it_status" "$it_url"
   printf "%-24s %-18b %-28s\n" "File Browser" "$fb_status" "$fb_url"
   printf "%-24s %-18b %-28s\n" "OpenList" "$openlist_status" "$openlist_url"
+  printf "%-24s %-18b %-28s\n" "Uptime Kuma" "$kuma_status" "$kuma_url"
   echo "NPM 识别到容器名: $npm_name"
   echo -e "Compose项目状态:  ${gl_lv}$(get_compose_projects_summary)${gl_bai}"
 }
@@ -1611,16 +2114,37 @@ npm_install() {
     fi
   done
 
+  local bind_ip
+  bind_ip="$(ask_port_bind_ip "Nginx Proxy Manager 管理后台 (端口 $port_81)")"
+
   mkdir -p /root/nginx-proxy-manager/data /root/nginx-proxy-manager/letsencrypt
+  chmod -R 777 /root/nginx-proxy-manager
   log_action "install Nginx Proxy Manager (80:$port_80, 443:$port_443, 81:$port_81)"
-  docker run -d \
-    --name "$name" \
-    --restart unless-stopped \
-    -p "$port_80":80 -p "$port_81":81 -p "$port_443":443 \
-    -v /root/nginx-proxy-manager/data:/data \
-    -v /root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt \
-    jc21/nginx-proxy-manager:latest
-  echo "Nginx Proxy Manager 已部署。如果映射了非标准端口，请访问对应的映射端口，例如管理后台: http://$(get_display_ip):$port_81"
+  
+  cat > /root/nginx-proxy-manager/docker-compose.yml <<EOF
+version: '3.8'
+services:
+  app:
+    image: 'jc21/nginx-proxy-manager:latest'
+    container_name: '$name'
+    restart: unless-stopped
+    ports:
+      - '${port_80}:80'
+      - '${port_443}:443'
+      - '${bind_ip}${port_81}:81'
+    volumes:
+      - '/root/nginx-proxy-manager/data:/data'
+      - '/root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt'
+EOF
+
+  (cd /root/nginx-proxy-manager && (docker compose up -d 2>/dev/null || docker-compose up -d))
+
+  if [ "$bind_ip" = "127.0.0.1:" ]; then
+    echo -e "Nginx Proxy Manager 已部署。\n本地管理后台端口: http://127.0.0.1:$port_81 (已锁定本地防扫，无法通过外网 IP 直连)"
+  else
+    echo "Nginx Proxy Manager 已部署。如果映射了非标准端口，请访问对应的映射端口，例如管理后台: http://$(get_display_ip):$port_81"
+  fi
+  check_and_prompt_caddy_proxy "Nginx Proxy Manager 管理后台" "$port_81" "$name" "81"
 }
 
 npm_tools_menu() {
@@ -1638,22 +2162,47 @@ npm_tools_menu() {
     fi
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 NPM 面板"
-    echo -e "${gl_kjlan}2.   ${gl_bai}查看日志"
-    echo -e "${gl_kjlan}3.   ${gl_bai}重启容器"
-    echo -e "${gl_kjlan}4.   ${gl_bai}停止容器"
-    echo -e "${gl_kjlan}5.   ${gl_bai}删除容器和数据"
+    echo -e "${gl_kjlan}2.   ${gl_bai}配置 Caddy 域名反向代理 (HTTPS)"
+    echo -e "${gl_kjlan}3.   ${gl_bai}切换端口安全模式 (127.0.0.1 防扫 / 0.0.0.0 直连)"
+    echo -e "${gl_kjlan}4.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}7.   ${gl_bai}删除容器和数据"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) npm_install; pause ;;
-      2) docker_require && docker logs --tail 120 "$name"; pause ;;
-      3) docker_require && docker restart "$name"; pause ;;
-      4) docker_require && docker stop "$name"; pause ;;
-      5)
+      2)
+         local port_81
+         port_81="$(docker port "$name" 81/tcp 2>/dev/null | awk -F: '{print $NF}' | head -n 1)"
+         [ -z "$port_81" ] && port_81="81"
+         caddy_add_reverse_proxy "$port_81" "$name" "81"
+         pause
+         ;;
+      3)
+         local port_81
+         port_81="$(docker port "$name" 81/tcp 2>/dev/null | awk -F: '{print $NF}' | head -n 1)"
+         if [ -n "$port_81" ]; then
+           if [ ! -f "/root/nginx-proxy-manager/docker-compose.yml" ]; then
+             echo "提示: 当前 NPM 容器不是通过 docker-compose 部署，无法直接切换模式。"
+             echo "请选择 [7] 删除容器和数据，然后重新 [1] 安装即可支持端口自由切换。"
+           else
+             toggle_container_port_bind "$name" "$port_81" "81"
+           fi
+         else
+           echo "NPM 容器未运行或未暴露端口。"
+         fi
+         pause
+         ;;
+      4) docker_require && docker logs --tail 120 "$name"; pause ;;
+      5) docker_require && docker restart "$name"; pause ;;
+      6) docker_require && docker stop "$name"; pause ;;
+      7)
         need_root || { pause; continue; }
         if confirm_danger "删除 Nginx Proxy Manager 容器和 /root/nginx-proxy-manager 数据" "$name"; then
+          (cd /root/nginx-proxy-manager && docker compose down 2>/dev/null || docker-compose down 2>/dev/null)
           docker rm -f "$name" 2>/dev/null || true
           rm -rf /root/nginx-proxy-manager
         fi
@@ -1686,13 +2235,17 @@ it_tools_install() {
     return 1
   fi
 
+  local bind_ip
+  bind_ip="$(ask_port_bind_ip "it-tools")"
+
   log_action "install it-tools port=$port"
   docker run -d \
     --name it-tools \
     --restart unless-stopped \
-    -p "$port":80 \
+    -p "${bind_ip}${port}":80 \
     corentinth/it-tools:latest
   echo "it-tools 已部署。访问: http://$(get_display_ip):$port"
+  check_and_prompt_caddy_proxy "it-tools" "$port" "it-tools" "80"
 }
 
 it_tools_menu() {
@@ -1708,20 +2261,30 @@ it_tools_menu() {
     fi
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 it-tools"
-    echo -e "${gl_kjlan}2.   ${gl_bai}查看日志"
-    echo -e "${gl_kjlan}3.   ${gl_bai}重启容器"
-    echo -e "${gl_kjlan}4.   ${gl_bai}停止容器"
-    echo -e "${gl_kjlan}5.   ${gl_bai}删除容器"
+    echo -e "${gl_kjlan}2.   ${gl_bai}配置 Caddy 域名反向代理 (HTTPS)"
+    echo -e "${gl_kjlan}3.   ${gl_bai}切换端口安全模式 (127.0.0.1 防扫 / 0.0.0.0 直连)"
+    echo -e "${gl_kjlan}4.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}7.   ${gl_bai}删除容器"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) it_tools_install; pause ;;
-      2) docker_require && docker logs --tail 120 it-tools; pause ;;
-      3) docker_require && docker restart it-tools; pause ;;
-      4) docker_require && docker stop it-tools; pause ;;
-      5)
+      2) caddy_add_reverse_proxy "8080"; pause ;;
+      3)
+        local curr_port
+        curr_port="$(docker container inspect --format '{{(index (index .HostConfig.PortBindings "80/tcp") 0).HostPort}}' it-tools 2>/dev/null)"
+        curr_port="${curr_port:-8080}"
+        toggle_container_port_bind "it-tools" "$curr_port" "80"
+        pause
+        ;;
+      4) docker_require && docker logs --tail 120 it-tools; pause ;;
+      5) docker_require && docker restart it-tools; pause ;;
+      6) docker_require && docker stop it-tools; pause ;;
+      7)
         if confirm_danger "删除 it-tools 容器" "it-tools"; then
           docker rm -f it-tools
         fi
@@ -1755,6 +2318,9 @@ filebrowser_install() {
     return 1
   fi
 
+  local bind_ip
+  bind_ip="$(ask_port_bind_ip "File Browser")"
+
   mkdir -p /root/filebrowser
   log_action "install filebrowser port=$port"
   docker run -d \
@@ -1762,10 +2328,11 @@ filebrowser_install() {
     --restart unless-stopped \
     -v /:/srv \
     -v /root/filebrowser:/database \
-    -p "$port":80 \
+    -p "${bind_ip}${port}":80 \
     filebrowser/filebrowser:latest
   echo "File Browser 已部署。访问: http://$(get_display_ip):$port"
   echo "默认用户名和密码为: admin / admin"
+  check_and_prompt_caddy_proxy "File Browser" "$port" "filebrowser" "80"
 }
 
 filebrowser_menu() {
@@ -1781,20 +2348,30 @@ filebrowser_menu() {
     fi
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 File Browser"
-    echo -e "${gl_kjlan}2.   ${gl_bai}查看日志"
-    echo -e "${gl_kjlan}3.   ${gl_bai}重启容器"
-    echo -e "${gl_kjlan}4.   ${gl_bai}停止容器"
-    echo -e "${gl_kjlan}5.   ${gl_bai}删除容器和配置数据"
+    echo -e "${gl_kjlan}2.   ${gl_bai}配置 Caddy 域名反向代理 (HTTPS)"
+    echo -e "${gl_kjlan}3.   ${gl_bai}切换端口安全模式 (127.0.0.1 防扫 / 0.0.0.0 直连)"
+    echo -e "${gl_kjlan}4.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}7.   ${gl_bai}删除容器和配置数据"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) filebrowser_install; pause ;;
-      2) docker_require && docker logs --tail 120 filebrowser; pause ;;
-      3) docker_require && docker restart filebrowser; pause ;;
-      4) docker_require && docker stop filebrowser; pause ;;
-      5)
+      2) caddy_add_reverse_proxy "8082"; pause ;;
+      3)
+        local curr_port
+        curr_port="$(docker container inspect --format '{{(index (index .HostConfig.PortBindings "80/tcp") 0).HostPort}}' filebrowser 2>/dev/null)"
+        curr_port="${curr_port:-8082}"
+        toggle_container_port_bind "filebrowser" "$curr_port" "80"
+        pause
+        ;;
+      4) docker_require && docker logs --tail 120 filebrowser; pause ;;
+      5) docker_require && docker restart filebrowser; pause ;;
+      6) docker_require && docker stop filebrowser; pause ;;
+      7)
         need_root || { pause; continue; }
         if confirm_danger "删除 File Browser 容器和数据库配置文件" "filebrowser"; then
           docker rm -f filebrowser 2>/dev/null || true
@@ -1841,8 +2418,12 @@ openlist_install() {
     fi
   done
 
+  local bind_ip
+  bind_ip="$(ask_port_bind_ip "OpenList")"
+
   data_dir="/root/openlist"
   mkdir -p "$data_dir/data"
+  chmod -R 777 "$data_dir/data"
 
   if [ "$deploy_mode" = "2" ]; then
     if ! docker compose version >/dev/null 2>&1 && ! has_cmd docker-compose; then
@@ -1858,8 +2439,8 @@ services:
     container_name: openlist
     restart: always
     ports:
-      - "$port:5244"
-      - "$port_dav:5245"
+      - "${bind_ip}${port}:5244"
+      - "${bind_ip}${port_dav}:5245"
     volumes:
       - ./data:/opt/openlist/data
     environment:
@@ -1880,8 +2461,8 @@ EOF
     docker run -d \
       --name openlist \
       --restart always \
-      -p "$port":5244 \
-      -p "$port_dav":5245 \
+      -p "${bind_ip}${port}":5244 \
+      -p "${bind_ip}${port_dav}":5245 \
       -v "$data_dir/data":/opt/openlist/data \
       -e UMASK=022 \
       -e TZ=Asia/Shanghai \
@@ -1910,6 +2491,7 @@ EOF
     echo "提示: 未能在日志中截获初始密码，您可以运行以下命令手动获取/重置密码："
     echo "  docker exec -it openlist ./openlist admin random"
   fi
+  check_and_prompt_caddy_proxy "OpenList" "$port" "openlist" "5244"
 }
 
 openlist_tools_menu() {
@@ -1924,21 +2506,31 @@ openlist_tools_menu() {
     fi
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 OpenList"
-    echo -e "${gl_kjlan}2.   ${gl_bai}查看日志"
-    echo -e "${gl_kjlan}3.   ${gl_bai}重启容器"
-    echo -e "${gl_kjlan}4.   ${gl_bai}停止容器"
-    echo -e "${gl_kjlan}5.   ${gl_bai}获取/重置管理员密码"
-    echo -e "${gl_kjlan}6.   ${gl_bai}删除容器和配置数据"
+    echo -e "${gl_kjlan}2.   ${gl_bai}配置 Caddy 域名反向代理 (HTTPS)"
+    echo -e "${gl_kjlan}3.   ${gl_bai}切换端口安全模式 (127.0.0.1 防扫 / 0.0.0.0 直连)"
+    echo -e "${gl_kjlan}4.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}7.   ${gl_bai}获取/重置管理员密码"
+    echo -e "${gl_kjlan}8.   ${gl_bai}删除容器和配置数据"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) openlist_install; pause ;;
-      2) docker_require && docker logs --tail 120 openlist; pause ;;
-      3) docker_require && docker restart openlist; pause ;;
-      4) docker_require && docker stop openlist; pause ;;
-      5)
+      2) caddy_add_reverse_proxy "5244"; pause ;;
+      3)
+        local curr_port
+        curr_port="$(docker container inspect --format '{{(index (index .HostConfig.PortBindings "5244/tcp") 0).HostPort}}' openlist 2>/dev/null)"
+        curr_port="${curr_port:-5244}"
+        toggle_container_port_bind "openlist" "$curr_port" "5244"
+        pause
+        ;;
+      4) docker_require && docker logs --tail 120 openlist; pause ;;
+      5) docker_require && docker restart openlist; pause ;;
+      6) docker_require && docker stop openlist; pause ;;
+      7)
         if docker_container_running openlist; then
           local new_pwd choice
           new_pwd="$(docker exec -i openlist ./openlist admin random 2>/dev/null | grep "password:" | awk '{print $2}' | tr -d '\r\n ')"
@@ -1955,11 +2547,102 @@ openlist_tools_menu() {
         fi
         pause
         ;;
-      6)
+      8)
         need_root || { pause; continue; }
         if confirm_danger "删除 OpenList 容器和所有配置数据" "openlist"; then
           docker rm -f openlist 2>/dev/null || true
           rm -rf /root/openlist
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+uptime_kuma_install() {
+  need_root || return 1
+  docker_require || install_docker || return 1
+
+  if docker_container_exists kuma; then
+    docker start kuma
+    echo "Uptime Kuma 容器已存在并已启动。"
+    return 0
+  fi
+
+  local port
+  read -r -e -p "请输入 Web 端口，回车默认 3001: " port
+  port="${port:-3001}"
+  if ! printf '%s\n' "$port" | grep -Eq '^[0-9]+$'; then
+    echo "端口必须是数字。"
+    return 1
+  fi
+  if is_port_taken "$port"; then
+    echo -e "${gl_hong}错误:${gl_bai} 端口 $port 已被系统占用，请先释放该端口，或者指定其他端口。"
+    return 1
+  fi
+
+  local bind_ip
+  bind_ip="$(ask_port_bind_ip "Uptime Kuma")"
+
+  mkdir -p /root/uptime-kuma
+  log_action "install uptime-kuma port=$port"
+  docker run -d \
+    --name kuma \
+    --restart always \
+    -p "${bind_ip}${port}":3001 \
+    -v /root/uptime-kuma:/app/data \
+    louislam/uptime-kuma:1
+  if [ "$bind_ip" = "127.0.0.1:" ]; then
+    echo -e "Uptime Kuma 已部署。\n本地访问端口: http://127.0.0.1:$port (已锁定本地防扫，无法通过外网 IP 直连)"
+  else
+    echo "Uptime Kuma 已部署。访问: http://$(get_display_ip):$port"
+  fi
+  check_and_prompt_caddy_proxy "Uptime Kuma" "$port" "kuma" "3001"
+}
+
+uptime_kuma_menu() {
+  local choice
+  while true; do
+    clear
+    echo -e "${gl_kjlan}Uptime Kuma 服务监控面板${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    if has_cmd docker && docker_container_exists kuma; then
+      docker ps -a --filter "name=^/kuma$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    else
+      echo "容器: 未安装"
+    fi
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}安装/启动 Uptime Kuma"
+    echo -e "${gl_kjlan}2.   ${gl_bai}配置 Caddy 域名反向代理 (HTTPS)"
+    echo -e "${gl_kjlan}3.   ${gl_bai}切换端口安全模式 (127.0.0.1 防扫 / 0.0.0.0 直连)"
+    echo -e "${gl_kjlan}4.   ${gl_bai}查看日志"
+    echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
+    echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
+    echo -e "${gl_kjlan}7.   ${gl_bai}删除容器与数据"
+    echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) uptime_kuma_install; pause ;;
+      2) caddy_add_reverse_proxy "3001"; pause ;;
+      3)
+        local curr_port
+        curr_port="$(docker container inspect --format '{{(index (index .HostConfig.PortBindings "3001/tcp") 0).HostPort}}' kuma 2>/dev/null)"
+        curr_port="${curr_port:-3001}"
+        toggle_container_port_bind "kuma" "$curr_port" "3001"
+        pause
+        ;;
+      4) docker_require && docker logs --tail 120 kuma; pause ;;
+      5) docker_require && docker restart kuma; pause ;;
+      6) docker_require && docker stop kuma; pause ;;
+      7)
+        need_root || { pause; continue; }
+        if confirm_danger "删除 Uptime Kuma 容器与数据" "kuma"; then
+          docker rm -f kuma 2>/dev/null || true
+          rm -rf /root/uptime-kuma
         fi
         pause
         ;;
@@ -1983,6 +2666,7 @@ panel_tools_menu() {
     echo -e "${gl_kjlan}4.   ${gl_bai}it-tools 工具箱"
     echo -e "${gl_kjlan}5.   ${gl_bai}File Browser 文件浏览器"
     echo -e "${gl_kjlan}6.   ${gl_bai}OpenList 网盘系统"
+    echo -e "${gl_kjlan}7.   ${gl_bai}Uptime Kuma 服务监控面板"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
@@ -1994,6 +2678,7 @@ panel_tools_menu() {
       4) it_tools_menu ;;
       5) filebrowser_menu ;;
       6) openlist_tools_menu ;;
+      7) uptime_kuma_menu ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -3598,107 +4283,110 @@ test_scripts_menu() {
   while true; do
     clear
     echo -e "${gl_kjlan}测试脚本合集${gl_bai}"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}IP 及解锁状态检测${gl_bai}"
-    echo -e "${gl_kjlan}1.   ${gl_bai}ChatGPT 解锁状态检测"
-    echo -e "${gl_kjlan}2.   ${gl_bai}Region 流媒体解锁测试"
-    echo -e "${gl_kjlan}3.   ${gl_bai}yeahwu 流媒体解锁检测"
-    echo -e "${gl_kjlan}4.   ${gl_bai}IP质量体检脚本"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}网络线路测速${gl_bai}"
-    echo -e "${gl_kjlan}11.  ${gl_bai}besttrace 三网回程延迟路由测试"
-    echo -e "${gl_kjlan}12.  ${gl_bai}mtr_trace 三网回程线路测试"
-    echo -e "${gl_kjlan}13.  ${gl_bai}Superspeed 三网测速"
-    echo -e "${gl_kjlan}14.  ${gl_bai}nxtrace 快速回程测试"
-    echo -e "${gl_kjlan}15.  ${gl_bai}nxtrace 指定IP回程测试"
-    echo -e "${gl_kjlan}16.  ${gl_bai}i-abc 多功能测速脚本"
-    echo -e "${gl_kjlan}17.  ${gl_bai}NetQuality 网络质量体检"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}硬件性能测试${gl_bai}"
-    echo -e "${gl_kjlan}21.  ${gl_bai}YABS 综合性能测试"
-    echo -e "${gl_kjlan}22.  ${gl_bai}YABS 跳过 iperf"
-    echo -e "${gl_kjlan}23.  ${gl_bai}icu/gb5 CPU 性能测试"
-    echo -e "${gl_kjlan}24.  ${gl_bai}极速硬盘与网络延迟自检"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}常用基础测试${gl_bai}"
-    echo -e "${gl_kjlan}31.  ${gl_bai}bench.sh 基础性能测试"
-    echo -e "${gl_kjlan}32.  ${gl_bai}融合怪测评"
-    echo -e "${gl_kjlan}33.  ${gl_bai}安装 speedtest-cli"
-    echo -e "${gl_kjlan}34.  ${gl_bai}运行 speedtest-cli"
-    echo -e "${gl_kjlan}35.  ${gl_bai}安装 iperf3"
-    echo -e "${gl_kjlan}36.  ${gl_bai}iperf3 客户端测试"
-    echo -e "${gl_kjlan}37.  ${gl_bai}Ping 测试"
-    echo -e "${gl_kjlan}38.  ${gl_bai}路由追踪"
-    echo -e "${gl_kjlan}41.  ${gl_bai}运行自定义脚本 URL"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+    echo -e "${gl_huang}【🔥 热门综合测评 (强烈推荐)】${gl_bai}"
+    echo -e "${gl_kjlan}1.   ${gl_bai}融合怪综合测评 (硬件/网络/解锁/IP欺诈一键全测)"
+    echo -e "${gl_kjlan}2.   ${gl_bai}YABS 经典性能测试 (GB5/GB6 CPU + Fio 磁盘 + iperf3)"
+    echo -e "${gl_kjlan}3.   ${gl_bai}YABS 快速测试 (跳过 iperf3)"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+    echo -e "${gl_huang}【🌐 IP 风险与流媒体解锁检测】${gl_bai}"
+    echo -e "${gl_kjlan}4.   ${gl_bai}IP.Check.Place 风险与欺诈分检测 (推荐)"
+    echo -e "${gl_kjlan}5.   ${gl_bai}Region 流媒体解锁测试 (lmc999)"
+    echo -e "${gl_kjlan}6.   ${gl_bai}yeahwu 流媒体解锁全面检测"
+    echo -e "${gl_kjlan}7.   ${gl_bai}OpenAI / ChatGPT 专项解锁检测"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+    echo -e "${gl_huang}【⚡ 网络线路与三网回程测速】${gl_bai}"
+    echo -e "${gl_kjlan}11.  ${gl_bai}NextTrace 三网快速回程追踪 (替代旧 BestTrace)"
+    echo -e "${gl_kjlan}12.  ${gl_bai}NextTrace 指定 IP / 运营商回程测试"
+    echo -e "${gl_kjlan}13.  ${gl_bai}i-abc 三网多功能节点测速 (取代旧 Superspeed)"
+    echo -e "${gl_kjlan}14.  ${gl_bai}NetQuality 全球网络质量体检"
+    echo -e "${gl_kjlan}15.  ${gl_bai}mtr_trace 经典三网回程"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+    echo -e "${gl_huang}【💻 硬件与基础工具】${gl_bai}"
+    echo -e "${gl_kjlan}21.  ${gl_bai}Geekbench 5 / 6 CPU 跑分测试"
+    echo -e "${gl_kjlan}22.  ${gl_bai}bench.sh 老牌基础性能跑分"
+    echo -e "${gl_kjlan}23.  ${gl_bai}UA Box 零依赖秒级自检 (磁盘/网络)"
+    echo -e "${gl_kjlan}24.  ${gl_bai}Speedtest-cli 命令行测速 (自动检测与安装)"
+    echo -e "${gl_kjlan}25.  ${gl_bai}iperf3 带宽压测 (自动检测与安装)"
+    echo -e "${gl_kjlan}26.  ${gl_bai}Ping 延迟与路由追踪 (Ping / Traceroute)"
+    echo -e "${gl_kjlan}31.  ${gl_bai}运行自定义脚本 URL"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
-    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice
 
     case "$choice" in
-      1) run_downloaded_script "$OPENAI_CHECK_SCRIPT" "$UA_BOX_TMP_DIR"/openai-check.sh; pause ;;
-      2) run_downloaded_script "$REGION_UNLOCK_SCRIPT" "$UA_BOX_TMP_DIR"/unlock-media.sh; pause ;;
-      3) run_downloaded_script "$YEAHWU_UNLOCK_SCRIPT" "$UA_BOX_TMP_DIR"/yeahwu-unlock.sh; pause ;;
+      1) run_downloaded_script "$FUSION_TEST_SCRIPT" "$UA_BOX_TMP_DIR"/fusion-test.sh; pause ;;
+      2) run_downloaded_script "$YABS_SCRIPT" "$UA_BOX_TMP_DIR"/yabs.sh; pause ;;
+      3) run_downloaded_script "$YABS_SCRIPT" "$UA_BOX_TMP_DIR"/yabs.sh -i; pause ;;
       4) download_to "https://IP.Check.Place" "$UA_BOX_TMP_DIR"/ip-check.sh && bash "$UA_BOX_TMP_DIR"/ip-check.sh; pause ;;
-      11) run_downloaded_script "$BESTTRACE_SCRIPT" "$UA_BOX_TMP_DIR"/besttrace.sh; pause ;;
-      12) run_downloaded_script "$MTR_TRACE_SCRIPT" "$UA_BOX_TMP_DIR"/mtr_trace.sh; pause ;;
-      13) run_downloaded_script "$SUPERSPEED_SCRIPT" "$UA_BOX_TMP_DIR"/superspeed.sh; pause ;;
-      14) download_to "https://nxtrace.org/nt" "$UA_BOX_TMP_DIR"/nxtrace.sh && bash "$UA_BOX_TMP_DIR"/nxtrace.sh && nexttrace --fast-trace --tcp; pause ;;
-      15)
-        echo "可参考的 IP 列表"
+      5) run_downloaded_script "$REGION_UNLOCK_SCRIPT" "$UA_BOX_TMP_DIR"/unlock-media.sh; pause ;;
+      6) run_downloaded_script "$YEAHWU_UNLOCK_SCRIPT" "$UA_BOX_TMP_DIR"/yeahwu-unlock.sh; pause ;;
+      7) run_downloaded_script "$OPENAI_CHECK_SCRIPT" "$UA_BOX_TMP_DIR"/openai-check.sh; pause ;;
+      11) download_to "https://nxtrace.org/nt" "$UA_BOX_TMP_DIR"/nxtrace.sh && bash "$UA_BOX_TMP_DIR"/nxtrace.sh && nexttrace --fast-trace --tcp; pause ;;
+      12)
+        echo "参考常用测试 IP 列表:"
         echo "北京电信: 219.141.136.12     北京联通: 202.106.50.1      北京移动: 221.179.155.161"
         echo "上海电信: 202.96.209.133     上海联通: 210.22.97.1       上海移动: 211.136.112.200"
         echo "广州电信: 58.60.188.222      广州联通: 210.21.196.6      广州移动: 120.196.165.24"
-        read -r -e -p "请输入指定 IP: " test_ip
+        read -r -e -p "请输入指定测试 IP: " test_ip
         download_to "https://nxtrace.org/nt" "$UA_BOX_TMP_DIR"/nxtrace.sh && bash "$UA_BOX_TMP_DIR"/nxtrace.sh
-        nexttrace "$test_ip"
+        nexttrace "${test_ip:-1.1.1.1}"
         pause
         ;;
-      16) run_downloaded_script "$IABC_SPEEDTEST_SCRIPT" "$UA_BOX_TMP_DIR"/iabc-speedtest.sh; pause ;;
-      17) download_to "https://Net.Check.Place" "$UA_BOX_TMP_DIR"/net-check.sh && bash "$UA_BOX_TMP_DIR"/net-check.sh; pause ;;
-      21) run_downloaded_script "$YABS_SCRIPT" "$UA_BOX_TMP_DIR"/yabs.sh; pause ;;
-      22) run_downloaded_script "$YABS_SCRIPT" "$UA_BOX_TMP_DIR"/yabs.sh -i; pause ;;
-      23) run_downloaded_script "$GB5_SCRIPT" "$UA_BOX_TMP_DIR"/gb5.sh; pause ;;
-      24) run_speed_io_test; pause ;;
-      31) run_downloaded_script "$BENCH_SCRIPT" "$UA_BOX_TMP_DIR"/bench.sh; pause ;;
-      32) run_downloaded_script "$FUSION_TEST_SCRIPT" "$UA_BOX_TMP_DIR"/fusion-test.sh; pause ;;
-      33) install_pkg speedtest-cli; pause ;;
-      34)
+      13) run_downloaded_script "$IABC_SPEEDTEST_SCRIPT" "$UA_BOX_TMP_DIR"/iabc-speedtest.sh; pause ;;
+      14) download_to "https://Net.Check.Place" "$UA_BOX_TMP_DIR"/net-check.sh && bash "$UA_BOX_TMP_DIR"/net-check.sh; pause ;;
+      15) run_downloaded_script "$MTR_TRACE_SCRIPT" "$UA_BOX_TMP_DIR"/mtr_trace.sh; pause ;;
+      21) run_downloaded_script "$GB5_SCRIPT" "$UA_BOX_TMP_DIR"/gb5.sh; pause ;;
+      22) run_downloaded_script "$BENCH_SCRIPT" "$UA_BOX_TMP_DIR"/bench.sh; pause ;;
+      23) run_speed_io_test; pause ;;
+      24)
+        if ! has_cmd speedtest-cli; then
+          echo "检测到系统未安装 speedtest-cli，正在自动安装..."
+          install_pkg speedtest-cli || true
+        fi
         if has_cmd speedtest-cli; then
           speedtest-cli
         else
-          echo "未找到 speedtest-cli，请先安装。"
+          echo "speedtest-cli 安装或执行失败。"
         fi
         pause
         ;;
-      35) install_pkg iperf3; pause ;;
-      36)
+      25)
         if ! has_cmd iperf3; then
-          echo "未找到 iperf3，请先安装。"
-          pause
-          continue
+          echo "检测到系统未安装 iperf3，正在自动安装..."
+          install_pkg iperf3 || true
+        fi
+        if ! has_cmd iperf3; then
+          echo "未找到 iperf3，安装失败。"
+          pause; continue
         fi
         read -r -e -p "请输入 iperf3 服务器地址: " host
         read -r -e -p "请输入端口，回车默认 5201: " port
         iperf3 -c "$host" -p "${port:-5201}"
         pause
         ;;
-      37)
-        read -r -e -p "请输入测试地址，回车默认 1.1.1.1: " host
-        ping -c 4 "${host:-1.1.1.1}"
-        pause
-        ;;
-      38)
-        read -r -e -p "请输入追踪地址，回车默认 1.1.1.1: " host
-        if has_cmd traceroute; then
-          traceroute "${host:-1.1.1.1}"
-        elif has_cmd tracepath; then
-          tracepath "${host:-1.1.1.1}"
-        else
-          echo "未找到 traceroute/tracepath，可先安装 traceroute。"
+      26)
+        echo "1. Ping 延迟测试"
+        echo "2. Traceroute 路由追踪"
+        read -r -e -p "请选择操作 [1-2]: " pr_opt
+        if [ "$pr_opt" = "1" ]; then
+          read -r -e -p "请输入测试地址，回车默认 1.1.1.1: " host
+          ping -c 4 "${host:-1.1.1.1}"
+        elif [ "$pr_opt" = "2" ]; then
+          read -r -e -p "请输入追踪地址，回车默认 1.1.1.1: " host
+          if has_cmd traceroute; then
+            traceroute "${host:-1.1.1.1}"
+          elif has_cmd tracepath; then
+            tracepath "${host:-1.1.1.1}"
+          else
+            echo "未找到 traceroute 工具，自动尝试安装..."
+            install_pkg traceroute || true
+            traceroute "${host:-1.1.1.1}" 2>/dev/null || tracepath "${host:-1.1.1.1}"
+          fi
         fi
         pause
         ;;
-      41)
+      31)
         read -r -e -p "请输入脚本 URL: " url
         read -r -e -p "请输入脚本参数，回车跳过: " args
         local args_arr=()
