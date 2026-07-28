@@ -318,11 +318,16 @@ system_live_monitor() {
     '
   }
 
+  local host_name sys_kernel sort_mode="cpu"
+  host_name="$(hostname 2>/dev/null || echo "$HOSTNAME")"
+  sys_kernel="$(uname -r 2>/dev/null || echo "Linux")"
+
   local prev_cpu prev_idle prev_rx prev_tx
   read -r prev_cpu prev_idle < <(get_cpu_stat)
   read -r prev_rx prev_tx < <(get_net_bytes)
 
   sleep 1
+  clear 2>/dev/null || true
 
   while true; do
     local curr_cpu curr_idle curr_rx curr_tx
@@ -354,6 +359,20 @@ system_live_monitor() {
       mem_used_mb=0
     fi
 
+    local swap_total swap_free swap_used=0 swap_percent=0 swap_total_mb=0 swap_used_mb=0
+    swap_total="$(grep SwapTotal /proc/meminfo | awk '{print $2}')"
+    swap_free="$(grep SwapFree /proc/meminfo | awk '{print $2}')"
+    if [ -n "$swap_total" ] && [ "$swap_total" -gt 0 ]; then
+      swap_used=$((swap_total - swap_free))
+      swap_percent=$((100 * swap_used / swap_total))
+      swap_total_mb=$((swap_total / 1024))
+      swap_used_mb=$((swap_used / 1024))
+    fi
+
+    local sys_load tcp_conns
+    sys_load="$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || echo "0 0 0")"
+    tcp_conns="$(ss -t -a state established 2>/dev/null | grep -v '^Recv-Q' | wc -l || echo "0")"
+
     local disk_info disk_usage disk_total disk_used
     disk_info="$(df -h / | awk 'NR==2 {print $2, $3, $5}')"
     read -r disk_total disk_used disk_usage <<< "$disk_info"
@@ -369,42 +388,66 @@ system_live_monitor() {
       echo "[$bar] $pct%"
     }
 
-    local cpu_bar mem_bar
+    local cpu_bar mem_bar swap_bar sys_uptime
     cpu_bar="$(draw_bar "$cpu_usage")"
     mem_bar="$(draw_bar "$mem_percent")"
+    swap_bar="$(draw_bar "$swap_percent")"
+    sys_uptime="$(uptime -p 2>/dev/null || uptime)"
 
-    tput clear 2>/dev/null || clear
-    echo -e "${gl_kjlan}====================================================${gl_bai}"
-    echo -e "         ${gl_lv}UA Box 动态 Live 系统监控控制台${gl_bai}  (按 Q 键退出)"
-    echo -e "${gl_kjlan}====================================================${gl_bai}"
-    echo -e "  主机名: ${gl_bai}$(hostname)${gl_bai} | 内核: ${gl_bai}$(uname -r)${gl_bai} | Uptime: ${gl_bai}$(uptime -p 2>/dev/null || uptime)${gl_bai}"
-    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
-    echo -e "  CPU 使用率  ($num_cpus 核): ${gl_huang}${cpu_bar}${gl_bai}"
-    echo -e "  内存 使用率 (${mem_used_mb}M/${mem_total_mb}M): ${gl_huang}${mem_bar}${gl_bai}"
-    echo -e "  根磁盘 占用 (/):        ${gl_kjlan}${disk_used} / ${disk_total} (${disk_usage})${gl_bai}"
-    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
-    echo -e "  网络实时下载 (RX): ${gl_lv}${rx_speed}${gl_bai} | 实时上传 (TX): ${gl_lv}${tx_speed}${gl_bai}"
-    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
+    # 使用 ANSI \033[H 原地移动光标重绘，彻底解决清屏闪烁
+    printf '\033[H'
+    echo -e "${gl_kjlan}====================================================${gl_bai}\033[K"
+    echo -e "         ${gl_lv}UA Box 动态 Live 系统监控控制台${gl_bai}  (按 Q 键退出)\033[K"
+    echo -e "${gl_kjlan}====================================================${gl_bai}\033[K"
+    echo -e "  主机名: ${gl_bai}${host_name}${gl_bai} | 内核: ${gl_bai}${sys_kernel}${gl_bai} | Uptime: ${gl_bai}${sys_uptime}${gl_bai}\033[K"
+    echo -e "  系统负载 (1/5/15m): ${gl_bai}${sys_load}${gl_bai} | TCP 建立连接: ${gl_lv}${tcp_conns}${gl_bai}\033[K"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}\033[K"
+    echo -e "  CPU 使用率  ($num_cpus 核): ${gl_huang}${cpu_bar}${gl_bai}\033[K"
+    echo -e "  内存 使用率 (${mem_used_mb}M/${mem_total_mb}M): ${gl_huang}${mem_bar}${gl_bai}\033[K"
+    if [ "$swap_total_mb" -gt 0 ]; then
+      echo -e "  Swap 虚拟内存 (${swap_used_mb}M/${swap_total_mb}M): ${gl_hui}${swap_bar}${gl_bai}\033[K"
+    fi
+    echo -e "  根磁盘 占用 (/):        ${gl_kjlan}${disk_used} / ${disk_total} (${disk_usage})${gl_bai}\033[K"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}\033[K"
+    echo -e "  全机实时下载 (RX): ${gl_lv}${rx_speed}${gl_bai} | 实时上传 (TX): ${gl_lv}${tx_speed}${gl_bai}\033[K"
+    echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}\033[K"
 
     if has_cmd docker && docker info >/dev/null 2>&1; then
-      echo -e "${gl_kjlan}Top 运行中 Docker 容器 (按 CPU 排序):${gl_bai}"
-      docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" 2>/dev/null | sort -k2 -hr | head -n 5 | awk -F'\t' '
-        BEGIN { printf "%-20s %-8s %-20s %-8s %-20s %s\n", "NAME", "CPU %", "MEM USAGE", "MEM %", "NET I/O", "BLOCK I/O" }
-        { printf "%-20.20s %-8s %-20s %-8s %-20s %s\n", $1, $2, $3, $4, $5, $6 }
-      '
+      if [ "$sort_mode" = "mem" ]; then
+        echo -e "${gl_kjlan}Top 运行中 Docker 容器 (按 内存 排序 | 按 C 键按 CPU 排序):${gl_bai}\033[K"
+        docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" 2>/dev/null | sort -k4 -hr | head -n 5 | awk -F'\t' '
+          BEGIN { printf "%-18s %-8s %-18s %-8s %-20s %s\033[K\n", "NAME", "CPU %", "MEM USAGE", "MEM %", "NET I/O", "BLOCK I/O" }
+          { printf "%-18.18s %-8s %-18s %-8s %-20s %s\033[K\n", $1, $2, $3, $4, $5, $6 }
+        '
+      else
+        echo -e "${gl_kjlan}Top 运行中 Docker 容器 (按 CPU 排序 | 按 M 键按 内存 排序):${gl_bai}\033[K"
+        docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" 2>/dev/null | sort -k2 -hr | head -n 5 | awk -F'\t' '
+          BEGIN { printf "%-18s %-8s %-18s %-8s %-20s %s\033[K\n", "NAME", "CPU %", "MEM USAGE", "MEM %", "NET I/O", "BLOCK I/O" }
+          { printf "%-18.18s %-8s %-18s %-8s %-20s %s\033[K\n", $1, $2, $3, $4, $5, $6 }
+        '
+      fi
     else
-      echo -e "${gl_kjlan}Top 高 CPU 占用进程 (Processes):${gl_bai}"
-      ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | head -n 6
+      echo -e "${gl_kjlan}Top 高 CPU 占用进程 (Processes):${gl_bai}\033[K"
+      ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | head -n 6 | awk '{print $0"\033[K"}'
     fi
-    echo -e "${gl_kjlan}====================================================${gl_bai}"
-    echo "提示: 画面每 1.5 秒自动刷新，按 Q 键返回菜单。"
+    echo -e "${gl_kjlan}====================================================${gl_bai}\033[K"
+    echo -e "提示: 1.5s 刷新 | Q: 退出 | C: 按 CPU 排序 | M: 按内存排序\033[K"
+    printf '\033[J'
 
     read -r -t 1.5 -n 1 input_key || true
-    if [[ "$input_key" == "q" ]] || [[ "$input_key" == "Q" ]]; then
-      tput cnorm 2>/dev/null || true
-      clear
-      return 0
-    fi
+    case "$input_key" in
+      q|Q)
+        tput cnorm 2>/dev/null || true
+        clear
+        return 0
+        ;;
+      c|C)
+        sort_mode="cpu"
+        ;;
+      m|M)
+        sort_mode="mem"
+        ;;
+    esac
   done
 }
 
