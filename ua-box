@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-UA_BOX_VERSION="0.6.2"
+UA_BOX_VERSION="0.6.3"
 UA_BOX_NAME="UA Box"
 SCRIPT_REAL_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 UA_BOX_HOME="$(cd "$(dirname "$SCRIPT_REAL_PATH")" && pwd)"

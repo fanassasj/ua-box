@@ -2,7 +2,7 @@
 
 UA Box 是一个轻量 Linux 命令行运维面板，整合系统管理、Docker、rclone、面板工具、网络测试和常用脚本入口。
 
-当前版本：**v0.6.2**
+当前版本：**v0.6.3**
 
 适合 VPS、独服、轻量服务器的日常管理。脚本以 Bash 编写，尽量减少依赖；部分系统级操作需要 root 权限。
 
@@ -276,6 +276,13 @@ UA Box 只在选择对应菜单项时下载并执行外部脚本：
 - 融合怪: `https://gitlab.com/spiritysdx/za`
 
 ## 更新日志
+
+### v0.6.3
+
+- 面板全面支持**「Docker Run / Docker Compose 双轨自选部署模式」**（涵盖 OpenList、NPM、File Browser、it-tools、Uptime Kuma），部署交互统一体验。
+- 重构**「一键安全切换引擎」**：实现 127.0.0.1 安全防扫模式与公网 0.0.0.0 直连模式智能热切换，自动兼容传统 Docker 容器与 Compose Yaml 栈，配置更新零阻塞。
+- 重构**「Nginx Proxy Manager」**底层：迁移至 Compose 纯净架构，原生补齐 81 管理端口防扫加密及一键反代链路，100% 融入 UA-Net 安全代理网络。
+- 完善**「Caddy 反代管理器」**：新增可视化反代规则单点删除功能与 Caddy (系统级/容器级) 彻底清理卸载模块。
 
 ### v0.6.2
 
