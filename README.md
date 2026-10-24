@@ -2,7 +2,7 @@
 
 UA Box 是一个轻量 Linux 命令行运维面板，整合系统管理、Docker、rclone、面板工具、网络测试和常用脚本入口。
 
-当前版本：**v0.6.3**
+当前版本：**v0.6.4**
 
 适合 VPS、独服、轻量服务器的日常管理。脚本以 Bash 编写，尽量减少依赖；部分系统级操作需要 root 权限。
 
@@ -157,13 +157,14 @@ curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lso
 
 `ua status` 会汇总关键异常：
 
-- Docker 服务状态和异常容器
+- Docker 服务状态、异常容器和 Docker Compose 部分停止项目
 - rclone remote 连接失败
 - systemd 服务未运行
+- Caddy SSL 证书即将过期（< 7 天）预警
 - CPU、内存、磁盘、系统负载高占用
 - 最近 UA Box 操作日志
 
-确认无需处理的异常可通过 `ua ignore` 管理，不需要手动编辑配置文件。
+支持通过 `ua status --notify` 或 `ua notify` 配置 Telegram Bot / 通用 Webhook（兼容企微/飞书/钉钉/Discord/Bark）定时自动巡检并在发现异常时主动推送告警。确认无需处理的异常可通过 `ua ignore` 管理，不需要手动编辑配置文件。
 
 ## 快捷命令
 
@@ -180,9 +181,14 @@ ua test            # 测试脚本合集
 ua top             # 打开动态 Live 实时系统监控控制台 (CPU/内存/网络网速/容器)
 ua fzf             # 打开 fzf 全功能交互式模糊搜索导航面板
 ua status          # UA 状态检查
+ua status --notify # 执行异常巡检并在发现异常时主动推送告警
+ua notify          # 打开状态巡检主动告警配置菜单 (Telegram / Webhook)
+ua export          # 一键打包导出全部面板配置与数据（支持联动上传 rclone）
+ua import          # 从迁移归档包一键恢复面板配置与数据
 ua ignore          # 异常忽略管理
 ua ignore current  # 忽略当前异常项
 ua ignore rclone quark # 忽略指定 rclone remote 异常
+ua settings        # 打开 UA Box 设置菜单
 ua config          # 编辑配置文件
 ua log             # 查看最近日志
 ua backup          # 备份当前脚本
@@ -226,6 +232,11 @@ UA_IGNORE_SERVICES=""
 UA_IGNORE_RCLONE_REMOTES=""
 UA_STATUS_DISK_WARN=80
 UA_STATUS_DISK_CRIT=90
+UA_MAX_BACKUPS=10
+GITHUB_PROXY_URLS="https://ghp.ci https://gh-proxy.com https://ghproxy.net"
+UA_NOTIFY_TG_BOT_TOKEN=""
+UA_NOTIFY_TG_CHAT_ID=""
+UA_NOTIFY_WEBHOOK_URL=""
 ```
 
 `UA_IGNORE_CONTAINERS`、`UA_IGNORE_SERVICES` 和 `UA_IGNORE_RCLONE_REMOTES` 用空格分隔多个名称，用于隐藏已确认无需处理的历史异常。推荐通过 `ua ignore` 写入这些配置。
@@ -276,6 +287,23 @@ UA Box 只在选择对应菜单项时下载并执行外部脚本：
 - 融合怪: `https://gitlab.com/spiritysdx/za`
 
 ## 更新日志
+
+### v0.6.4
+
+- 新增**「状态巡检主动告警推送 (`ua notify` / `ua status --notify`)」**：支持配置 Telegram Bot 与通用 Webhook（兼容企微/飞书/钉钉/Discord/Bark），支持一键开启每 30 分钟 Cron 自动后台巡检，在发现容器停止、磁盘满、Rclone 掉线或 SSL 证书即将到期时主动告警。
+- 新增**「面板配置与数据一键迁移 / 备份中心 (`ua export` / `ua import`)」**：自动扫描打包 UA Box 配置、Caddy 配置与证书、OpenList、File Browser、Uptime Kuma、NPM、it-tools、`rclone.conf` 及挂载服务，支持一键联动上传至 Rclone 远程网盘与安全校验恢复。
+- 新增**「面板容器一键无损更新镜像版本」**：在 NPM、OpenList、File Browser、Uptime Kuma、it-tools 管理菜单中新增无损升级选项，自动兼容 Compose 与 `docker run` 部署，完整保留原端口安全策略与 `ua-net` 内网连接。
+- 新增**「Caddy 反代站点映射看板与 SSL 证书到期预警」**：Caddy 状态页直观列出所有已配置域名与反代目标，`ua status` 自动检测剩余有效期 `< 7 天` 的 SSL 证书并预警。
+- 安全与防呆加固：
+  - SSH 禁用密码认证前强制检测系统是否存在有效公钥（`authorized_keys`），防止无密钥锁死服务器。
+  - UFW 启用防火墙前自动保底放行当前 SSH 监听端口，防止启用瞬间 SSH 失联。
+  - 防火墙管理面板新增 Docker `0.0.0.0` 端口绕过 UFW/Firewalld 风险自动扫描与提醒。
+  - Fail2ban 规则动态联动自定义 SSH 端口，修改 SSH 端口时自动同步更新 `/etc/fail2ban/jail.local`。
+- 稳定性与底层修复：
+  - 升级 Caddyfile 块解析器为 `awk` 花括号深度追踪，支持嵌套子块安全删除/覆写，并在校验失败时自动回滚备份。
+  - 修复容器切换 `127.0.0.1` / `0.0.0.0` 端口模式后脱离 `ua-net` 网络导致 Caddy 容器反代 502 的问题。
+  - 修复流量统计与限流自动关机未排除 Docker/虚拟网卡导致流量重复累加的问题。
+  - 新增全模块历史备份文件自动轮转清理（`UA_MAX_BACKUPS=10`）、GitHub 加速代理池多源轮询回退（`GITHUB_PROXY_URLS`）及 Rclone 挂载 FUSE 依赖自动检测安装。
 
 ### v0.6.3
 

@@ -9,6 +9,11 @@ UA_IGNORE_SERVICES=""
 UA_IGNORE_RCLONE_REMOTES=""
 UA_STATUS_DISK_WARN=80
 UA_STATUS_DISK_CRIT=90
+UA_MAX_BACKUPS=10
+GITHUB_PROXY_URLS="https://ghp.ci https://gh-proxy.com https://ghproxy.net"
+UA_NOTIFY_TG_BOT_TOKEN=""
+UA_NOTIFY_TG_CHAT_ID=""
+UA_NOTIFY_WEBHOOK_URL=""
 
 WARP_MANAGER_SCRIPT="https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh"
 DOCKER_INSTALL_SCRIPT="https://get.docker.com"

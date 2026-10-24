@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-UA_BOX_VERSION="0.6.3"
+UA_BOX_VERSION="0.6.4"
 UA_BOX_NAME="UA Box"
 SCRIPT_REAL_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 UA_BOX_HOME="$(cd "$(dirname "$SCRIPT_REAL_PATH")" && pwd)"
@@ -46,6 +46,11 @@ UA_STATUS_DISK_CRIT=90
 UA_APT_UPDATE_INTERVAL=60
 UA_MONITOR_SERVICES="caddy"
 UA_STATUS_SKIP_RCLONE=0
+UA_MAX_BACKUPS=10
+GITHUB_PROXY_URLS="https://ghp.ci https://gh-proxy.com https://ghproxy.net"
+UA_NOTIFY_TG_BOT_TOKEN=""
+UA_NOTIFY_TG_CHAT_ID=""
+UA_NOTIFY_WEBHOOK_URL=""
 
 init_ua_box() {
   mkdir -p "$UA_BOX_HOME" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR"
@@ -65,6 +70,11 @@ UA_STATUS_DISK_CRIT=90
 UA_APT_UPDATE_INTERVAL=60
 UA_MONITOR_SERVICES="caddy"
 UA_STATUS_SKIP_RCLONE=0
+UA_MAX_BACKUPS=10
+GITHUB_PROXY_URLS="https://ghp.ci https://gh-proxy.com https://ghproxy.net"
+UA_NOTIFY_TG_BOT_TOKEN=""
+UA_NOTIFY_TG_CHAT_ID=""
+UA_NOTIFY_WEBHOOK_URL=""
 
 WARP_MANAGER_SCRIPT="$WARP_MANAGER_SCRIPT"
 
@@ -116,6 +126,29 @@ confirm_danger() {
   esac
 }
 
+prune_old_backups() {
+  local dir="$1"
+  local pattern="$2"
+  local keep="${3:-${UA_MAX_BACKUPS:-10}}"
+  [ -d "$dir" ] || return 0
+  printf '%s\n' "$keep" | grep -Eq '^[0-9]+$' || keep=10
+
+  local files=()
+  local f
+  # shellcheck disable=SC2086
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] && files+=("$f")
+  done < <(ls -1td "$dir"/$pattern 2>/dev/null)
+
+  local count="${#files[@]}"
+  if [ "$count" -gt "$keep" ]; then
+    local i
+    for ((i = keep; i < count; i++)); do
+      rm -f "${files[$i]}" 2>/dev/null || true
+    done
+  fi
+}
+
 backup_self() {
   local src
   local dst
@@ -123,6 +156,7 @@ backup_self() {
   src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
   dst="$UA_BOX_BACKUP_DIR/ua-box-$(date '+%Y%m%d-%H%M%S').bak"
   cp "$src" "$dst"
+  prune_old_backups "$UA_BOX_BACKUP_DIR" "ua-box-*.bak" "${UA_MAX_BACKUPS:-10}"
   log_action "backup_self $dst"
   echo "已备份到: $dst"
 }
@@ -173,7 +207,7 @@ _ua_completion() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  main_commands="ps info sys system ssh ssh-port ssh-key f2b fail2ban tools panel docker dk work rclone test status ignore config log backup update init bbr fw fb ol top monitor fzf search find install remove"
+  main_commands="ps info sys system ssh ssh-port ssh-key f2b fail2ban tools panel docker dk work rclone test status notify export import ignore config log backup update init bbr fw fb ol top monitor fzf search find install remove settings"
 
   if [ "$COMP_CWORD" -eq 1 ]; then
     mapfile -t COMPREPLY < <(compgen -W "${main_commands}" -- "${cur}")
@@ -1085,8 +1119,19 @@ download_to() {
   fi
 
   if [[ "$url" =~ github\.com ]] || [[ "$url" =~ raw\.githubusercontent\.com ]]; then
-    echo -e "${gl_huang}直连 GitHub 超时，自动尝试加速代理...${gl_bai}"
-    try_dl "https://ghp.ci/$url"
+    echo -e "${gl_huang}直连 GitHub 超时，自动尝试加速代理池...${gl_bai}"
+    local proxy proxy_list
+    proxy_list="${GITHUB_PROXY_URLS:-https://ghp.ci https://gh-proxy.com https://ghproxy.net}"
+    # shellcheck disable=SC2086
+    for proxy in $proxy_list; do
+      proxy="${proxy%/}"
+      [ -z "$proxy" ] && continue
+      echo "尝试加速源: ${proxy}/..."
+      if try_dl "${proxy}/${url}"; then
+        return 0
+      fi
+    done
+    return 1
   else
     return 1
   fi
@@ -1195,10 +1240,18 @@ local_ip() {
 }
 
 net_total() {
-  awk '
-    $1 ~ /^[a-zA-Z0-9_.:-]+:$/ && $1 !~ /^lo:/ {
-      rx += $2;
-      tx += $10
+  awk -F'[: ]+' '
+    NR > 2 {
+      iface = $1
+      if (iface == "") iface = $2
+      if (iface ~ /^(lo|docker|br-|veth|tun|tap|wg|warp|CloudflareWARP|tailscale|zt)/) next
+      for (i = 1; i <= NF; i++) {
+        if ($i == iface) {
+          rx += $(i + 1)
+          tx += $(i + 9)
+          break
+        }
+      }
     }
     END {
       printf "%.2fG / %.2fG", rx/1024/1024/1024, tx/1024/1024/1024
@@ -1441,6 +1494,11 @@ toggle_container_port_bind() {
   fi
 
   echo "正在重构 $container_name 容器端口绑定模式 [$bind_mode_flag] ..."
+  local was_in_ua_net=0
+  if docker container inspect --format '{{range $net, $v := .NetworkSettings.Networks}}{{$net}} {{end}}' "$container_name" 2>/dev/null | grep -qw "ua-net"; then
+    was_in_ua_net=1
+  fi
+
   local compose_file=""
   for dir in "/root/$container_name" "/root/nginx-proxy-manager" "/root/uptime-kuma"; do
     if [ -f "$dir/docker-compose.yml" ]; then
@@ -1467,16 +1525,105 @@ toggle_container_port_bind() {
     docker rm "$container_name" >/dev/null 2>&1 || true
     
     if [ "$container_name" = "it-tools" ]; then
-      docker run -d --name it-tools --restart unless-stopped -p "$new_bind" corentinth/it-tools:latest
+      docker run -d --name it-tools --restart unless-stopped -p "$new_bind" "${img_name:-corentinth/it-tools:latest}"
     elif [ "$container_name" = "filebrowser" ]; then
-      docker run -d --name filebrowser --restart unless-stopped -v /:/srv -v /root/filebrowser:/database -p "$new_bind" filebrowser/filebrowser:latest
+      docker run -d --name filebrowser --restart unless-stopped -v /:/srv -v /root/filebrowser:/database -p "$new_bind" "${img_name:-filebrowser/filebrowser:latest}"
     elif [ "$container_name" = "kuma" ]; then
-      docker run -d --name kuma --restart always -p "$new_bind" -v /root/uptime-kuma:/app/data louislam/uptime-kuma:1
+      docker run -d --name kuma --restart always -p "$new_bind" -v /root/uptime-kuma:/app/data "${img_name:-louislam/uptime-kuma:1}"
     elif [ "$container_name" = "openlist" ]; then
-      docker run -d --name openlist --restart always -p "$new_bind" -v /root/openlist/data:/opt/openlist/data -e UMASK=022 -e TZ=Asia/Shanghai --user "0:0" openlistteam/openlist:latest
+      docker run -d --name openlist --restart always -p "$new_bind" -v /root/openlist/data:/opt/openlist/data -e UMASK=022 -e TZ=Asia/Shanghai --user "0:0" "${img_name:-openlistteam/openlist:latest}"
+    fi
+  fi
+
+  if [ "$was_in_ua_net" -eq 1 ] || docker_container_exists caddy; then
+    if docker network inspect ua-net >/dev/null 2>&1; then
+      docker network connect ua-net "$container_name" >/dev/null 2>&1 || true
     fi
   fi
   echo -e "${gl_lv}端口安全模式切换完成！当前模式: ${bind_mode_flag}${gl_bai}"
+}
+
+update_panel_container() {
+  local container_name="$1"
+  need_root || return 1
+  docker_require || return 1
+
+  if ! docker_container_exists "$container_name"; then
+    echo "容器 $container_name 尚未安装，请先选择安装。"
+    return 1
+  fi
+
+  local was_in_ua_net=0
+  if docker container inspect --format '{{range $net, $v := .NetworkSettings.Networks}}{{$net}} {{end}}' "$container_name" 2>/dev/null | grep -qw "ua-net"; then
+    was_in_ua_net=1
+  fi
+
+  local compose_file=""
+  for dir in "/root/$container_name" "/root/nginx-proxy-manager" "/root/uptime-kuma" "/root/openlist" "/root/filebrowser" "/root/it-tools"; do
+    if [ -f "$dir/docker-compose.yml" ]; then
+      if grep -q "container_name:[[:space:]]*['\"]*$container_name['\"]*" "$dir/docker-compose.yml" || [ "$dir" = "/root/$container_name" ]; then
+        compose_file="$dir/docker-compose.yml"
+        break
+      fi
+    fi
+  done
+
+  echo -e "${gl_kjlan}正在拉取最新镜像并无损更新容器: ${container_name} ...${gl_bai}"
+  if [ -n "$compose_file" ]; then
+    local compose_dir
+    compose_dir="$(dirname "$compose_file")"
+    if (cd "$compose_dir" && (docker compose pull 2>/dev/null || docker-compose pull) && (docker compose up -d 2>/dev/null || docker-compose up -d)); then
+      echo -e "${gl_lv}✓ Compose 项目 ($container_name) 镜像拉取并重建完成！${gl_bai}"
+    else
+      echo -e "${gl_hong}✗ Compose 更新失败，请检查网络连接。${gl_bai}"
+      return 1
+    fi
+  else
+    local img_name
+    img_name="$(docker container inspect --format '{{.Config.Image}}' "$container_name" 2>/dev/null)"
+    [ -z "$img_name" ] && { echo "无法获取容器镜像名。"; return 1; }
+
+    docker pull "$img_name" || { echo -e "${gl_hong}✗ 镜像拉取失败。${gl_bai}"; return 1; }
+
+    local port_args=()
+    local p_line
+    while IFS= read -r p_line; do
+      [ -n "$p_line" ] && port_args+=("-p" "$p_line")
+    done < <(docker container inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{if $conf}}{{with index $conf 0}}{{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}}{{"\n"}}{{end}}{{end}}{{end}}' "$container_name" 2>/dev/null | sed 's|/tcp$||')
+
+    docker stop "$container_name" >/dev/null 2>&1 || true
+    docker rm "$container_name" >/dev/null 2>&1 || true
+
+    if [ "$container_name" = "it-tools" ]; then
+      [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "127.0.0.1:8080:80")
+      docker run -d --name it-tools --restart unless-stopped "${port_args[@]}" "$img_name"
+    elif [ "$container_name" = "filebrowser" ]; then
+      [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "127.0.0.1:8082:80")
+      docker run -d --name filebrowser --restart unless-stopped -v /:/srv -v /root/filebrowser:/database "${port_args[@]}" "$img_name"
+    elif [ "$container_name" = "kuma" ]; then
+      [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "127.0.0.1:3001:3001")
+      docker run -d --name kuma --restart always "${port_args[@]}" -v /root/uptime-kuma:/app/data "$img_name"
+    elif [ "$container_name" = "openlist" ]; then
+      [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "127.0.0.1:5244:5244" "-p" "127.0.0.1:5245:5245")
+      docker run -d --name openlist --restart always "${port_args[@]}" -v /root/openlist/data:/opt/openlist/data -e UMASK=022 -e TZ=Asia/Shanghai --user "0:0" "$img_name"
+    else
+      local npm_name
+      npm_name="$(npm_container_name)"
+      if [ "$container_name" = "$npm_name" ]; then
+        [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "80:80" "-p" "443:443" "-p" "127.0.0.1:81:81")
+        docker run -d --name "$npm_name" --restart unless-stopped "${port_args[@]}" -v /root/nginx-proxy-manager/data:/data -v /root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt "$img_name"
+      fi
+    fi
+    echo -e "${gl_lv}✓ 容器 ($container_name) 已使用最新镜像重建启动！${gl_bai}"
+  fi
+
+  if [ "$was_in_ua_net" -eq 1 ] || docker_container_exists caddy; then
+    if docker network inspect ua-net >/dev/null 2>&1; then
+      docker network connect ua-net "$container_name" >/dev/null 2>&1 || true
+    fi
+  fi
+  docker image prune -f >/dev/null 2>&1 || true
+  log_action "update panel container $container_name"
 }
 
 
@@ -1558,6 +1705,7 @@ warp_tools_menu() {
 caddy_status() {
   echo -e "${gl_kjlan}Caddy 状态${gl_bai}"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
+  local cfg_file=""
   if docker_container_exists caddy; then
     local _running
     _running="$(docker inspect --format '{{.State.Running}}' caddy 2>/dev/null)"
@@ -1569,15 +1717,33 @@ caddy_status() {
       echo -e "服务状态: ${gl_huang}已停止${gl_bai}"
     fi
     echo "容器名称: caddy"
-    echo "配置文件: /root/caddy/Caddyfile"
+    cfg_file="/root/caddy/Caddyfile"
+    echo "配置文件: $cfg_file"
   elif has_cmd caddy; then
     caddy version 2>/dev/null || true
     echo "部署模式: 原生系统服务"
     echo -n "服务状态: "
     svc_status_short caddy
-    [ -f /etc/caddy/Caddyfile ] && echo "配置文件: /etc/caddy/Caddyfile"
+    if [ -f /etc/caddy/Caddyfile ]; then
+      cfg_file="/etc/caddy/Caddyfile"
+      echo "配置文件: $cfg_file"
+    fi
   else
     echo "Caddy: 未安装"
+  fi
+
+  if [ -n "$cfg_file" ] && [ -f "$cfg_file" ]; then
+    local domains
+    domains="$(grep -E "^[[:space:]]*[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[[:space:]]*\{" "$cfg_file" 2>/dev/null | awk '{print $1}' | tr -d '{')"
+    if [ -n "$domains" ]; then
+      echo -e "${gl_kjlan}已配置反代站点:${gl_bai}"
+      local d up_target
+      while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        up_target="$(caddy_get_domain_upstream "$cfg_file" "$d")"
+        printf "  - ${gl_lv}%-26s${gl_bai} -> ${gl_huang}%s${gl_bai}\n" "$d" "${up_target:-未知}"
+      done <<< "$domains"
+    fi
   fi
 }
 
@@ -1640,6 +1806,84 @@ EOF
 
   echo "Caddy Docker 容器部署完成。"
   echo "配置文件已映射到宿主机: /root/caddy/Caddyfile"
+}
+
+caddy_remove_domain_block() {
+  local cfg_file="$1"
+  local target_domain="$2"
+  local tmp_file="$UA_BOX_TMP_DIR/caddyfile.clean.$$"
+
+  awk -v dom="$target_domain" '
+    BEGIN { skip = 0; depth = 0 }
+    {
+      if (!skip) {
+        line = $0
+        sub(/^[[:space:]]+/, "", line)
+        if (index(line, dom) == 1) {
+          rest = substr(line, length(dom) + 1)
+          if (rest ~ /^[[:space:]]*\{/) {
+            skip = 1
+            depth = 0
+          }
+        }
+      }
+      if (skip) {
+        tmp = $0
+        gsub(/(^|[[:space:]])#.*/, "", tmp)
+        open_c = gsub(/\{/, "{", tmp)
+        close_c = gsub(/\}/, "}", tmp)
+        depth += open_c - close_c
+        if (depth <= 0) {
+          skip = 0
+          depth = 0
+        }
+        next
+      }
+      print $0
+    }
+  ' "$cfg_file" > "$tmp_file" && mv "$tmp_file" "$cfg_file"
+}
+
+caddy_get_domain_upstream() {
+  local cfg_file="$1"
+  local target_domain="$2"
+
+  awk -v dom="$target_domain" '
+    BEGIN { in_block = 0; depth = 0 }
+    {
+      if (!in_block) {
+        line = $0
+        sub(/^[[:space:]]+/, "", line)
+        if (index(line, dom) == 1) {
+          rest = substr(line, length(dom) + 1)
+          if (rest ~ /^[[:space:]]*\{/) {
+            in_block = 1
+            depth = 0
+          }
+        }
+      }
+      if (in_block) {
+        tmp = $0
+        gsub(/(^|[[:space:]])#.*/, "", tmp)
+        if (tmp ~ /(^|[[:space:]])reverse_proxy[[:space:]]+/) {
+          n = split(tmp, arr, /[[:space:]]+/)
+          for (i = 1; i <= n; i++) {
+            if (arr[i] == "reverse_proxy" && i < n) {
+              print arr[i + 1]
+              exit
+            }
+          }
+        }
+        open_c = gsub(/\{/, "{", tmp)
+        close_c = gsub(/\}/, "}", tmp)
+        depth += open_c - close_c
+        if (depth <= 0) {
+          in_block = 0
+          depth = 0
+        }
+      }
+    }
+  ' "$cfg_file"
 }
 
 caddy_add_reverse_proxy() {
@@ -1735,12 +1979,14 @@ caddy_add_reverse_proxy() {
 
   mkdir -p "$(dirname "$cfg_file")"
   touch "$cfg_file"
-  cp "$cfg_file" "${cfg_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+  local bak_file="${cfg_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+  cp "$cfg_file" "$bak_file"
+  prune_old_backups "$(dirname "$cfg_file")" "$(basename "$cfg_file").ua-box.*.bak" "${UA_MAX_BACKUPS:-10}"
 
-  # 清理旧的重复域名配置块，防止 Caddy 报 Ambiguous site definition 错误崩溃
+  # 清理旧的重复域名配置块（支持嵌套花括号块），防止 Caddy 报 Ambiguous site definition 错误崩溃
   if grep -E "^[[:space:]]*${domain}[[:space:]]*\{" "$cfg_file" >/dev/null 2>&1; then
     echo "提示: 检测到 Caddyfile 中已存在 $domain 配置，正在覆写更新..."
-    sed -i "/^[[:space:]]*${domain}[[:space:]]*{/,/}/d" "$cfg_file"
+    caddy_remove_domain_block "$cfg_file" "$domain"
   fi
 
   cat >> "$cfg_file" <<EOF
@@ -1754,14 +2000,53 @@ EOF
   if docker_container_exists caddy; then
     if docker_container_running caddy; then
       docker exec -w /etc/caddy caddy caddy fmt --overwrite Caddyfile 2>/dev/null || true
-      docker restart caddy 2>/dev/null || docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+      if ! docker exec -w /etc/caddy caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+        echo -e "${gl_hong}错误: Caddyfile 语法校验失败，已自动回滚至修改前配置。${gl_bai}"
+        cp "$bak_file" "$cfg_file"
+        return 1
+      fi
+      docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || docker restart caddy 2>/dev/null || true
     fi
   elif has_cmd caddy; then
     caddy fmt --overwrite /etc/caddy/Caddyfile 2>/dev/null || true
-    caddy validate --config /etc/caddy/Caddyfile || return 1
+    if ! caddy validate --config /etc/caddy/Caddyfile; then
+      echo -e "${gl_hong}错误: Caddyfile 语法校验失败，已自动回滚至修改前配置。${gl_bai}"
+      cp "$bak_file" "$cfg_file"
+      return 1
+    fi
     svc reload caddy 2>/dev/null || svc restart caddy 2>/dev/null || true
   fi
   echo "已追加 Caddy 反代配置并重载服务。"
+}
+
+panel_setup_caddy_proxy() {
+  local service_name="$1"
+  local default_port="$2"
+  local container_name="$3"
+  local container_port="${4:-$default_port}"
+
+  local curr_port=""
+  if [ -n "$container_name" ] && docker_container_exists "$container_name"; then
+    curr_port="$(docker container inspect --format "{{(index (index .HostConfig.PortBindings \"${container_port}/tcp\") 0).HostPort}}" "$container_name" 2>/dev/null)"
+  fi
+  curr_port="${curr_port:-$default_port}"
+
+  if caddy_add_reverse_proxy "$curr_port" "$container_name" "$container_port"; then
+    if [ -n "$container_name" ] && docker_container_exists "$container_name"; then
+      local current_ports
+      current_ports="$(docker container inspect "$container_name" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null)"
+      if [[ "$current_ports" != *"127.0.0.1"* ]]; then
+        echo -e "${gl_huang}为了最高安全性，建议防外网扫端口：${gl_bai}"
+        local lock_port
+        read -r -e -p "是否自动收紧端口为 127.0.0.1 (仅保留 Caddy 域名安全访问，禁止公网直连)？[Y/n]: " lock_port
+        lock_port="${lock_port:-Y}"
+        if [[ "$lock_port" =~ ^[Yy]$ ]]; then
+          echo "1" | toggle_container_port_bind "$container_name" "$curr_port" "$container_port" >/dev/null 2>&1 || true
+          echo -e "${gl_lv}✓ 已成功锁定 $container_name 端口至 127.0.0.1 本地防护模式！${gl_bai}"
+        fi
+      fi
+    fi
+  fi
 }
 
 check_and_prompt_caddy_proxy() {
@@ -1775,20 +2060,7 @@ check_and_prompt_caddy_proxy() {
     echo -e "${gl_huang}检测到系统已安装 Caddy 反向代理。${gl_bai}"
     read -r -e -p "是否立刻为 ${service_name} 配置 Caddy 域名反向代理与 HTTPS SSL 证书？[y/N]: " setup_caddy
     if [[ "$setup_caddy" =~ ^[Yy]$ ]]; then
-      caddy_add_reverse_proxy "$target_port" "$container_name" "$container_port"
-      if [ -n "$container_name" ] && docker_container_exists "$container_name"; then
-        local current_ports
-        current_ports="$(docker container inspect "$container_name" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null)"
-        if [[ "$current_ports" != *"127.0.0.1"* ]]; then
-          echo -e "${gl_huang}为了最高安全性，建议防外网扫端口：${gl_bai}"
-          read -r -e -p "是否自动收紧端口为 127.0.0.1 (仅保留 Caddy 域名安全访问，禁止公网直连)？[Y/n]: " lock_port
-          lock_port="${lock_port:-Y}"
-          if [[ "$lock_port" =~ ^[Yy]$ ]]; then
-            echo "1" | toggle_container_port_bind "$container_name" "$target_port" "$container_port" >/dev/null 2>&1 || true
-            echo -e "${gl_lv}✓ 已成功锁定 $container_name 端口至 127.0.0.1 本地防护模式！${gl_bai}"
-          fi
-        fi
-      fi
+      panel_setup_caddy_proxy "$service_name" "$target_port" "$container_name" "$container_port"
     fi
   fi
 }
@@ -1823,7 +2095,7 @@ caddy_delete_reverse_proxy() {
     count=$((count + 1))
     domain_array+=("$d")
     local upstream_target
-    upstream_target="$(sed -n "/^[[:space:]]*${d}[[:space:]]*{/,/}/p" "$cfg_file" | grep "reverse_proxy" | awk '{print $2}')"
+    upstream_target="$(caddy_get_domain_upstream "$cfg_file" "$d")"
     echo -e "  ${count}) ${gl_lv}${d}${gl_bai} -> ${gl_huang}${upstream_target:-未知}${gl_bai}"
   done <<< "$domains"
 
@@ -1849,18 +2121,29 @@ caddy_delete_reverse_proxy() {
   fi
 
   if confirm_danger "删除 Caddy 反代站点规则 $target_domain" "$target_domain"; then
-    cp "$cfg_file" "${cfg_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
-    sed -i "/^[[:space:]]*${target_domain}[[:space:]]*{/,/}/d" "$cfg_file"
+    local bak_file="${cfg_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+    cp "$cfg_file" "$bak_file"
+    prune_old_backups "$(dirname "$cfg_file")" "$(basename "$cfg_file").ua-box.*.bak" "${UA_MAX_BACKUPS:-10}"
+    caddy_remove_domain_block "$cfg_file" "$target_domain"
     echo -e "${gl_lv}已成功删除反代站点 $target_domain 规则。${gl_bai}"
 
     if docker_container_exists caddy; then
       if docker_container_running caddy; then
         docker exec -w /etc/caddy caddy caddy fmt --overwrite Caddyfile 2>/dev/null || true
-        docker restart caddy 2>/dev/null || docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+        if ! docker exec -w /etc/caddy caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+          echo -e "${gl_hong}错误: 删除后 Caddyfile 语法校验失败，已自动回滚。${gl_bai}"
+          cp "$bak_file" "$cfg_file"
+          return 1
+        fi
+        docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || docker restart caddy 2>/dev/null || true
       fi
     elif has_cmd caddy; then
       caddy fmt --overwrite /etc/caddy/Caddyfile 2>/dev/null || true
-      caddy validate --config /etc/caddy/Caddyfile || return 1
+      if ! caddy validate --config /etc/caddy/Caddyfile; then
+        echo -e "${gl_hong}错误: 删除后 Caddyfile 语法校验失败，已自动回滚。${gl_bai}"
+        cp "$bak_file" "$cfg_file"
+        return 1
+      fi
       svc reload caddy 2>/dev/null || svc restart caddy 2>/dev/null || true
     fi
     echo "已重载 Caddy 配置生效。"
@@ -2202,19 +2485,14 @@ npm_tools_menu() {
     echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
     echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
     echo -e "${gl_kjlan}7.   ${gl_bai}删除容器和数据"
+    echo -e "${gl_kjlan}8.   ${gl_bai}一键无损更新镜像版本"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) npm_install; pause ;;
-      2)
-         local port_81
-         port_81="$(docker port "$name" 81/tcp 2>/dev/null | awk -F: '{print $NF}' | head -n 1)"
-         [ -z "$port_81" ] && port_81="81"
-         caddy_add_reverse_proxy "$port_81" "$name" "81"
-         pause
-         ;;
+      2) panel_setup_caddy_proxy "Nginx Proxy Manager" "81" "$name" "81"; pause ;;
       3)
          local port_81
          port_81="$(docker port "$name" 81/tcp 2>/dev/null | awk -F: '{print $NF}' | head -n 1)"
@@ -2242,6 +2520,7 @@ npm_tools_menu() {
         fi
         pause
         ;;
+      8) update_panel_container "$name"; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -2317,13 +2596,14 @@ it_tools_menu() {
     echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
     echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
     echo -e "${gl_kjlan}7.   ${gl_bai}删除容器"
+    echo -e "${gl_kjlan}8.   ${gl_bai}一键无损更新镜像版本"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) it_tools_install; pause ;;
-      2) caddy_add_reverse_proxy "8080"; pause ;;
+      2) panel_setup_caddy_proxy "it-tools" "8080" "it-tools" "80"; pause ;;
       3)
         local curr_port
         curr_port="$(docker container inspect --format '{{(index (index .HostConfig.PortBindings "80/tcp") 0).HostPort}}' it-tools 2>/dev/null)"
@@ -2336,10 +2616,12 @@ it_tools_menu() {
       6) docker_require && docker stop it-tools; pause ;;
       7)
         if confirm_danger "删除 it-tools 容器" "it-tools"; then
-          docker rm -f it-tools
+          docker rm -f it-tools 2>/dev/null || true
+          rm -rf /root/it-tools
         fi
         pause
         ;;
+      8) update_panel_container "it-tools"; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -2422,13 +2704,14 @@ filebrowser_menu() {
     echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
     echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
     echo -e "${gl_kjlan}7.   ${gl_bai}删除容器和配置数据"
+    echo -e "${gl_kjlan}8.   ${gl_bai}一键无损更新镜像版本"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) filebrowser_install; pause ;;
-      2) caddy_add_reverse_proxy "8082"; pause ;;
+      2) panel_setup_caddy_proxy "File Browser" "8082" "filebrowser" "80"; pause ;;
       3)
         local curr_port
         curr_port="$(docker container inspect --format '{{(index (index .HostConfig.PortBindings "80/tcp") 0).HostPort}}' filebrowser 2>/dev/null)"
@@ -2447,6 +2730,7 @@ filebrowser_menu() {
         fi
         pause
         ;;
+      8) update_panel_container "filebrowser"; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -2577,13 +2861,14 @@ openlist_tools_menu() {
     echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
     echo -e "${gl_kjlan}7.   ${gl_bai}获取/重置管理员密码"
     echo -e "${gl_kjlan}8.   ${gl_bai}删除容器和配置数据"
+    echo -e "${gl_kjlan}9.   ${gl_bai}一键无损更新镜像版本"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) openlist_install; pause ;;
-      2) caddy_add_reverse_proxy "5244"; pause ;;
+      2) panel_setup_caddy_proxy "OpenList" "5244" "openlist" "5244"; pause ;;
       3)
         local curr_port
         curr_port="$(docker container inspect --format '{{(index (index .HostConfig.PortBindings "5244/tcp") 0).HostPort}}' openlist 2>/dev/null)"
@@ -2619,6 +2904,7 @@ openlist_tools_menu() {
         fi
         pause
         ;;
+      9) update_panel_container "openlist"; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -2702,13 +2988,14 @@ uptime_kuma_menu() {
     echo -e "${gl_kjlan}5.   ${gl_bai}重启容器"
     echo -e "${gl_kjlan}6.   ${gl_bai}停止容器"
     echo -e "${gl_kjlan}7.   ${gl_bai}删除容器与数据"
+    echo -e "${gl_kjlan}8.   ${gl_bai}一键无损更新镜像版本"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) uptime_kuma_install; pause ;;
-      2) caddy_add_reverse_proxy "3001"; pause ;;
+      2) panel_setup_caddy_proxy "Uptime Kuma" "3001" "kuma" "3001"; pause ;;
       3)
         local curr_port
         curr_port="$(docker container inspect --format '{{(index (index .HostConfig.PortBindings "3001/tcp") 0).HostPort}}' kuma 2>/dev/null)"
@@ -2727,6 +3014,7 @@ uptime_kuma_menu() {
         fi
         pause
         ;;
+      8) update_panel_container "kuma"; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -3483,6 +3771,7 @@ docker_limit_container_logs() {
   if [ -f "$daemon_file" ]; then
     echo "检测到已存在 daemon.json。正在尝试安全合并限制参数..."
     cp "$daemon_file" "${daemon_file}.ua-box.bak.$(date +%Y%m%d-%H%M%S)"
+    prune_old_backups "/etc/docker" "daemon.json.ua-box*" "${UA_MAX_BACKUPS:-10}"
     
     local success=0
     if has_cmd python3; then
@@ -3586,6 +3875,7 @@ docker_setup_ipv6() {
 
   if [ -f "$daemon_file" ]; then
     cp "$daemon_file" "${daemon_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
+    prune_old_backups "/etc/docker" "daemon.json.ua-box*" "${UA_MAX_BACKUPS:-10}"
   fi
 
   if has_cmd jq; then
@@ -4088,6 +4378,14 @@ rclone_mount_systemd() {
     return 1
   fi
 
+  # 自动检查并补全 FUSE 挂载依赖 (fusermount3 / fusermount)
+  if ! has_cmd fusermount3 && ! has_cmd fusermount; then
+    echo -e "${gl_huang}检测到系统缺少 FUSE 挂载组件 (fusermount)，正在自动安装 fuse3/fuse...${gl_bai}"
+    install_pkg fuse3 || install_pkg fuse || {
+      echo -e "${gl_hong}警告: 自动安装 fuse3/fuse 失败，rclone mount 可能会启动失败。${gl_bai}"
+    }
+  fi
+
   # 转换绝对路径
   mkdir -p "$mount_point"
   mount_point="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
@@ -4175,8 +4473,9 @@ rclone_edit_config() {
   fi
 
   echo "正在使用默认编辑器打开配置文件: $config_file"
-  # 安全备份
+  # 安全备份并自动轮转旧备份
   cp "$config_file" "${config_file}.ua-box.bak.$(date +%Y%m%d-%H%M%S)"
+  prune_old_backups "$(dirname "$config_file")" "$(basename "$config_file").ua-box.bak.*" "${UA_MAX_BACKUPS:-10}"
   "${EDITOR:-nano}" "$config_file"
   echo "配置文件已编辑完成。"
 }
@@ -4555,6 +4854,13 @@ system_clean() {
     journalctl --rotate 2>/dev/null || true
     journalctl --vacuum-size=500M 2>/dev/null || true
   fi
+
+  # 自动清理各模块超额历史备份文件
+  prune_old_backups "$UA_BOX_BACKUP_DIR" "ua-box-*.bak" "${UA_MAX_BACKUPS:-10}"
+  prune_old_backups "/etc/ssh" "sshd_config.ua-box.*.bak" "${UA_MAX_BACKUPS:-10}"
+  prune_old_backups "/etc/caddy" "Caddyfile.ua-box.*.bak" "${UA_MAX_BACKUPS:-10}"
+  prune_old_backups "/root/caddy" "Caddyfile.ua-box.*.bak" "${UA_MAX_BACKUPS:-10}"
+  prune_old_backups "/etc/docker" "daemon.json.ua-box*" "${UA_MAX_BACKUPS:-10}"
 }
 
 system_set_shortcut() {
@@ -4687,6 +4993,7 @@ ssh_apply_login_profile() {
   fi
 
   cp /etc/ssh/sshd_config "$backup" || return 1
+  prune_old_backups "/etc/ssh" "sshd_config.ua-box.*.bak" "${UA_MAX_BACKUPS:-10}"
   if ! ssh_set_global_option /etc/ssh/sshd_config PermitRootLogin "$root_login" ||
      ! ssh_set_global_option /etc/ssh/sshd_config PasswordAuthentication "$password_auth" ||
      ! ssh_set_global_option /etc/ssh/sshd_config PubkeyAuthentication yes; then
@@ -4727,10 +5034,49 @@ system_enable_root_password_login() {
   fi
 }
 
+user_has_ssh_pubkey() {
+  local target_user="$1"
+  local home_dir key_file
+  home_dir="$(getent passwd "$target_user" 2>/dev/null | cut -d: -f6)"
+  [ -z "$home_dir" ] && return 1
+  key_file="$home_dir/.ssh/authorized_keys"
+  [ -f "$key_file" ] || return 1
+  grep -Eq '^[[:space:]]*(ssh-rsa|ssh-dss|ecdsa-sha2-nistp[0-9]+|ssh-ed25519|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp[0-9]+@openssh\.com)[[:space:]]+' "$key_file" 2>/dev/null
+}
+
+any_login_user_has_ssh_pubkey() {
+  local u users
+  users="$(awk -F: '($3 == 0 || $3 >= 1000) && $7 !~ /nologin$|false$|sync$/ {print $1}' /etc/passwd 2>/dev/null)"
+  for u in $users; do
+    if user_has_ssh_pubkey "$u"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 system_disable_root_password_login() {
   need_root || return 1
 
   echo "该功能会关闭 root 密码登录，保留普通用户 SSH 密码登录，并保留公钥登录。"
+  if ! user_has_ssh_pubkey root; then
+    local normal_users
+    normal_users="$(awk -F: '$3 >= 1000 && $7 !~ /nologin$|false$|sync$/ {print $1}' /etc/passwd 2>/dev/null)"
+    if [ -z "$normal_users" ]; then
+      echo -e "${gl_hong}⚠️  安全拦截:${gl_bai} 检测到 root 用户尚未配置任何有效的 SSH 公钥，且系统无其他普通登录用户！"
+      echo "若此时关闭 root 密码登录，您将彻底失去 SSH 访问权限。"
+      read -r -e -p "是否现在先为 root 导入 SSH 公钥？[Y/n]: " go_import
+      go_import="${go_import:-Y}"
+      if [[ "$go_import" =~ ^[Yy]$ ]]; then
+        system_import_ssh_key || return 1
+      else
+        echo "已取消操作。"
+        return 1
+      fi
+    else
+      echo -e "${gl_huang}⚠️  警告:${gl_bai} root 尚未配置 SSH 公钥，关闭后需使用普通用户 (${normal_users}) 登录。"
+    fi
+  fi
   if confirm_danger "关闭 ROOT 密码登录，保留普通用户密码登录" "/etc/ssh/sshd_config"; then
     ssh_apply_login_profile "disable root password ssh login" prohibit-password yes
   fi
@@ -4740,6 +5086,19 @@ system_disable_all_password_login() {
   need_root || return 1
 
   echo "该功能会关闭 root 密码登录，并禁用所有用户的 SSH 密码认证，保留公钥登录。"
+  if ! any_login_user_has_ssh_pubkey; then
+    echo -e "${gl_hong}⚠️  高危锁死拦截:${gl_bai} 检测到系统所有可登录用户（含 root）均未配置有效的 SSH 公钥 (authorized_keys)！"
+    echo "若此时禁用所有密码认证，重启 SSH 后您将彻底无法登录服务器！"
+    read -r -e -p "是否现在先导入/安装 SSH 公钥？[Y/n]: " go_import
+    go_import="${go_import:-Y}"
+    if [[ "$go_import" =~ ^[Yy]$ ]]; then
+      system_import_ssh_key || return 1
+      any_login_user_has_ssh_pubkey || return 1
+    else
+      echo "已取消禁用密码登录操作。"
+      return 1
+    fi
+  fi
   if confirm_danger "关闭 ROOT 密码登录并禁用所有密码认证" "/etc/ssh/sshd_config"; then
     ssh_apply_login_profile "disable all ssh password login" prohibit-password no
   fi
@@ -4901,6 +5260,7 @@ system_change_ssh_port() {
 
   backup="/etc/ssh/sshd_config.ua-box.$(date +%Y%m%d-%H%M%S).bak"
   cp /etc/ssh/sshd_config "$backup" || return 1
+  prune_old_backups "/etc/ssh" "sshd_config.ua-box.*.bak" "${UA_MAX_BACKUPS:-10}"
 
   echo "1. 正在通过防火墙放行新端口 ${new_port}/tcp..."
   ssh_allow_port_firewall "$new_port"
@@ -4925,6 +5285,17 @@ system_change_ssh_port() {
     ssh_restart_service >/dev/null 2>&1 || true
     echo -e "${gl_hong}SSH 服务重启失败，已自动回滚备份！${gl_bai}"
     return 1
+  fi
+
+  # 5. 若已配置 Fail2ban jail.local，自动同步更新监控端口
+  if [ -f /etc/fail2ban/jail.local ] && grep -q '^\[sshd\]' /etc/fail2ban/jail.local 2>/dev/null; then
+    local f2b_port_val="ssh"
+    [ "$new_port" != "22" ] && f2b_port_val="ssh,${new_port}"
+    sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port    = ${f2b_port_val}/" /etc/fail2ban/jail.local 2>/dev/null || true
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+      systemctl reload fail2ban >/dev/null 2>&1 || systemctl restart fail2ban >/dev/null 2>&1 || true
+      echo "5. 已同步更新 Fail2ban 防暴破监控端口 (${f2b_port_val})。"
+    fi
   fi
 
   log_action "change ssh port from ${cur_port} to ${new_port}"
@@ -5038,7 +5409,7 @@ system_fail2ban_menu() {
         f2b_status="${gl_huang}未启动 (Inactive)${gl_bai}"
       fi
     else
-      f2b_state="${gl_hui}未安装 (Not Installed)${gl_bai}"
+      f2b_status="${gl_hui}未安装 (Not Installed)${gl_bai}"
     fi
 
     echo -e "Fail2ban 状态: $f2b_status"
@@ -5071,13 +5442,24 @@ system_fail2ban_menu() {
           install_pkg fail2ban || return 1
         fi
         
-        local max_retry ban_time
+        local max_retry ban_time cur_ssh_port f2b_port_val
         read -r -e -p "请输入允许失败的最大次数 (直接回车默认为 5): " max_retry
         max_retry="${max_retry:-5}"
         read -r -e -p "请输入封禁时长 (分钟，直接回车默认为 60 分钟): " ban_time
         ban_time="${ban_time:-60}"
 
+        if ! printf '%s\n' "$max_retry" | grep -Eq '^[0-9]+$' || [ "$max_retry" -lt 1 ] ||
+           ! printf '%s\n' "$ban_time" | grep -Eq '^[0-9]+$' || [ "$ban_time" -lt 1 ]; then
+          echo -e "${gl_hong}错误: 最大失败次数和封禁时长必须为大于 0 的整数！${gl_bai}"
+          pause
+          continue
+        fi
+
         local ban_seconds=$((ban_time * 60))
+        cur_ssh_port="$(ssh_get_current_port)"
+        f2b_port_val="ssh"
+        [ "$cur_ssh_port" != "22" ] && f2b_port_val="ssh,${cur_ssh_port}"
+        mkdir -p "$(dirname "$jail_conf")"
 
         cat > "$jail_conf" <<EOF
 # UA Box 自动生成的 Fail2ban 配置文件
@@ -5089,7 +5471,7 @@ maxretry = ${max_retry}
 
 [sshd]
 enabled = true
-port    = ssh
+port    = ${f2b_port_val}
 filter  = sshd
 logpath = %(sshd_log)s
 backend = %(sshd_backend)s
@@ -5695,8 +6077,21 @@ STATE_FILE="/var/lib/ua-box-limit-shutdown.state"
 mkdir -p "\$(dirname "\$STATE_FILE")"
 today="\$(date +%d)"
 today_full="\$(date +%Y-%m-%d)"
-rx_now="\$(awk '\$1 ~ /^[a-zA-Z0-9_.:-]+:\$/ && \$1 !~ /^lo:/ {rx += \$2} END {print rx+0}' /proc/net/dev)"
-tx_now="\$(awk '\$1 ~ /^[a-zA-Z0-9_.:-]+:\$/ && \$1 !~ /^lo:/ {tx += \$10} END {print tx+0}' /proc/net/dev)"
+read -r rx_now tx_now < <(awk -F'[: ]+' '
+  NR > 2 {
+    iface = \$1
+    if (iface == "") iface = \$2
+    if (iface ~ /^(lo|docker|br-|veth|tun|tap|wg|warp|CloudflareWARP|tailscale|zt)/) next
+    for (i = 1; i <= NF; i++) {
+      if (\$i == iface) {
+        rx += \$(i + 1)
+        tx += \$(i + 9)
+        break
+      }
+    }
+  }
+  END { printf "%.0f %.0f\n", rx+0, tx+0 }
+' /proc/net/dev)
 
 # 首次运行：创建基准状态文件
 if [ ! -f "\$STATE_FILE" ]; then
@@ -6307,6 +6702,30 @@ TCPTUNE
   done
 }
 
+check_docker_public_ports_warning() {
+  has_cmd docker || return 0
+  docker info >/dev/null 2>&1 || return 0
+
+  local exposed_list="" cname cports
+  while IFS=$'\t' read -r cname cports; do
+    [ -z "$cname" ] || [ -z "$cports" ] && continue
+    # 排除反向代理网关自身的 80/443 暴露
+    if [ "$cname" = "caddy" ]; then
+      continue
+    fi
+    if printf '%s' "$cports" | grep -Eq '(0\.0\.0\.0|:::):[0-9]+->'; then
+      exposed_list="${exposed_list}${cname} "
+    fi
+  done < <(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null)
+
+  if [ -n "$exposed_list" ]; then
+    echo -e "${gl_huang}⚠️  安全提醒:${gl_bai} 检测到容器 [ ${gl_lv}${exposed_list}${gl_bai}] 绑定在 0.0.0.0 公网直连。"
+    echo -e "   Docker 默认 iptables 转发规则会绕过 UFW/Firewalld 直接向公网暴露端口。"
+    echo -e "   建议在「ua panel」或「ua docker -> 容器端口安全模式」中切换为 127.0.0.1 本地防扫模式。"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+  fi
+}
+
 system_firewall_menu() {
   need_root || return 1
   local fw choice
@@ -6329,6 +6748,7 @@ system_firewall_menu() {
         echo -e "检测到防火墙工具: ${gl_lv}ufw${gl_bai}"
         echo -e "当前状态: $(ufw status | head -n1)"
         echo -e "${gl_kjlan}------------------------${gl_bai}"
+        check_docker_public_ports_warning
         echo -e "${gl_kjlan}1.  ${gl_bai}查看规则"
         echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
         echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
@@ -6355,7 +6775,16 @@ system_firewall_menu() {
             [ -n "$num" ] && ufw delete "$num"
             pause
             ;;
-          5) need_root && ufw --force enable && log_action "ufw enabled"; pause ;;
+          5)
+            if need_root; then
+              local _cur_ssh_port
+              _cur_ssh_port="$(ssh_get_current_port)"
+              ufw allow "${_cur_ssh_port}/tcp" >/dev/null 2>&1 || true
+              echo -e "${gl_lv}✓ 已自动保底放行当前 SSH 端口 (${_cur_ssh_port}/tcp) 防止失联。${gl_bai}"
+              ufw --force enable && log_action "ufw enabled (auto-allowed ssh port ${_cur_ssh_port}/tcp)"
+            fi
+            pause
+            ;;
           6) need_root && ufw disable && log_action "ufw disabled"; pause ;;
           0) return 0 ;;
           *) echo "无效输入"; pause ;;
@@ -6370,6 +6799,7 @@ system_firewall_menu() {
         echo -e "检测到防火墙工具: ${gl_lv}firewalld${gl_bai}"
         echo -e "当前状态: $(firewall-cmd --state 2>/dev/null)"
         echo -e "${gl_kjlan}------------------------${gl_bai}"
+        check_docker_public_ports_warning
         echo -e "${gl_kjlan}1.  ${gl_bai}查看开放端口"
         echo -e "${gl_kjlan}2.  ${gl_bai}放行端口（TCP）"
         echo -e "${gl_kjlan}3.  ${gl_bai}放行端口（UDP）"
@@ -6537,6 +6967,22 @@ installed_status() {
   local cmd="$1"
   if has_cmd "$cmd"; then
     echo -e "${gl_lv}已安装${gl_bai}"
+  else
+    echo -e "${gl_hui}未安装${gl_bai}"
+  fi
+}
+
+caddy_installed_status() {
+  if docker_container_exists caddy; then
+    if docker_container_running caddy; then
+      echo -e "${gl_lv}已安装 (Docker 容器: 运行中)${gl_bai}"
+    else
+      echo -e "${gl_huang}已安装 (Docker 容器: 已停止)${gl_bai}"
+    fi
+  elif has_cmd caddy; then
+    local _st
+    _st="$(svc_status_short caddy)"
+    echo -e "${gl_lv}已安装 (原生服务: ${_st})${gl_bai}"
   else
     echo -e "${gl_hui}未安装${gl_bai}"
   fi
@@ -6768,10 +7214,395 @@ ua_abnormal_summary() {
     fi
   fi
 
+  if has_cmd openssl; then
+    local cert_dir crt_file expiring_certs=""
+    for cert_dir in "/root/caddy_data/caddy/certificates" "/var/lib/caddy/.local/share/caddy/certificates"; do
+      [ -d "$cert_dir" ] || continue
+      while IFS= read -r crt_file; do
+        [ -z "$crt_file" ] || [ ! -f "$crt_file" ] && continue
+        if ! openssl x509 -checkend 604800 -noout -in "$crt_file" >/dev/null 2>&1; then
+          expiring_certs="${expiring_certs}$(basename "$crt_file" .crt) "
+        fi
+      done < <(find "$cert_dir" -type f -name "*.crt" 2>/dev/null)
+    done
+    if [ -n "$expiring_certs" ]; then
+      echo "- SSL 证书即将过期 (<7天) 或已过期: $expiring_certs"
+      echo "  建议: 检查域名 DNS 解析是否仍指向本机，并在「ua panel -> Caddy」中重载服务触发续期。"
+      found=1
+    fi
+  fi
+
+  _UA_LAST_ABNORMAL_FOUND="$found"
   [ "$found" -eq 0 ] && echo "- 暂无明显异常。"
+  return 0
+}
+
+ua_send_notification() {
+  local title="$1"
+  local body="$2"
+  local full_text sent_any=0
+
+  full_text="【${title}】
+主机: $(hostname 2>/dev/null || echo 'unknown')
+时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
+------------------------
+${body}"
+
+  if [ -n "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -n "${UA_NOTIFY_TG_CHAT_ID:-}" ]; then
+    if curl -fsSL --max-time 15 -X POST "https://api.telegram.org/bot${UA_NOTIFY_TG_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${UA_NOTIFY_TG_CHAT_ID}" \
+      --data-urlencode "text=${full_text}" >/dev/null 2>&1; then
+      echo -e "${gl_lv}✓ Telegram 告警消息推送成功。${gl_bai}"
+      sent_any=1
+    else
+      echo -e "${gl_hong}✗ Telegram 告警消息推送失败，请检查 Bot Token / Chat ID 或网络。${gl_bai}"
+    fi
+  fi
+
+  if [ -n "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
+    local escaped_json
+    escaped_json="$(printf '%s' "$full_text" | awk '
+      BEGIN { ORS="" }
+      {
+        gsub(/\\/, "\\\\")
+        gsub(/"/, "\\\"")
+        gsub(/\t/, "\\t")
+        gsub(/\r/, "")
+        if (NR > 1) printf "\\n"
+        printf "%s", $0
+      }
+    ')"
+    local payload="{\"msgtype\":\"text\",\"text\":{\"content\":\"${escaped_json}\"},\"content\":\"${escaped_json}\",\"title\":\"${title}\",\"body\":\"${escaped_json}\"}"
+    if curl -fsSL --max-time 15 -X POST "$UA_NOTIFY_WEBHOOK_URL" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null 2>&1; then
+      echo -e "${gl_lv}✓ Webhook 告警消息推送成功。${gl_bai}"
+      sent_any=1
+    else
+      echo -e "${gl_hong}✗ Webhook 告警消息推送失败，请检查 Webhook URL。${gl_bai}"
+    fi
+  fi
+
+  if [ "$sent_any" -eq 0 ]; then
+    if [ -z "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -z "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
+      echo -e "${gl_huang}提示: 尚未配置 Telegram Bot 或 Webhook 告警渠道（可通过 ua notify 配置）。${gl_bai}"
+    fi
+    return 1
+  fi
+  log_action "notification sent: $title"
+  return 0
+}
+
+ua_status_notify() {
+  local force_test="${1:-}"
+  if [ "$force_test" = "--test" ] || [ "$force_test" = "test" ]; then
+    ua_send_notification "UA Box 告警通道测试" "这是一条来自 UA Box v${UA_BOX_VERSION} 的测试通知，您的告警推送配置工作正常！"
+    return $?
+  fi
+
+  local summary_file="$UA_BOX_TMP_DIR/ua-abnormal-notify.$$"
+  _UA_LAST_ABNORMAL_FOUND=0
+  ua_abnormal_summary > "$summary_file" 2>&1
+
+  # 去除 ANSI 颜色控制符与首行标题
+  local clean_summary
+  clean_summary="$(sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$summary_file" | grep -v '^异常汇总$' | grep -v '^检测 .* 个 rclone remote')"
+  rm -f "$summary_file"
+
+  if printf '%s\n' "$clean_summary" | grep -q "暂无明显异常"; then
+    echo "巡检完成：当前系统无明显异常，无需发送告警。"
+    return 0
+  fi
+
+  echo "检测到系统异常，正在触发告警推送..."
+  printf '%s\n' "$clean_summary"
+  ua_send_notification "UA Box 状态巡检异常告警" "$clean_summary"
+}
+
+ua_notify_menu() {
+  while true; do
+    clear
+    local tg_stat wh_stat cron_stat choice
+    if [ -n "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -n "${UA_NOTIFY_TG_CHAT_ID:-}" ]; then
+      tg_stat="${gl_lv}已配置 (Chat ID: ${UA_NOTIFY_TG_CHAT_ID})${gl_bai}"
+    else
+      tg_stat="${gl_hui}未配置${gl_bai}"
+    fi
+    if [ -n "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
+      wh_stat="${gl_lv}已配置${gl_bai}"
+    else
+      wh_stat="${gl_hui}未配置${gl_bai}"
+    fi
+    if crontab -l 2>/dev/null | grep -q "status --notify"; then
+      cron_stat="${gl_lv}已开启 ($(crontab -l 2>/dev/null | grep 'status --notify' | head -n1))${gl_bai}"
+    else
+      cron_stat="${gl_hui}未开启${gl_bai}"
+    fi
+
+    echo -e "${gl_kjlan}状态巡检主动告警推送 (Telegram / Webhook)${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "Telegram Bot:  ${tg_stat}"
+    echo -e "Webhook 通知:  ${wh_stat}"
+    echo -e "定时自动巡检:  ${cron_stat}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.  ${gl_bai}配置 Telegram Bot (Token & Chat ID)"
+    echo -e "${gl_kjlan}2.  ${gl_bai}配置通用 Webhook URL (兼容企微/飞书/钉钉/Discord/Bark)"
+    echo -e "${gl_kjlan}3.  ${gl_bai}发送测试告警通知"
+    echo -e "${gl_kjlan}4.  ${gl_bai}立即执行一次异常巡检并推送 (ua status --notify)"
+    echo -e "${gl_kjlan}5.  ${gl_bai}开启 Cron 定时自动巡检告警 (每 30 分钟)"
+    echo -e "${gl_kjlan}6.  ${gl_bai}关闭 Cron 定时自动巡检告警"
+    echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1)
+        local token chat_id
+        read -r -e -p "请输入 Telegram Bot Token (留空清除): " token
+        read -r -e -p "请输入 Telegram Chat ID (留空清除): " chat_id
+        config_set_var "UA_NOTIFY_TG_BOT_TOKEN" "$token"
+        config_set_var "UA_NOTIFY_TG_CHAT_ID" "$chat_id"
+        echo -e "${gl_lv}Telegram 告警配置已保存。${gl_bai}"
+        pause
+        ;;
+      2)
+        local wh_url
+        read -r -e -p "请输入 Webhook URL (留空清除): " wh_url
+        config_set_var "UA_NOTIFY_WEBHOOK_URL" "$wh_url"
+        echo -e "${gl_lv}Webhook 告警配置已保存。${gl_bai}"
+        pause
+        ;;
+      3)
+        ua_status_notify --test
+        pause
+        ;;
+      4)
+        ua_status_notify
+        pause
+        ;;
+      5)
+        need_root || { pause; continue; }
+        local ua_bin="/usr/local/bin/ua"
+        [ ! -x "$ua_bin" ] && ua_bin="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+        (crontab -l 2>/dev/null | grep -v "status --notify"; echo "*/30 * * * * $ua_bin status --notify >/dev/null 2>&1") | crontab -
+        log_action "enable cron status --notify (every 30m)"
+        echo -e "${gl_lv}✓ 已开启每 30 分钟自动异常巡检与告警推送。${gl_bai}"
+        pause
+        ;;
+      6)
+        need_root || { pause; continue; }
+        crontab -l 2>/dev/null | grep -v "status --notify" | crontab - 2>/dev/null || true
+        log_action "disable cron status --notify"
+        echo -e "${gl_huang}已关闭定时自动巡检告警。${gl_bai}"
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+ua_export_bundle() {
+  need_root || return 1
+  mkdir -p "$UA_BOX_BACKUP_DIR"
+
+  local rclone_dest="${1:-}"
+  local items=()
+  local candidate
+  local rclone_cfg=""
+  if has_cmd rclone; then
+    rclone_cfg="$(rclone_config_file_path 2>/dev/null)"
+  fi
+
+  for candidate in \
+    "$UA_BOX_CONFIG" \
+    "/etc/caddy/Caddyfile" \
+    "/root/caddy" \
+    "/root/caddy_data" \
+    "/root/caddy_config" \
+    "/root/openlist" \
+    "/root/filebrowser" \
+    "/root/uptime-kuma" \
+    "/root/nginx-proxy-manager" \
+    "/root/it-tools" \
+    "$rclone_cfg"; do
+    [ -z "$candidate" ] && continue
+    if [ -e "$candidate" ]; then
+      items+=("${candidate#/}")
+    fi
+  done
+
+  # 附加 systemd rclone-mount 服务文件
+  local svc_file
+  for svc_file in /etc/systemd/system/rclone-mount-*.service; do
+    [ -f "$svc_file" ] && items+=("${svc_file#/}")
+  done
+
+  if [ "${#items[@]}" -eq 0 ]; then
+    echo "未找到可导出的面板配置或数据目录。"
+    return 1
+  fi
+
+  local host_tag archive_name archive_path
+  host_tag="$(hostname 2>/dev/null | tr -cd 'a-zA-Z0-9-' || echo 'server')"
+  [ -z "$host_tag" ] && host_tag="server"
+  archive_name="ua-migration-${host_tag}-$(date '+%Y%m%d-%H%M%S').tar.gz"
+  archive_path="$UA_BOX_BACKUP_DIR/$archive_name"
+
+  echo -e "${gl_kjlan}正在打包以下配置与面板数据目录：${gl_bai}"
+  local it
+  for it in "${items[@]}"; do
+    echo "  - /$it"
+  done
+
+  if tar --exclude='*.bak*' -czf "$archive_path" -C / "${items[@]}" 2>/dev/null; then
+    prune_old_backups "$UA_BOX_BACKUP_DIR" "ua-migration-*.tar.gz" "${UA_MAX_BACKUPS:-10}"
+    log_action "export migration bundle $archive_path"
+    local size_str
+    size_str="$(du -h "$archive_path" 2>/dev/null | awk '{print $1}')"
+    echo -e "${gl_lv}✓ 导出成功！归档文件: ${archive_path} (${size_str:-未知大小})${gl_bai}"
+  else
+    echo -e "${gl_hong}✗ 打包归档失败！${gl_bai}"
+    rm -f "$archive_path"
+    return 1
+  fi
+
+  # 支持命令行直接指定 rclone 目标或交互式询问上传
+  if [ -n "$rclone_dest" ]; then
+    rclone_require || return 1
+    echo "正在通过 rclone 上传备份至 ${rclone_dest} ..."
+    rclone copy "$archive_path" "$rclone_dest" -P && echo -e "${gl_lv}✓ 已上传至远程网盘: ${rclone_dest}${gl_bai}"
+    return $?
+  fi
+
+  if [ -t 0 ] && has_cmd rclone; then
+    local remotes_list=()
+    mapfile -t remotes_list < <(rclone listremotes 2>/dev/null | sed 's/:$//')
+    if [ "${#remotes_list[@]}" -gt 0 ]; then
+      echo ""
+      read -r -e -p "检测到已配置 rclone 远程网盘，是否同时将备份包上传至云端？[y/N]: " up_cloud
+      if [[ "$up_cloud" =~ ^[Yy]$ ]]; then
+        local sel_remote
+        sel_remote="$(select_with_fzf_or_menu '选择要上传到的 rclone remote' "${remotes_list[@]}")"
+        if [ -n "$sel_remote" ]; then
+          local remote_dir="ua-box-backups"
+          read -r -e -p "请输入远程目录名 (默认 ua-box-backups): " input_rdir
+          remote_dir="${input_rdir:-ua-box-backups}"
+          echo "正在上传到 ${sel_remote}:${remote_dir} ..."
+          if rclone copy "$archive_path" "${sel_remote}:${remote_dir}" -P; then
+            log_action "upload migration bundle to ${sel_remote}:${remote_dir}"
+            echo -e "${gl_lv}✓ 已成功上传到远程网盘: ${sel_remote}:${remote_dir}/${archive_name}${gl_bai}"
+          else
+            echo -e "${gl_hong}✗ 上传至远程网盘失败。${gl_bai}"
+          fi
+        fi
+      fi
+    fi
+  fi
+}
+
+ua_import_bundle() {
+  need_root || return 1
+  local archive_path="${1:-}"
+
+  if [ -z "$archive_path" ]; then
+    local local_bundles=()
+    local f
+    while IFS= read -r f; do
+      [ -n "$f" ] && [ -f "$f" ] && local_bundles+=("$f")
+    done < <(ls -1td "$UA_BOX_BACKUP_DIR"/ua-migration-*.tar.gz 2>/dev/null)
+
+    if [ "${#local_bundles[@]}" -gt 0 ]; then
+      echo -e "${gl_kjlan}检测到本地有以下迁移备份包：${gl_bai}"
+      local idx=1
+      for f in "${local_bundles[@]}"; do
+        echo "  ${idx}) $(basename "$f") ($(du -h "$f" 2>/dev/null | awk '{print $1}'))"
+        idx=$((idx + 1))
+      done
+      echo "  m) 手动输入归档文件完整路径"
+      echo "  0) 取消"
+      local sel
+      read -r -e -p "请选择要恢复的备份序号或输入 m: " sel
+      if [ -z "$sel" ] || [ "$sel" = "0" ]; then
+        echo "已取消。"
+        return 0
+      elif [ "$sel" = "m" ] || [ "$sel" = "M" ]; then
+        read -r -e -p "请输入 .tar.gz 备份包完整路径: " archive_path
+      elif printf '%s\n' "$sel" | grep -Eq '^[0-9]+$' && [ "$sel" -ge 1 ] && [ "$sel" -le "${#local_bundles[@]}" ]; then
+        archive_path="${local_bundles[$((sel - 1))]}"
+      else
+        echo "无效选择。"
+        return 1
+      fi
+    else
+      read -r -e -p "请输入要恢复的 .tar.gz 备份包完整路径 (回车取消): " archive_path
+    fi
+  fi
+
+  [ -z "$archive_path" ] && echo "已取消。" && return 0
+  if [ ! -f "$archive_path" ]; then
+    echo -e "${gl_hong}错误: 备份文件不存在: $archive_path${gl_bai}"
+    return 1
+  fi
+
+  if ! tar -tzf "$archive_path" >/dev/null 2>&1; then
+    echo -e "${gl_hong}错误: 归档文件损坏或不是有效的 tar.gz 格式！${gl_bai}"
+    return 1
+  fi
+
+  echo -e "${gl_kjlan}归档包含以下顶层目录/文件：${gl_bai}"
+  tar -tzf "$archive_path" 2>/dev/null | awk -F/ '{print "  - /" $1 ($2 ? "/" $2 : "")}' | sort -u | head -n 20
+
+  if confirm_danger "解压并覆盖恢复面板配置与数据目录" "$archive_path"; then
+    if tar -xzf "$archive_path" -C /; then
+      # 重新加载配置与 systemd
+      # shellcheck disable=SC1090
+      [ -f "$UA_BOX_CONFIG" ] && . "$UA_BOX_CONFIG"
+      has_cmd systemctl && systemctl daemon-reload 2>/dev/null || true
+      log_action "import migration bundle $archive_path"
+      echo -e "${gl_lv}✓ 面板配置与数据已成功恢复！${gl_bai}"
+      echo "提示: 若恢复了 Docker Compose 面板目录，可进入「ua docker -> 8」或「ua panel」一键启动对应服务。"
+    else
+      echo -e "${gl_hong}✗ 解压恢复过程中发生错误。${gl_bai}"
+      return 1
+    fi
+  fi
+}
+
+ua_migration_menu() {
+  while true; do
+    clear
+    echo -e "${gl_kjlan}面板配置与数据一键迁移 / 备份中心${gl_bai}"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo "自动涵盖: UA Box 配置、Caddy 配置与证书、OpenList、File Browser、"
+    echo "          Uptime Kuma、NPM、it-tools、rclone.conf 及挂载守护服务。"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    echo -e "${gl_kjlan}1.  ${gl_bai}一键打包导出全部配置与数据 (支持联动上传 Rclone 网盘)"
+    echo -e "${gl_kjlan}2.  ${gl_bai}从备份归档一键恢复配置与数据"
+    echo -e "${gl_kjlan}3.  ${gl_bai}查看本地已导出的迁移归档列表"
+    echo -e "${gl_kjlan}0.  ${gl_bai}返回"
+    echo -e "${gl_kjlan}------------------------${gl_bai}"
+    local choice
+    read -r -e -p "请输入你的选择: " choice || break
+
+    case "$choice" in
+      1) ua_export_bundle; pause ;;
+      2) ua_import_bundle; pause ;;
+      3)
+        ls -lh "$UA_BOX_BACKUP_DIR"/ua-migration-*.tar.gz 2>/dev/null || echo "暂无已导出的迁移归档包。"
+        pause
+        ;;
+      0) break ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
 }
 
 ua_status() {
+  if [ "${1:-}" = "--notify" ] || [ "${1:-}" = "-n" ]; then
+    ua_status_notify
+    return $?
+  fi
   clear
   echo -e "${gl_kjlan}UA Box 状态检查${gl_bai}"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -6788,7 +7619,7 @@ ua_status() {
   echo -e "${gl_kjlan}rclone:       ${gl_bai}$(installed_status rclone)"
   echo -e "${gl_kjlan}curl:         ${gl_bai}$(installed_status curl)"
   echo -e "${gl_kjlan}wget:         ${gl_bai}$(installed_status wget)"
-  echo -e "${gl_kjlan}Caddy:        ${gl_bai}$(installed_status caddy)"
+  echo -e "${gl_kjlan}Caddy:        ${gl_bai}$(caddy_installed_status)"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
   ua_abnormal_summary
   echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -7013,6 +7844,8 @@ ua_settings_menu() {
     echo -e "${gl_kjlan}--------------------[ 系统管理与更新 ]----------------------${gl_bai}"
     echo -e "  ${gl_kjlan}8.  ${gl_bai}异常忽略管理"
     echo -e "  ${gl_kjlan}9.  ${gl_bai}检查与更新脚本 (支持 Git/配置URL/自定义URL)"
+    echo -e "  ${gl_kjlan}10. ${gl_bai}状态巡检主动告警推送 (Telegram / Webhook)"
+    echo -e "  ${gl_kjlan}11. ${gl_bai}面板配置与数据一键迁移 / 备份中心"
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
     echo -e "  ${gl_hong}0.  ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
@@ -7053,6 +7886,8 @@ ua_settings_menu() {
         ;;
       8) ua_ignore_menu ;;
       9) update_self; pause ;;
+      10) ua_notify_menu ;;
+      11) ua_migration_menu ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -7066,8 +7901,13 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
 用法:
   ua                     打开交互面板
   ua ps                  显示系统信息
+  ua top                 打开动态 Live 实时系统监控控制台
+  ua fzf                 打开 fzf 全功能交互式模糊搜索导航面板
   ua sys                 打开系统工具
-  ua ssh                 打开 SSH 登录安全菜单
+  ua ssh                 打开 SSH 登录安全与防暴破菜单
+  ua ssh-port            修改 SSH 监听端口
+  ua ssh-key             导入/安装 SSH 密钥公钥
+  ua f2b                 打开 Fail2ban 防暴破管理
   ua disable-root-pass   关闭 root 密码登录，保留普通用户密码登录
   ua disable-password    禁用所有 SSH 密码认证
   ua enable-root-pass    临时开启 root 密码登录
@@ -7076,16 +7916,23 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua clean               系统清理
   ua tools               打开常用工具菜单
   ua panel               打开面板工具
+  ua fb                  打开 File Browser 文件浏览器管理
+  ua ol                  打开 OpenList 网盘系统管理
 
   ua docker              打开 Docker 管理
   ua work                打开工作区模块
   ua rclone              打开 rclone 管理
   ua test                打开测试脚本菜单
   ua status              显示状态检查
+  ua status --notify     执行异常巡检并在发现异常时推送告警
+  ua notify              打开状态巡检告警推送配置菜单
+  ua export [remote:dir] 一键打包导出面板配置与数据（可选直接上传 rclone）
+  ua import [file.tar.gz] 从迁移归档包恢复面板配置与数据
   ua ignore              打开异常忽略管理
   ua ignore current      将当前异常项加入忽略列表
   ua ignore rclone <name> 忽略指定 rclone remote 异常
   ua unignore rclone <name> 取消忽略指定 rclone remote
+  ua settings            打开 UA Box 设置菜单
   ua config              编辑配置文件
   ua log                 查看最近日志
   ua backup              备份当前脚本
@@ -7209,7 +8056,26 @@ case "${1:-}" in
     test_scripts_menu
     ;;
   status|状态)
-    ua_status
+    shift
+    ua_status "$@"
+    ;;
+  notify|alert|告警)
+    shift
+    if [ "${1:-}" = "test" ] || [ "${1:-}" = "--test" ]; then
+      ua_status_notify --test
+    elif [ "${1:-}" = "run" ] || [ "${1:-}" = "check" ]; then
+      ua_status_notify
+    else
+      ua_notify_menu
+    fi
+    ;;
+  export|导出|迁移导出)
+    shift
+    ua_export_bundle "$@"
+    ;;
+  import|导入|迁移恢复)
+    shift
+    ua_import_bundle "$@"
     ;;
   ignore|忽略)
     shift
