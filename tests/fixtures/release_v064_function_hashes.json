@@ -1,0 +1,83 @@
+{
+  "baseline": "af8fe36be99e0eb38d70525b2b7f03f84a5f37c1",
+  "functions": {
+    "ask_deploy_mode": "cd8fbba1443ef0c6b8eeab0b20d9f965bbddb6e94bbc40dd3a4406ce61fe9b2d",
+    "ask_port_bind_ip": "b97ff858f02c87c14b4a8f3a3adf37e1f379beb33ee0e5f7eec95579e66536cc",
+    "caddy_add_reverse_proxy": "035fa645cd00a95b6e62c5774079afa55cfd11b778980110136dfe2ce2f2ac0e",
+    "caddy_delete_reverse_proxy": "0680a9b533be819ad0c4ebadab64f187cee12957f3be6dc2d0a97dfc1b52b0fd",
+    "caddy_docker_install": "0d2874758676cd5846fea6fc3bfe089a139668eb831dd4b21c8bca353a3d90e2",
+    "caddy_get_domain_upstream": "b1c625500eea926eec047b8836be425850de2034ced15e83c07198615349b686",
+    "caddy_installed_status": "098d8260f7abdf0eb7e174aa7ae92ed1fa2a0296d499e6df7e0eda5e8c68ba70",
+    "caddy_remove_domain_block": "d50e5be4f0693cc88c204c4a1d08ec879e6a58aa5c140e77eb6f902a1b0a2b21",
+    "caddy_status": "94d8ba7ec308eec2fcefcdf2fae421a83feba70933fce9285baf3c6ab83325d4",
+    "caddy_tools_menu": "ccb61548a279cc5b10e421dc16cc866ba2381d2241c09a167a4c9d1a8845fb9e",
+    "caddy_uninstall": "08e4db9677c692da96ee24b797fedefc7503bb858a8b88cf9f02bb04ed73f593",
+    "check_and_prompt_caddy_proxy": "dd193872861c5a191cc929aca034e699b31e4c2a3332fd416f51876a1e780e59",
+    "docker_compose_menu": "6fbbd88a9310e0e2720732f25ad13e96c12ada1a50b94ab11cb18cfe1b0b92d5",
+    "docker_compose_project_control": "ec50329990431d08ed3f520930167fa5f35581e2aff2a7b27b34412b78affec4",
+    "docker_compose_run": "c59723e2c6e1940e5ce01c2bc82084c7f9737f8a2dbf1bf2b1df78ae9ff4b507",
+    "docker_container_action": "7eab43b0190ed64fbeace18513f4fac266979beb3efb5bc5fb56ecb41cd7bdd7",
+    "docker_container_all_action": "6a021184ead64329f6576a40b63e82a8819c5368f5ffbbcef3b56935a31bad68",
+    "docker_container_create": "f4934c5081517ee9812a684a2d9a11e0304d8b8ec8f666fa23dba0c47c0634cb",
+    "docker_container_exists": "5876aa70cc66294a30d7b60c48761a8c38bf05d13a370480910cfb3c867dc6e0",
+    "docker_container_list": "3caa4c0075dc9274111b9ac304f61b80e6d720ac978f03a025d2ee602e350fe0",
+    "docker_container_logs": "5ff5a1df372551aea393e639f375d73efa8ec45bdb8dd771de8ec3b580ba9112",
+    "docker_container_menu": "91027d18fdc2124a154241db750cb878213afce87d949ca8d0e7b0ee765a482a",
+    "docker_container_network_overview": "d6ae98d856344cfcfa37eaf209af0d04cfdc69280bb90ce385efd197d8d9f2b7",
+    "docker_container_port_access": "84c55b5232a65f6c537f7e7d71d1246c9121da153096e35df515cc99ac8732ec",
+    "docker_container_rename": "2e5cd1895f46f81792594e2750d19044596bf3114e73100b3c5c0ccd1be35354",
+    "docker_container_running": "69588fc389f53ccb8cc06c905f6e0f379681544ed48b4453e69740a9d21a70e5",
+    "docker_container_shell": "cfc7a0755c3e2a445cc76050cf66f9c1fa79f66b9a9276cbcf156851750e6f87",
+    "docker_container_stats_once": "3056de986c08580dd3e8edd369fa22833771bfa6da785dd55f25fc58e2513c00",
+    "docker_container_status": "91b62a8633a3834c93f6f224e6953508570ebb6fc637b07fc88f9a4aef2ddf2f",
+    "docker_daemon_status": "ea1033329f043cb27819ea06b562aa5d2379372f6a228c97d2a2435ecc06687d",
+    "docker_edit_daemon": "5f063e0f89b5c04719bd876f0a4d72c5c19f1e6656ebed5fe8d404b7bb86f54e",
+    "docker_global_status": "5c35666f988a4911c14146e15887bcd061d6da7c4619d616477a010dd610c1c2",
+    "docker_limit_container_logs": "f220d7d11034b403442ea100deec3905acec94ce25b99145c5736d10f042d30b",
+    "docker_menu": "46cf1b118e9953cfdf5d497c57670502118b6047683d69fe29a06eda1714ea07",
+    "docker_network_menu": "8ee0fa14125d32c1e3907ac8909c6ffde8a4841650e4e6f5fcee961abc39c27c",
+    "docker_require": "946ec3ac018c8c98cffd2f6066e0256521d3c7e38a0fe2284cfe6765a2e3b8bd",
+    "docker_setup_ipv6": "fe00488664642a7519d985143cec865c3d446037e2d6694b084755cc00b1cc6b",
+    "docker_uninstall": "0301a3ec52899b5fbe09561d68eb2aa5ad1b669de1c5e7263e973b53e4b0165d",
+    "docker_volume_menu": "76e214a6ea3b4eebfddc383b6a6ee57b04dff043b05277146f96d27542d8b0de",
+    "filebrowser_install": "ebb44d01a8ebb80db4702ab877efaa204318018ea7c7f97ea7f2d05d842a350e",
+    "filebrowser_menu": "cfe26f4b4d0cdf0ed1639c1761ff0fc9c36b3895f2c72853a896372ca8ba729f",
+    "install_docker": "a2cc61ac4a7e91c17bd4743e5bbb215b0cd9a4475d3d2fe34aeeb912c1f6e58d",
+    "it_tools_install": "0382c966db008a83e85726916c4e8fdaff2e371f6766037d5cc12e45e8e2418d",
+    "it_tools_menu": "0fca61a432e207203d69e7b62df8c6c128c8585d29c87f0c613e45d02247941e",
+    "npm_container_name": "b54b102e70bb8f935c85f81acb466188215e4a2f07e9f7fe64167e1da8a8835b",
+    "npm_install": "e9eabb551eb17f5a75be0dd968a8b4093a8c08a7f1ff4117601da26dfa4bc2a3",
+    "npm_tools_menu": "b0de06620e44b3c86f854ac43b53ee40eee8ef61ffb10467c890ebd4f58eed8c",
+    "openlist_install": "b8fd9465065609bab50e3f341d36ff795362baaea8b97ce79277ecf9ae667021",
+    "openlist_tools_menu": "b561608f5b9af3694be4d525e5d7d057dba68a98c838cd3c5296ad8e713e9099",
+    "panel_setup_caddy_proxy": "4ae4d162752774f1f61eeefe77bc78171a47bda28568fc33df0923b0c1a66af4",
+    "panel_status_overview": "500dec09d702217a601ff320c99efc5fb7957c40ac2fc6f0e9156e3e82197383",
+    "panel_tools_menu": "c4258246ec89ff96f98a3202d4a230161332a2317f4db46b0420dfc7002ec187",
+    "toggle_container_port_bind": "eff2bed904a12d2e2318b95372bd8e665e9c0d0416a0d236a7afaee1cf8d9e61",
+    "ua_export_bundle": "3569a8d55fbc292319d63714425daea9058c56b794e10f8a268348518efcae47",
+    "ua_import_bundle": "c7e52386432f604c1586a3380f10deb9f8b3a252b0109dfa7d241e3cee63d3f0",
+    "ua_migration_menu": "a28d914b84218a7f312acb48556100f5293dabe77dd6e0a4076e97ec33975e7f",
+    "update_panel_container": "9d3773879ac123764d9d5a50b4fca0cda8affea429984a1b410b5aae555f558b",
+    "uptime_kuma_install": "8ac27cb9f6def870270c3841ce9ad2fd3f09ee51edab9e4c0aaf4c2e3344ed3c",
+    "uptime_kuma_menu": "c88730c361c2cf94130bff8962516ce1df0c525eb8905b4f3eeedc3ef5c6705d"
+  },
+  "normalization": {
+    "baseline_expression": "$container_name['\\\"]*",
+    "functions": [
+      "toggle_container_port_bind",
+      "update_panel_container"
+    ],
+    "reason": "Only braces around the scalar container_name expansion; resolves baseline ShellCheck SC1087 without importing recovery changes.",
+    "release_expression": "${container_name}['\\\"]*"
+  },
+  "sections": {
+    "docker_container_exists": {
+      "end": "tmux_require",
+      "sha256": "368cdbec4581ce0ecc2a37ce4b231b6ea0e94ab02586dcdf2cef88e5d1b917ac"
+    },
+    "ua_export_bundle": {
+      "end": "ua_ignore_add",
+      "sha256": "034dc6b4152ff9f67f19a7d39a506e167a5165826ddb9f3a7efb8747ee989c2c"
+    }
+  }
+}

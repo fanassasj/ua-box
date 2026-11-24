@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-UA_BOX_VERSION="0.6.4"
+UA_BOX_VERSION="0.6.5"
 UA_BOX_NAME="UA Box"
 SCRIPT_REAL_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 UA_BOX_HOME="$(cd "$(dirname "$SCRIPT_REAL_PATH")" && pwd)"
@@ -8,8 +8,22 @@ UA_BOX_CONFIG="${UA_BOX_CONFIG:-$UA_BOX_HOME/config}"
 UA_BOX_LOG_DIR="${UA_BOX_LOG_DIR:-$UA_BOX_HOME/logs}"
 UA_BOX_LOG_FILE="${UA_BOX_LOG_FILE:-$UA_BOX_LOG_DIR/ua-box.log}"
 UA_BOX_BACKUP_DIR="${UA_BOX_BACKUP_DIR:-$UA_BOX_HOME/backups}"
-UA_BOX_TMP_DIR="${UA_BOX_TMP_DIR:-$(mktemp -d /tmp/ua-box.XXXXXX)}"
-trap 'rm -rf "$UA_BOX_TMP_DIR"' EXIT INT TERM
+# UA_BOX_TMP_DIR 指定父目录；只清理本进程创建的子目录。
+UA_BOX_READ_ONLY=0
+if [ "${1:-}" = doctor ]; then
+  UA_BOX_READ_ONLY=1
+  UA_BOX_TMP_DIR=""
+else
+  UA_BOX_TMP_DIR="$(mktemp -d "${UA_BOX_TMP_DIR:-${TMPDIR:-/tmp}}/ua-box.XXXXXX")" || exit 1
+fi
+readonly UA_BOX_OWN_TMP_DIR="$UA_BOX_TMP_DIR"
+ua_cleanup_tmp() {
+  [ -n "$UA_BOX_OWN_TMP_DIR" ] && [ -d "$UA_BOX_OWN_TMP_DIR" ] && rm -rf -- "$UA_BOX_OWN_TMP_DIR"
+  return 0
+}
+trap ua_cleanup_tmp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 gl_hui='\033[37m'
 gl_hong='\033[31m'
 gl_lv='\033[32m'
@@ -51,11 +65,13 @@ GITHUB_PROXY_URLS="https://ghp.ci https://gh-proxy.com https://ghproxy.net"
 UA_NOTIFY_TG_BOT_TOKEN=""
 UA_NOTIFY_TG_CHAT_ID=""
 UA_NOTIFY_WEBHOOK_URL=""
+UA_NOTIFY_COOLDOWN_SECONDS=3600
 
 init_ua_box() {
+  [ "$UA_BOX_READ_ONLY" = 1 ] && return 0
   mkdir -p "$UA_BOX_HOME" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR"
   if [ ! -f "$UA_BOX_CONFIG" ]; then
-    cat > "$UA_BOX_CONFIG" <<'EOF'
+    (umask 077; cat > "$UA_BOX_CONFIG" <<'EOF'
 # UA Box 配置文件
 # 修改后重新运行 ua 生效。
 
@@ -75,6 +91,7 @@ GITHUB_PROXY_URLS="https://ghp.ci https://gh-proxy.com https://ghproxy.net"
 UA_NOTIFY_TG_BOT_TOKEN=""
 UA_NOTIFY_TG_CHAT_ID=""
 UA_NOTIFY_WEBHOOK_URL=""
+UA_NOTIFY_COOLDOWN_SECONDS=3600
 
 WARP_MANAGER_SCRIPT="$WARP_MANAGER_SCRIPT"
 
@@ -95,6 +112,7 @@ BESTTRACE_SCRIPT="$BESTTRACE_SCRIPT"
 SUPERSPEED_SCRIPT="$SUPERSPEED_SCRIPT"
 LIMIT_SHUTDOWN_SCRIPT="$LIMIT_SHUTDOWN_SCRIPT"
 EOF
+    )
   fi
 
   # shellcheck disable=SC1090
@@ -103,12 +121,15 @@ EOF
 
 log_action() {
   local message="$*"
-  mkdir -p "$UA_BOX_LOG_DIR"
+  mkdir -p "$UA_BOX_LOG_DIR" || return 1
+  [ ! -L "$UA_BOX_LOG_FILE" ] && [ ! -L "${UA_BOX_LOG_FILE}.1" ] || return 1
   # 日志超过 5MB 自动轮转，保留最近一份
   if [ -f "$UA_BOX_LOG_FILE" ] && [ "$(wc -c < "$UA_BOX_LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
     mv "$UA_BOX_LOG_FILE" "${UA_BOX_LOG_FILE}.1"
   fi
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$message" >> "$UA_BOX_LOG_FILE"
+  (umask 077; printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$message" >> "$UA_BOX_LOG_FILE") || return 1
+  chmod 600 "$UA_BOX_LOG_FILE"
+  [ ! -f "${UA_BOX_LOG_FILE}.1" ] || chmod 600 "${UA_BOX_LOG_FILE}.1"
 }
 
 confirm_danger() {
@@ -150,14 +171,17 @@ prune_old_backups() {
 }
 
 backup_self() {
-  local src
-  local dst
-
+  local src dst
   src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-  dst="$UA_BOX_BACKUP_DIR/ua-box-$(date '+%Y%m%d-%H%M%S').bak"
-  cp "$src" "$dst"
+  mkdir -p "$UA_BOX_BACKUP_DIR" || return 1
+  dst="$(mktemp "$UA_BOX_BACKUP_DIR/ua-box-$(date '+%Y%m%d-%H%M%S').XXXXXX.bak")" || return 1
+  if ! cp "$src" "$dst" || ! cmp -s "$src" "$dst"; then
+    rm -f -- "$dst"
+    echo "脚本备份未完成，已停止后续操作。" >&2
+    return 1
+  fi
   prune_old_backups "$UA_BOX_BACKUP_DIR" "ua-box-*.bak" "${UA_MAX_BACKUPS:-10}"
-  log_action "backup_self $dst"
+  log_action "backup_self $dst" || true
   echo "已备份到: $dst"
 }
 
@@ -176,13 +200,13 @@ select_with_fzf_or_menu() {
   fi
 
   local i item_count="${#input_items[@]}"
-  echo -e "${gl_kjlan}${prompt_msg}${gl_bai}"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}${prompt_msg}${gl_bai}" >&2
+  echo -e "${gl_kjlan}------------------------${gl_bai}" >&2
   for ((i=0; i<item_count; i++)); do
-    echo -e "${gl_kjlan}$((i+1)). ${gl_bai}${input_items[$i]}"
+    echo -e "${gl_kjlan}$((i+1)). ${gl_bai}${input_items[$i]}" >&2
   done
-  echo -e "${gl_kjlan}0. 取消${gl_bai}"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}0. 取消${gl_bai}" >&2
+  echo -e "${gl_kjlan}------------------------${gl_bai}" >&2
 
   local choice
   read -r -e -p "请输入序号选择 (0-$item_count): " choice
@@ -207,7 +231,7 @@ _ua_completion() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  main_commands="ps info sys system ssh ssh-port ssh-key f2b fail2ban tools panel docker dk work rclone test status notify export import ignore config log backup update init bbr fw fb ol top monitor fzf search find install remove settings"
+  main_commands="doctor ps info sys system ssh ssh-port ssh-key f2b fail2ban tools panel docker dk work rclone test status notify export import ignore config log backup update init bbr fw fb ol top monitor fzf search find install remove settings"
 
   if [ "$COMP_CWORD" -eq 1 ]; then
     mapfile -t COMPREPLY < <(compgen -W "${main_commands}" -- "${cur}")
@@ -282,7 +306,10 @@ create_local_links() {
 }
 
 system_live_monitor() {
-  trap 'tput cnorm 2>/dev/null; clear; return 0' INT TERM
+  (
+  trap 'tput cnorm 2>/dev/null || true' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   tput civis 2>/dev/null || true
 
   local num_cpus
@@ -695,6 +722,7 @@ system_live_monitor() {
         ;;
     esac
   done
+  )
 }
 
 system_fzf_interactive_menu() {
@@ -749,85 +777,881 @@ system_fzf_interactive_menu() {
     *"13. 🛠"*) common_tools_menu ;;
     *"14. ⚡"*) system_init_optimize ;;
     *"15. 🧪"*) test_scripts_menu ;;
-    *"16. 🏥"*) system_status_check; pause ;;
+    *"16. 🏥"*) ua_status; pause ;;
     *"17. ⚙️"*) "${EDITOR:-nano}" "$UA_BOX_CONFIG" ;;
   esac
 }
 
 update_self() {
-  local src tmp update_url up_choice update_git
+  local src tmp update_url up_choice update_git branch upstream before target relative status
   src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-
-  # 1. 检测是否为 Git 仓库并提示通过 Git 更新
-  if [ -d "$UA_BOX_HOME/.git" ]; then
-    echo -e "检测到当前项目是通过 ${gl_lv}Git 克隆${gl_bai} 安装的。"
-    read -r -e -p "是否通过 Git 拉取最新代码进行更新？[Y/n]: " update_git
-    update_git="${update_git:-y}"
-    if [ "$update_git" = "y" ] || [ "$update_git" = "Y" ]; then
-      echo "开始通过 Git 更新..."
-      log_action "update via git pull"
+  if [ -e "$UA_BOX_HOME/.git" ]; then
+    branch="$(git -C "$UA_BOX_HOME" symbolic-ref --quiet --short HEAD 2>/dev/null)" || branch=""
+    upstream="$(git -C "$UA_BOX_HOME" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || upstream=""
+    echo "当前分支: ${branch:-分离 HEAD}；更新目标: ${upstream:-未配置上游}"
+    read -r -e -p "是否从该分支上游获取并快进更新？[Y/n]: " update_git || return 1
+    if [[ "${update_git:-y}" = [Yy] ]]; then
+      [ -n "$branch" ] && [ -n "$upstream" ] || { echo "分支或上游未明确，未更新。" >&2; return 1; }
+      status="$(git -C "$UA_BOX_HOME" status --porcelain --untracked-files=no)" || return 1
+      [ -z "$status" ] || { echo "存在已跟踪文件的本地修改，请先处理；未覆盖或暂存任何修改。" >&2; return 1; }
+      before="$(git -C "$UA_BOX_HOME" rev-parse HEAD)" || return 1
+      # 先读取和验证目标脚本，再快进工作区；不自动合并、stash 或 reset。
+      if ! git -C "$UA_BOX_HOME" fetch --no-tags >/dev/null 2>&1; then
+        echo "Git 获取上游失败，未更新工作区。" >&2; return 1
+      fi
+      target="$(git -C "$UA_BOX_HOME" rev-parse --verify '@{upstream}^{commit}' 2>/dev/null)" || return 1
+      echo "目标提交: $target"
+      [ "$before" != "$target" ] || { echo "当前已是上游版本，无需更新。"; return 0; }
+      git -C "$UA_BOX_HOME" merge-base --is-ancestor "$before" "$target" || { echo "历史已分叉或本地领先，未自动合并。" >&2; return 1; }
+      case "$src" in "$UA_BOX_HOME/"*) relative="${src#"$UA_BOX_HOME/"}" ;; *) echo "脚本不在当前仓库中，未更新。" >&2; return 1 ;; esac
+      tmp="$(mktemp "$UA_BOX_TMP_DIR/update.XXXXXX")" || return 1
+      git -C "$UA_BOX_HOME" show "$target:$relative" > "$tmp" 2>/dev/null || { echo "无法读取目标脚本，未更新。" >&2; return 1; }
+      ua_validate_update "$tmp" || return 1
+      status="$(git -C "$UA_BOX_HOME" status --porcelain --untracked-files=no)" || return 1
+      [ -z "$status" ] && [ "$(git -C "$UA_BOX_HOME" rev-parse HEAD)" = "$before" ] || { echo "工作区或分支在检查期间发生变化，未继续更新。" >&2; return 1; }
       backup_self || return 1
-      if (cd "$UA_BOX_HOME" && git pull); then
-        create_local_links >/dev/null 2>&1 || true
-        echo -e "${gl_lv}Git 更新成功！正在自动为您重新加载新版本...${gl_bai}"
-        sleep 1.5
-        exec bash "$src"
-      else
-        echo -e "${gl_hong}Git 拉取失败，请检查网络或本地修改。${gl_bai}"
+      if ! git -C "$UA_BOX_HOME" merge --ff-only "$target" >/dev/null 2>&1; then
+        echo "Git 快进失败，未认定更新成功；原脚本备份已保留。" >&2; return 1
       fi
-      return 0
+      [ "$(git -C "$UA_BOX_HOME" rev-parse HEAD)" = "$target" ] && cmp -s "$tmp" "$src" || { echo "更新结果未通过核验，未重新执行；请检查工作区与原脚本备份。" >&2; return 1; }
+      log_action "self update verified git commit=$target" || true
+    else
+      update_git=n
     fi
+  else
+    update_git=n
   fi
-
-  # 2. 交互式选择更新源（包含手动输入选项）
-  echo "请选择更新源："
-  echo -e "1) 使用配置的 URL 进行更新 [ ${gl_lv}${UA_BOX_UPDATE_URL:-未配置}${gl_bai} ]"
-  echo "2) 手动输入自定义 URL 进行更新"
-  echo "0) 取消"
-  read -r -e -p "请输入选择 (0-2): " up_choice
-  [ -z "$up_choice" ] && return 0
-
-  case "$up_choice" in
-    1)
-      if [ -z "$UA_BOX_UPDATE_URL" ]; then
-        echo -e "${gl_hong}错误: 配置文件中未设置 UA_BOX_UPDATE_URL。${gl_bai}"
-        return 1
-      fi
-      update_url="$UA_BOX_UPDATE_URL"
-      ;;
-    2)
-      read -r -e -p "请输入更新脚本的完整 URL: " update_url
-      if [ -z "$update_url" ]; then
-        echo "URL 不能为空。"
-        return 1
-      fi
-      ;;
-    *)
-      return 0
-      ;;
-  esac
-
-  # 3. 下载并覆盖更新
-  tmp="$UA_BOX_TMP_DIR/ua-box-update.$$"
-  backup_self || return 1
-  echo "正在从 $update_url 下载最新版本..."
-  download_to "$update_url" "$tmp" || return 1
-  bash -n "$tmp" || {
-    echo "下载的新脚本语法校验失败，已取消更新。"
-    rm -f "$tmp"
+  if [ "$update_git" = n ]; then
+    echo "1) 使用已配置的更新地址（地址内容不显示）"
+    echo "2) 手动输入更新地址"
+    echo "0) 取消"
+    read -r -e -p "请输入选择 (0-2): " up_choice || return 1
+    case "$up_choice" in
+      1) update_url="${UA_BOX_UPDATE_URL:-}" ;;
+      2) read -r -s -p "请输入更新脚本 URL（不回显）: " update_url || return 1; echo ;;
+      *) return 0 ;;
+    esac
+    [ -n "$update_url" ] || { echo "更新地址为空，未更新。" >&2; return 1; }
+    tmp="$(mktemp "$UA_BOX_TMP_DIR/update.XXXXXX")" || return 1
+    if ! download_to "$update_url" "$tmp" >/dev/null 2>&1; then
+      echo "更新下载失败，地址及凭据未写入日志。" >&2; return 1
+    fi
+    ua_validate_update "$tmp" || return 1
+    backup_self || return 1
+    local atomic_tmp
+    atomic_tmp="$(mktemp "${src}.tmp.XXXXXX")" || return 1
+    if ! cp "$tmp" "$atomic_tmp" || ! chmod 755 "$atomic_tmp" || ! mv -f "$atomic_tmp" "$src"; then
+      rm -f -- "$atomic_tmp"
+      echo "更新文件替换失败，原脚本备份已保留。" >&2; return 1
+    fi
+    cmp -s "$tmp" "$src" || { echo "更新结果核验失败，未重新执行。" >&2; return 1; }
+    log_action "self update verified URL source omitted" || true
+  fi
+  if ! create_local_links >/dev/null 2>&1; then
+    echo "脚本已更新，但快捷入口设置失败；未自动重新执行。" >&2
     return 1
-  }
-  local atomic_tmp
-  atomic_tmp="$(mktemp "${src}.tmp.XXXXXX")" || return 1
-  cp "$tmp" "$atomic_tmp" && mv "$atomic_tmp" "$src"
-  chmod +x "$src"
-  rm -f "$tmp"
-  log_action "update_self from $update_url"
-  create_local_links >/dev/null 2>&1 || true
-  echo -e "${gl_lv}UA Box 已更新成功！正在自动为您重新加载新版本...${gl_bai}"
-  sleep 1.5
+  fi
+  echo "更新内容已核验，正在加载新版本。"
+  ua_cleanup_tmp
   exec bash "$src"
 }
+
+ua_validate_update() {
+  local candidate="$1"
+  if ! bash -n "$candidate" >/dev/null 2>&1 ||
+     ! grep -Eq '^UA_BOX_VERSION="[0-9]+([.][0-9]+)+[a-zA-Z0-9._-]*"$' "$candidate" ||
+     ! grep -q '^create_local_links()' "$candidate"; then
+    echo "候选文件不是可识别的 UA Box 脚本或语法无效，未应用。" >&2
+    return 1
+  fi
+  if grep -Eq "<<'PY_UA_(RECOVERY|HEALTH)'" "$candidate"; then
+    has_cmd python3 || { echo "需要 Python 3 校验内嵌程序，未应用更新。" >&2; return 1; }
+    if ! python3 -B -c 'import pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text()
+for marker in ("PY_UA_RECOVERY", "PY_UA_HEALTH"):
+    prefix="<<"+chr(39)+marker+chr(39)+"\n"
+    if prefix in text:
+        code=text.split(prefix,1)[1].split("\n"+marker+"\n",1)[0]
+        compile(code,marker,"exec")
+' "$candidate" >/dev/null 2>&1; then
+      echo "内嵌 Python 程序校验失败，未应用更新。" >&2
+      return 1
+    fi
+  fi
+}
+
+
+ua_disk_io_test() {
+  (
+  local target="${UA_IO_TEST_DIR:-$PWD}" size="${UA_IO_TEST_MB:-256}" free_kb temporary owner rate
+  [[ "$size" =~ ^[0-9]{1,4}$ ]] && ((10#$size >= 1 && 10#$size <= 4096)) || { echo "测速大小必须为 1–4096 MiB。" >&2; exit 1; }
+  size=$((10#$size))
+  target="$(readlink -f -- "$target")" && [ -d "$target" ] || { echo "待测目录不可用。" >&2; exit 1; }
+  free_kb="$(df -Pk -- "$target" 2>/dev/null | awk 'NR==2 {print $4}')"
+  [[ "$free_kb" =~ ^[0-9]+$ ]] && [ "$free_kb" -ge $(((size + 128) * 1024)) ] || { echo "测速空间不足或无法读取，未写入测试数据。" >&2; exit 1; }
+  temporary="$(mktemp -d "$target/.ua-io.XXXXXX")" || exit 1
+  owner="$(stat -c '%d:%i' -- "$temporary")" || exit 1
+  ua_disk_cleanup() {
+    if [ "$(stat -c '%d:%i' -- "$temporary" 2>/dev/null)" = "$owner" ]; then
+      rm -rf -- "$temporary"
+    else
+      echo "测速目录身份改变，未清理该路径。" >&2
+    fi
+  }
+  trap ua_disk_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cd -- "$temporary" || exit 1
+  [ "$(stat -c '%d:%i' .)" = "$owner" ] || exit 1
+  echo "正在测试目标文件系统写入（${size} MiB）..."
+  if ! LC_ALL=C dd if=/dev/zero of=data bs=1M count="$size" oflag=direct 2> result; then
+    echo "磁盘写入测试失败，未报告速率。" >&2; exit 1
+  fi
+  [ "$(stat -c '%s' data 2>/dev/null)" = "$((size * 1024 * 1024))" ] || { echo "测速写入量未通过核验。" >&2; exit 1; }
+  rate="$(awk '/copied/ {rate=$(NF-1) " " $NF} END {print rate}' result)"
+  echo "磁盘写入速度: ${rate:-写入完成，无法解析速率}"
+  )
+}
+
+
+system_init_swap() {
+  local target_mb="$1" active_kb
+  active_kb="$(awk 'NR > 1 {total += $3} END {printf "%.0f", total}' /proc/swaps)" || return 1
+  if [ "$active_kb" -gt 0 ]; then
+    echo "已有 Swap $(( (active_kb + 1023) / 1024 ))MB，保留现有配置（建议 ${target_mb}MB）。"
+    return 0
+  fi
+  if [ "$target_mb" -eq 0 ]; then
+    echo "磁盘空间不足，无法创建 Swap 并保留 2GB 空余空间。" >&2
+    return 1
+  fi
+  if [ -e /swapfile ] || [ -L /swapfile ]; then
+    echo "/swapfile 已存在但未启用；为保护原文件，请先手动检查。" >&2
+    return 1
+  fi
+  (
+    umask 077
+    # 排他创建，防止检查后出现同名文件时覆盖它。
+    set -o noclobber
+    : > /swapfile || exit 1
+    if has_cmd fallocate; then
+      fallocate -l "${target_mb}M" /swapfile 2>/dev/null ||
+        dd if=/dev/zero of=/swapfile bs=1M count="$target_mb" status=none || exit 1
+    else
+      dd if=/dev/zero of=/swapfile bs=1M count="$target_mb" status=none || exit 1
+    fi
+    chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile || exit 1
+    awk '$1 == "/swapfile" {found=1} END {exit !found}' /proc/swaps || exit 1
+    if ! grep -Eq '^/swapfile[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)' /etc/fstab; then
+      printf '%s\n' '/swapfile swap swap defaults 0 0' >> /etc/fstab || exit 1
+    fi
+  ) || {
+    echo "Swap 创建或验证失败；保留现有文件和已启用的 Swap，请手动检查。" >&2
+    return 1
+  }
+  echo "Swap 已设置为 ${target_mb}MB。"
+}
+
+
+system_init_check_status() {
+  local failed=0
+  free -h || failed=1
+  df -h / || failed=1
+  uptime || failed=1
+  return "$failed"
+}
+
+
+ua_health_program() {
+  cat <<'PY_UA_HEALTH'
+"""Read-only diagnostics and private, acknowledged notification state. No work on import."""
+import copy
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+class HealthError(RuntimeError):
+    pass
+
+
+def query(args):
+    """Only callers' fixed read-only probes; never invoke a shell or emit raw stderr."""
+    environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C")
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=8, env=environment)
+        return result.returncode, result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return 125, ""
+
+
+def safe_path(path):
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise HealthError("状态路径必须是规范绝对路径。")
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise HealthError("状态路径或父目录不能是符号链接。")
+    return path
+
+
+def private_file(path):
+    path = safe_path(path)
+    if path.exists():
+        info = path.stat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_nlink != 1):
+            raise HealthError("状态文件必须由当前用户拥有、权限为 600，且不是链接或特殊文件。")
+    return path
+
+
+def prepare_state(directory):
+    directory = safe_path(directory)
+    if not directory.exists():
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = directory.stat()
+    if not directory.is_dir() or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise HealthError("告警状态目录必须由当前用户拥有，且权限不大于 700；未修改已有目录。")
+    private_file(directory / "state.json")
+    private_file(directory / ".notify.lock")
+    descriptor = os.open(directory / ".notify.lock", os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    os.close(descriptor)
+
+
+def write_json(path, data):
+    path = private_file(path)
+    descriptor, temporary = tempfile.mkstemp(prefix=".ua-notify-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(data, stream, ensure_ascii=False, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def load_state(directory):
+    directory = safe_path(directory)
+    info = directory.stat()
+    if not directory.is_dir() or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise HealthError("告警状态目录权限不安全，未读取或修改状态。")
+    path = private_file(Path(directory) / "state.json")
+    if not path.exists():
+        return {"version": 1, "channels": {}}
+    try:
+        state = json.loads(path.read_text())
+        if type(state.get("version")) is not int or state["version"] != 1 or not isinstance(state.get("channels"), dict):
+            raise ValueError()
+        for identifier, channel in state["channels"].items():
+            if not re.fullmatch(r"[0-9a-f]{64}", identifier) or not isinstance(channel, dict):
+                raise ValueError()
+            if channel.get("kind") not in ("telegram", "webhook") or not isinstance(channel.get("active"), dict):
+                raise ValueError()
+            for key, issue in channel["active"].items():
+                validate_issue(key, issue)
+                for field in ("last_sent", "first_seen"):
+                    if type(issue.get(field)) not in (int, float) or not math.isfinite(issue[field]) or issue[field] < 0:
+                        raise ValueError()
+        return state
+    except (ValueError, TypeError, AttributeError, KeyError):
+        raise HealthError("告警状态损坏或版本不支持；已保留原文件，未重置去重状态。") from None
+
+
+def validate_issue(key, issue):
+    if (not isinstance(key, str) or not 1 <= len(key) <= 1024 or not isinstance(issue, dict)
+            or issue.get("severity") not in ("warning", "critical")
+            or not isinstance(issue.get("scope"), str) or not issue["scope"]
+            or not isinstance(issue.get("message"), str) or not 1 <= len(issue["message"]) <= 8192):
+        raise HealthError("告警对象格式无效，未更新通知状态。")
+
+
+def observations(path):
+    result = {"issues": {}, "checked": set(), "unknown": set(), "ignored": set()}
+    for line in Path(path).read_text().splitlines():
+        event = json.loads(line)
+        kind = event.get("type")
+        if kind in ("checked", "unknown") and isinstance(event.get("scope"), str) and event["scope"]:
+            result[kind].add(event["scope"])
+        elif kind == "ignored" and isinstance(event.get("key"), str):
+            result["ignored"].add(event["key"])
+        elif kind == "issue":
+            key = event.get("key")
+            issue = {k: event.get(k) for k in ("scope", "severity", "message")}
+            validate_issue(key, issue)
+            if key in result["issues"]:
+                raise HealthError("巡检产生重复告警标识，未更新通知状态。")
+            result["issues"][key] = issue
+        else:
+            raise HealthError("巡检事件无效，不能推断恢复。")
+    if not result["checked"] and not result["unknown"]:
+        raise HealthError("没有有效巡检结果，不能推断恢复。")
+    return result
+
+
+def scope_checked(scope, observed):
+    return scope in observed["checked"] and not any(
+        scope == value or scope.startswith(value + ".") or scope.startswith(value + ":")
+        for value in observed["unknown"])
+
+
+def configured_channels(environment):
+    channels = []
+    token, chat = environment.get("UA_HEALTH_TG_TOKEN", ""), environment.get("UA_HEALTH_TG_CHAT", "")
+    if bool(token) != bool(chat):
+        raise HealthError("Telegram 配置不完整，未更新通知状态。")
+    if token:
+        channels.append({"kind": "telegram", "id": fingerprint(["telegram", token, chat])})
+    url, kind = environment.get("UA_HEALTH_WEBHOOK", ""), environment.get("UA_HEALTH_WEBHOOK_KIND", "")
+    if url:
+        if kind not in ("wecom", "feishu", "dingtalk", "discord", "bark"):
+            raise HealthError("Webhook 类型无法识别，未更新通知状态。")
+        channels.append({"kind": "webhook", "id": fingerprint(["webhook", kind, url])})
+    if not channels:
+        raise HealthError("尚未配置有效的告警渠道，未更新通知状态。")
+    return channels
+
+
+def notification_plan(state, observed, channels, cooldown, now):
+    if type(cooldown) is not int or not 0 <= cooldown <= 604800 or not math.isfinite(now) or now < 0:
+        raise HealthError("冷却时间须为 0–604800 秒；当前时间必须有效。")
+    result = {"channels": {}, "unknown_scopes": sorted(observed["unknown"])}
+    for channel in channels:
+        previous = state["channels"].get(channel["id"], {"kind": channel["kind"], "active": {}})
+        active = copy.deepcopy(previous["active"])
+        send_keys, recover_keys, lines = [], [], []
+        for key, current in sorted(observed["issues"].items()):
+            if key in observed["ignored"] or not scope_checked(current["scope"], observed):
+                continue
+            old = active.get(key)
+            changed = old is not None and old["severity"] != current["severity"]
+            due = old is None or changed or now < old["last_sent"] or now - old["last_sent"] >= cooldown
+            if not due:
+                continue
+            reason = "新故障" if old is None else "级别变化" if changed else "持续异常提醒"
+            lines.append("[" + reason + "][" + current["severity"] + "] " + current["message"])
+            active[key] = {**current, "first_seen": min(old["first_seen"], now) if old else now, "last_sent": now}
+            send_keys.append(key)
+        for key, old in sorted(previous["active"].items()):
+            if not scope_checked(old["scope"], observed):
+                result["unknown_scopes"].append(old["scope"])
+            if key in observed["ignored"]:
+                continue
+            if key not in observed["issues"] and scope_checked(old["scope"], observed):
+                lines.append("[已恢复] " + old["message"] + "（此前告警，当前该项检查正常）")
+                active.pop(key, None)
+                recover_keys.append(key)
+        if not lines:
+            continue
+        title = "UA Box 状态恢复通知" if not send_keys else "UA Box 状态巡检异常告警"
+        if send_keys and recover_keys:
+            title = "UA Box 状态变化通知（异常及恢复）"
+        result["channels"][channel["kind"]] = {
+            "id": channel["id"], "kind": channel["kind"], "expected": fingerprint(previous),
+            "active": active, "send_keys": send_keys, "recover_keys": recover_keys,
+            "title": title, "body": "\n".join(lines), "planned_at": now}
+    result["unknown_scopes"] = sorted(set(result["unknown_scopes"]))
+    return result
+
+
+def plan_delivery(directory, events_path, plan_path, cooldown, environment, now=None):
+    cooldown = int(cooldown)
+    if not 0 <= cooldown <= 604800:
+        raise HealthError("冷却时间须为 0–604800 秒。")
+    state = load_state(directory)
+    observed = observations(events_path)
+    channels = configured_channels(environment)
+    # Explicitly ignored objects are retired silently, never described as recovered.
+    changed = False
+    for channel in state["channels"].values():
+        for key in observed["ignored"]:
+            if key in channel["active"]:
+                del channel["active"][key]
+                changed = True
+    if changed:
+        write_json(Path(directory) / "state.json", state)
+    plan = notification_plan(state, observed, channels, int(cooldown), time.time() if now is None else now)
+    write_json(plan_path, plan)
+    return plan
+
+
+def commit_delivery(directory, plan_path, kind, now=None):
+    plan = json.loads(Path(plan_path).read_text())["channels"][kind]
+    state = load_state(directory)
+    previous = state["channels"].get(plan["id"], {"kind": kind, "active": {}})
+    if fingerprint(previous) != plan["expected"]:
+        raise HealthError("通知状态已变化，拒绝提交过期计划。")
+    active = plan["active"]
+    for key in plan["send_keys"]:
+        active[key]["last_sent"] = time.time() if now is None else now
+    state["channels"][plan["id"]] = {"kind": kind, "active": active}
+    write_json(Path(directory) / "state.json", state)
+
+
+def static_config(path):
+    """Never source a shell configuration or evaluate expansion/substitution."""
+    values, dynamic = {}, False
+    for raw in Path(path).read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Z_][A-Z0-9_]*)=(.*)", line)
+        if not match:
+            dynamic = True
+            continue
+        try:
+            tokens = shlex.split(match[2], comments=True)
+        except ValueError:
+            dynamic = True
+            continue
+        # Dynamic shell values are not used to choose paths or claim capabilities.
+        if len(tokens) != 1 or re.search(r"[$`]|[;&<>|]", match[2]):
+            dynamic = True
+            continue
+        values[match[1]] = tokens[0]
+    return values, dynamic
+
+
+def doctor(home, config, log_dir, backup_dir, state_dir):
+    checks, capabilities = [], {}
+    def record(identifier, status, message):
+        checks.append({"id": identifier, "status": status, "message": message})
+    def dependency(name, required=False):
+        found = shutil.which(name) is not None
+        record("dependency." + name, "PASS" if found else "FAIL" if required else "SKIP",
+               name + (" 可用" if found else " 未安装；相关功能不可用"))
+        return found
+    record("platform", "PASS" if sys.platform.startswith("linux") else "FAIL", "平台为 Linux" if sys.platform.startswith("linux") else "需要 Linux")
+    record("python", "PASS" if sys.version_info >= (3, 9) else "FAIL", "Python " + ".".join(map(str, sys.version_info[:3])) + "；恢复功能要求 ≥3.9")
+    if dependency("bash", True):
+        code, output = query(["bash", "--noprofile", "--norc", "-c", 'printf "%s" "${BASH_VERSINFO[0]}"'])
+        record("bash.version", "PASS" if code == 0 and output.isdigit() and int(output) >= 4 else "FAIL", "Bash 主版本要求 ≥4")
+    for name in ("readlink", "awk", "sed", "grep", "tar", "mktemp", "stat"):
+        dependency(name, True)
+    downloader = bool(shutil.which("curl") or shutil.which("wget"))
+    record("download", "PASS" if downloader else "WARN", "下载工具可用" if downloader else "缺少 curl/wget；不会自动安装")
+    values = {}
+    config_path = Path(config)
+    if not config_path.exists():
+        record("config", "WARN", "配置文件不存在；只读诊断不会创建默认配置")
+    elif not config_path.is_file() or config_path.is_symlink():
+        record("config", "FAIL", "配置必须为普通文件；未执行配置")
+    else:
+        try:
+            mode = stat.S_IMODE(config_path.stat().st_mode)
+            owner_matches = config_path.stat().st_uid == os.geteuid()
+            record("config.owner", "PASS" if owner_matches else "FAIL" if os.geteuid() == 0 else "WARN", "配置属主应与执行用户一致；未修改属主")
+            record("config.permissions", "FAIL" if mode & 0o022 else "WARN" if mode & 0o077 else "PASS",
+                   "配置权限 " + oct(mode) + "；建议 600，禁止其他用户写入")
+            if config_path.stat().st_size > 1048576:
+                raise ValueError()
+            code, _ = query(["bash", "--noprofile", "--norc", "-n", str(config_path)])
+            record("config.syntax", "PASS" if code == 0 else "FAIL", "仅检查 Bash 语法，不执行配置")
+            values, dynamic = static_config(config_path)
+            record("config.static", "WARN" if dynamic else "PASS", "配置含动态语句，相关值无法静态确认；未执行" if dynamic else "配置可静态读取；不显示配置值或凭据")
+        except (OSError, ValueError, UnicodeError):
+            record("config.read", "FAIL", "无法安全读取配置；未输出内容")
+    for key, default in (("logs", log_dir), ("backups", backup_dir), ("notification-state", state_dir)):
+        value = values.get({"logs": "UA_BOX_LOG_DIR", "backups": "UA_BOX_BACKUP_DIR", "notification-state": "UA_NOTIFY_STATE_DIR"}[key], default)
+        path = Path(value)
+        try:
+            safe_path(path)
+            nearest = path
+            while not nearest.exists():
+                nearest = nearest.parent
+            valid = nearest.is_dir() and os.access(nearest, os.W_OK | os.X_OK)
+            record("path." + key, "PASS" if valid else "WARN", key + (" 目录或最近父目录具备访问权限（未写入验证）" if valid else " 路径不可用；未创建或修改"))
+            if key == "notification-state" and path.exists():
+                info = path.stat()
+                private = info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o077
+                record("notification.permissions", "PASS" if private else "FAIL", "状态目录应由当前用户拥有，权限不大于 700")
+                try:
+                    load_state(path)
+                    private_file(path / ".notify.lock")
+                    record("notification.state", "PASS", "已有告警状态可读取；未修改")
+                except (HealthError, OSError):
+                    record("notification.state", "FAIL", "告警状态不可安全读取，不能可靠去重；未修改")
+        except (OSError, HealthError):
+            record("path." + key, "FAIL", key + " 路径不安全或不可访问；未修改")
+    try:
+        disk = Path(home)
+        while not disk.exists():
+            disk = disk.parent
+        free = shutil.disk_usage(disk).free
+        record("disk.free", "FAIL" if free < 128 * 1024**2 else "WARN" if free < 512 * 1024**2 else "PASS", "项目所在文件系统可用空间约 " + str(free // 1024**2) + " MiB（仅查询）")
+    except OSError:
+        record("disk.free", "WARN", "可用空间无法读取")
+    docker_found = dependency("docker")
+    capabilities["docker_readable"] = False
+    capabilities["local_docker_socket"] = False
+    capabilities["compose_config_format"] = False
+    if docker_found:
+        code, _ = query(["docker", "version", "--format", "{{.Server.Version}}"])
+        capabilities["docker_readable"] = code == 0
+        record("docker.daemon", "PASS" if code == 0 else "WARN", "Docker daemon 可只读访问" if code == 0 else "Docker daemon 不可访问或探测超时；未尝试启动")
+        endpoint = os.environ.get("DOCKER_HOST") if not os.environ.get("DOCKER_CONTEXT") else None
+        if not endpoint:
+            args = ["docker", "context", "inspect"]
+            if os.environ.get("DOCKER_CONTEXT"):
+                args.append(os.environ["DOCKER_CONTEXT"])
+            code, output = query(args)
+            try:
+                endpoint = json.loads(output)[0]["Endpoints"]["docker"]["Host"] if code == 0 else None
+            except (ValueError, KeyError, IndexError, TypeError):
+                endpoint = None
+        local = bool(endpoint and endpoint.startswith("unix://"))
+        capabilities["local_docker_socket"] = local and capabilities["docker_readable"]
+        record("docker.endpoint", "PASS" if local else "WARN", "本机 Unix Socket，可用于本地只读检查" if local else "远程或未知连接，不满足本地 Socket 条件；不显示连接地址")
+        code, _ = query(["docker", "compose", "version", "--short"])
+        if code == 0:
+            help_code, help_text = query(["docker", "compose", "config", "--help"])
+            capabilities["compose_config_format"] = help_code == 0 and "--format" in help_text
+            record("docker.compose", "PASS" if capabilities["compose_config_format"] else "WARN", "Compose 插件支持配置格式输出" if capabilities["compose_config_format"] else "Compose 缺少可确认的配置格式输出能力")
+        else:
+            record("docker.compose", "WARN", "Compose 插件不可用；无法检查 Compose 配置输出")
+        dependency("dockerd")
+    for name in ("rclone", "bbolt", "systemctl", "systemd-escape", "systemd-analyze"):
+        dependency(name)
+    fuse = bool(shutil.which("fusermount3") or shutil.which("fusermount")) and os.access("/dev/fuse", os.R_OK | os.W_OK)
+    capabilities["rclone_mount_prerequisites"] = bool(shutil.which("rclone") and shutil.which("systemd-escape") and shutil.which("systemd-analyze") and fuse)
+    record("rclone.fuse", "PASS" if fuse else "SKIP", "FUSE 工具及设备权限可用；未执行挂载" if fuse else "FUSE 工具或设备权限不足；挂载前需处理")
+    capabilities["notification_prerequisites"] = bool(shutil.which("curl") and shutil.which("flock") and sys.version_info >= (3, 9))
+    record("notification.dependencies", "PASS" if capabilities["notification_prerequisites"] else "WARN", "告警需要 Python ≥3.9、curl 和 flock；未发送测试消息")
+    token, chat = values.get("UA_NOTIFY_TG_BOT_TOKEN", ""), values.get("UA_NOTIFY_TG_CHAT_ID", "")
+    webhook = values.get("UA_NOTIFY_WEBHOOK_URL", "")
+    capabilities["notification_configured"] = bool(token and chat or webhook)
+    if bool(token) != bool(chat):
+        record("notification.configuration", "WARN", "Telegram 参数不完整；不显示凭据")
+    else:
+        record("notification.configuration", "PASS" if capabilities["notification_configured"] else "SKIP",
+               "静态配置中存在通知渠道；未验证远端送达" if capabilities["notification_configured"] else "未发现可静态确认的通知渠道")
+    cooldown = values.get("UA_NOTIFY_COOLDOWN_SECONDS", "3600")
+    record("notification.cooldown", "PASS" if cooldown.isdigit() and 0 <= int(cooldown) <= 604800 else "FAIL", "冷却时间必须为 0–604800 秒；默认 3600 秒")
+    code = 2 if any(check["status"] == "FAIL" for check in checks) else 1 if any(check["status"] == "WARN" for check in checks) else 0
+    return {"read_only": True, "checks": checks, "capabilities": capabilities, "exit_code": code}
+
+
+
+CRON_MARKER = "# ua-box:status-notify"
+
+
+def owned_notify_cron(line, executable, script):
+    content = line.strip()
+    if not content or content.startswith("#"):
+        return False
+    if content.endswith(" " + CRON_MARKER):
+        return True
+    fields = content.split(None, 5)
+    if len(fields) != 6 or fields[:5] != ["*/30", "*", "*", "*", "*"]:
+        return False
+    try:
+        command = shlex.split(fields[5])
+    except ValueError:
+        return False
+    # Only the exact legacy command generated by UA Box is migrated.
+    aliases = {executable, script}
+    return len(command) == 5 and command[0] in aliases and command[1:] == ["status", "--notify", ">/dev/null", "2>&1"]
+
+
+def notify_cron_plan(content, executable, script, action):
+    if action not in ("enable", "disable") or not Path(executable).is_absolute() or any(ord(c) < 32 or ord(c) == 127 for c in executable):
+        raise HealthError("定时任务参数无效，未修改。")
+    retained = [line for line in content.splitlines(keepends=True) if not owned_notify_cron(line, executable, script)]
+    result = "".join(retained)
+    if action == "enable":
+        if result and not result.endswith("\n"):
+            result += "\n"
+        # crond interprets '%' before the shell, including inside quoted strings.
+        command = shlex.quote(executable).replace("%", "\\%")
+        result += "*/30 * * * * " + command + " status --notify >/dev/null 2>&1 " + CRON_MARKER + "\n"
+    return result
+
+def notification_payload(kind, title, body):
+    if kind in ("wecom", "dingtalk"):
+        return {"msgtype": "text", "text": {"content": body}}
+    if kind == "feishu":
+        return {"msg_type": "text", "content": {"text": body}}
+    if kind == "discord":
+        return {"content": body}
+    if kind == "bark":
+        return {"title": title, "body": body}
+    raise HealthError("Webhook 类型未知，请配置 wecom/feishu/dingtalk/discord/bark。")
+
+def verify_notification(kind, status, payload):
+    if not 200 <= int(status) < 300:
+        raise HealthError("通知 HTTP 请求失败。")
+    if kind == "discord" and int(status) == 204:
+        return
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise HealthError("通知响应不是对象。")
+    success = ((kind == "telegram" and data.get("ok") is True)
+               or (kind in ("wecom", "dingtalk") and type(data.get("errcode")) is int and data["errcode"] == 0)
+               or (kind == "feishu" and (type(data.get("code")) is int and data["code"] == 0
+                                        or type(data.get("StatusCode")) is int and data["StatusCode"] == 0))
+               or (kind == "bark" and type(data.get("code")) is int and data["code"] == 200)
+               or (kind == "discord" and "id" in data))
+    if not success:
+        raise HealthError("通知平台未确认接收成功。")
+
+
+def main(args=None):
+    args = sys.argv[1:] if args is None else args
+    try:
+        command, *args = args
+        if command == "notify-payload":
+            print(json.dumps(notification_payload(*args)))
+        elif command == "notify-verify":
+            verify_notification(args[0], args[1], Path(args[2]).read_text())
+        elif command == "doctor":
+            paths, options = args[:5], args[5:]
+            if options not in ([], ["--json"]):
+                raise HealthError("用法: ua doctor [--json]")
+            try:
+                report = doctor(*paths)
+            except (OSError, ValueError, HealthError):
+                report = {"read_only": True, "checks": [{"id": "diagnostic", "status": "FAIL", "message": "部分路径或配置无法安全读取；未修改"}],
+                          "capabilities": {}, "exit_code": 2}
+            if options:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            else:
+                print("UA Box 只读诊断（不执行配置、不安装、不修复、不启动服务）")
+                for check in report["checks"]:
+                    print("[" + check["status"] + "] " + check["id"] + ": " + check["message"])
+                print("退出码: 0=检查通过，1=存在提醒，2=存在错误；能力检查不等同于业务验收。")
+            return report["exit_code"]
+        elif command == "cron-plan":
+            source, destination, executable, script, action = args
+            content = Path(source).read_bytes().decode()
+            Path(destination).write_text(notify_cron_plan(content, executable, script, action))
+        elif command == "cron-status":
+            source, executable, script = args
+            lines = Path(source).read_bytes().decode().splitlines()
+            count = sum(owned_notify_cron(line, executable, script) for line in lines)
+            print("已开启（" + str(count) + " 条 UA Box 任务）" if count else "未开启")
+        elif command == "state-init":
+            prepare_state(*args)
+        elif command == "state-plan":
+            plan_delivery(*args, environment=os.environ)
+        elif command == "state-commit":
+            commit_delivery(*args)
+        elif command == "plan-field":
+            plan = json.loads(Path(args[0]).read_text())
+            value = plan["channels"].get(args[1])
+            if value is None:
+                return 3
+            print(value[args[2]])
+        elif command == "plan-summary":
+            plan = json.loads(Path(args[0]).read_text())
+            print("计划通知渠道数: " + str(len(plan["channels"])))
+            if plan["unknown_scopes"]:
+                print("部分检查未完成或已跳过；这些对象不会被判定恢复。")
+            if not plan["channels"]:
+                print("没有需要发送的状态变化：正常或仍在冷却期。")
+        else:
+            raise HealthError("未知健康检查命令。")
+    except HealthError as error:
+        print("诊断/告警处理失败：" + str(error), file=sys.stderr)
+        return 2
+    except (OSError, ValueError, TypeError, KeyError):
+        # Raw probe/config/state errors may contain credentials; never echo their contents.
+        print("诊断/告警处理失败：参数、探测结果或私有状态不可用；原状态未被重置。", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY_UA_HEALTH
+}
+
+
+ua_health_operation() {
+  has_cmd python3 || { echo "需要 Python 3，只读诊断及告警不会自动安装依赖。" >&2; return 2; }
+  python3 -B -c "$(ua_health_program)" "$@"
+}
+
+
+ua_doctor() {
+  if ! has_cmd python3; then
+    if [ "${1:-}" = --json ]; then
+      printf '%s\n' '{"read_only":true,"checks":[{"id":"python","status":"FAIL","message":"缺少 Python 3；未自动安装"}],"capabilities":{},"exit_code":2}'
+    else
+      echo "[FAIL] 缺少 Python 3；只读诊断不会安装依赖。"
+    fi
+    return 2
+  fi
+  ua_health_operation doctor "$UA_BOX_HOME" "$UA_BOX_CONFIG" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR" "${UA_NOTIFY_STATE_DIR:-$UA_BOX_HOME/state/notify}" "$@"
+}
+
+
+ua_notify_serialized() {
+  (
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  umask 077
+  has_cmd python3 && has_cmd curl && has_cmd flock || { echo "告警去重需要 Python 3、curl 和 flock；未自动安装。" >&2; exit 1; }
+  local state_dir="${UA_NOTIFY_STATE_DIR:-$UA_BOX_HOME/state/notify}" notify_fd lock_rc
+  local events summary plan channel title body field_rc webhook_kind="" failed=0
+  ua_health_operation state-init "$state_dir" || exit 1
+  exec {notify_fd}>> "$state_dir/.notify.lock" || exit 1
+  if flock -n "$notify_fd"; then
+    :
+  else
+    lock_rc=$?
+    [ "$lock_rc" -eq 1 ] && { echo "已有巡检正在运行，本次跳过。"; exit 0; }
+    echo "告警锁不可用，未执行通知。" >&2; exit 1
+  fi
+  events="$(mktemp "$UA_BOX_TMP_DIR/alert-events.XXXXXX")" || exit 1
+  summary="$(mktemp "$UA_BOX_TMP_DIR/alert-summary.XXXXXX")" || exit 1
+  plan="$(mktemp "$UA_BOX_TMP_DIR/alert-plan.XXXXXX")" || exit 1
+  local UA_ALERT_EVENTS_FILE="$events" _UA_ALERT_RECORD_FAILED=0
+  if ! ua_abnormal_summary > "$summary" 2>&1 || [ "$_UA_ALERT_RECORD_FAILED" -ne 0 ]; then
+    echo "巡检或事件记录失败，未更新告警状态。" >&2
+    exit 1
+  fi
+  [ -z "${UA_NOTIFY_WEBHOOK_URL:-}" ] || webhook_kind="$(ua_webhook_kind)" || { echo "Webhook 类型无法识别，未更新状态。" >&2; exit 1; }
+  UA_HEALTH_TG_TOKEN="${UA_NOTIFY_TG_BOT_TOKEN:-}" UA_HEALTH_TG_CHAT="${UA_NOTIFY_TG_CHAT_ID:-}" \
+    UA_HEALTH_WEBHOOK="${UA_NOTIFY_WEBHOOK_URL:-}" UA_HEALTH_WEBHOOK_KIND="$webhook_kind" \
+    ua_health_operation state-plan "$state_dir" "$events" "$plan" "${UA_NOTIFY_COOLDOWN_SECONDS:-3600}" || exit 1
+  ua_health_operation plan-summary "$plan" || exit 1
+  for channel in telegram webhook; do
+    field_rc=0
+    title="$(ua_health_operation plan-field "$plan" "$channel" title)" || field_rc=$?
+    if [ "$field_rc" -ne 0 ]; then
+      [ "$field_rc" -eq 3 ] || failed=1
+      continue
+    fi
+    body="$(ua_health_operation plan-field "$plan" "$channel" body)" || { failed=1; continue; }
+    if ua_send_notification "$title" "$body" "$channel"; then
+      ua_health_operation state-commit "$state_dir" "$plan" "$channel" || {
+        echo "平台已确认，但告警状态保存失败；下次可能重复通知。" >&2; failed=1;
+      }
+    else
+      echo "$channel 未确认送达，保留待重试状态。" >&2
+      failed=1
+    fi
+  done
+  [ "$failed" -eq 0 ]
+  )
+}
+
+
+ua_notification_post() {
+  local kind="$1" url="$2" payload="$3" response status
+  response="$(mktemp "$UA_BOX_TMP_DIR/notify.XXXXXX")" || return 1
+  if ! status="$(curl -sS --max-time 15 --output "$response" --write-out '%{http_code}' \
+    -X POST "$url" -H 'Content-Type: application/json' -d "$payload" 2>/dev/null)"; then
+    rm -f -- "$response"
+    return 1
+  fi
+  if ua_health_operation notify-verify "$kind" "$status" "$response" >/dev/null 2>&1; then
+    rm -f -- "$response"
+    return 0
+  fi
+  rm -f -- "$response"
+  return 1
+}
+
+
+ua_webhook_kind() {
+  case "${UA_NOTIFY_WEBHOOK_TYPE:-auto}" in
+    wecom|feishu|dingtalk|discord|bark) printf '%s\n' "$UA_NOTIFY_WEBHOOK_TYPE"; return 0 ;;
+    auto|"") ;;
+    *) return 1 ;;
+  esac
+  case "$UA_NOTIFY_WEBHOOK_URL" in
+    https://qyapi.weixin.qq.com/*) echo wecom ;;
+    https://open.feishu.cn/*|https://open.larksuite.com/*) echo feishu ;;
+    https://oapi.dingtalk.com/*) echo dingtalk ;;
+    https://discord.com/*|https://discordapp.com/*) echo discord ;;
+    https://api.day.app/*) echo bark ;;
+    *) return 1 ;;
+  esac
+}
+
+
+ua_crontab_read() {
+  local destination="$1" rc=0
+  LC_ALL=C crontab -l > "$destination" 2> "${destination}.stderr" || rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  if [ "$rc" -eq 1 ] && [ ! -s "$destination" ] &&
+     grep -Eq '^(crontab: )?no crontab for [a-zA-Z0-9_.-]+$' "${destination}.stderr"; then
+    return 0
+  fi
+  echo "无法确认当前定时任务，未覆盖或清空。" >&2
+  return 1
+}
+
+
+ua_notify_cron_status() {
+  local current ua_bin="/usr/local/bin/ua" script="${SCRIPT_REAL_PATH:-$UA_BOX_HOME/ua-box}"
+  has_cmd crontab || { echo "未安装 crontab"; return 1; }
+  if [ ! -x "$ua_bin" ] || [ "$(readlink -f -- "$ua_bin")" != "$(readlink -f -- "$script")" ]; then ua_bin="$script"; fi
+  current="$(mktemp "$UA_BOX_TMP_DIR/cron-status.XXXXXX")" || return 1
+  ua_crontab_read "$current" || { echo "读取失败，状态未知"; return 1; }
+  ua_health_operation cron-status "$current" "$ua_bin" "$script"
+}
+
+
+ua_notify_cron_update() {
+  (
+  umask 077
+  local action="$1" state_dir="${UA_NOTIFY_STATE_DIR:-$UA_BOX_HOME/state/notify}" lock_fd
+  local current planned check verify backup ua_bin="/usr/local/bin/ua" script="${SCRIPT_REAL_PATH:-$UA_BOX_HOME/ua-box}"
+  need_root || exit 1
+  has_cmd crontab && has_cmd flock || { echo "缺少 crontab/flock，未修改任务。" >&2; exit 1; }
+  case "$action" in enable|disable) ;; *) exit 1 ;; esac
+  if [ ! -x "$ua_bin" ] || [ "$(readlink -f -- "$ua_bin")" != "$(readlink -f -- "$script")" ]; then ua_bin="$script"; fi
+  [ "$action" != enable ] || [ -x "$ua_bin" ] || { echo "当前脚本不可执行，未开启定时任务。" >&2; exit 1; }
+  ua_health_operation state-init "$state_dir" || exit 1
+  exec {lock_fd}>> "$state_dir/.notify.lock" || exit 1
+  flock -w 5 "$lock_fd" || { echo "巡检或任务设置正在运行，请稍后重试。" >&2; exit 1; }
+  current="$(mktemp "$UA_BOX_TMP_DIR/cron-current.XXXXXX")" || exit 1
+  planned="$(mktemp "$UA_BOX_TMP_DIR/cron-plan.XXXXXX")" || exit 1
+  check="$(mktemp "$UA_BOX_TMP_DIR/cron-check.XXXXXX")" || exit 1
+  verify="$(mktemp "$UA_BOX_TMP_DIR/cron-verify.XXXXXX")" || exit 1
+  ua_crontab_read "$current" || exit 1
+  ua_health_operation cron-plan "$current" "$planned" "$ua_bin" "$script" "$action" || exit 1
+  cmp -s "$current" "$planned" && { echo "UA Box 定时任务已符合所选状态。"; exit 0; }
+  mkdir -p "$UA_BOX_BACKUP_DIR" || exit 1
+  backup="$(mktemp "$UA_BOX_BACKUP_DIR/crontab-before-$(date +%Y%m%d-%H%M%S).XXXXXX.bak")" || exit 1
+  if ! cp "$current" "$backup" || ! cmp -s "$current" "$backup"; then
+    rm -f -- "$backup"  # 只移除本次 mktemp 创建、未通过校验的副本。
+    echo "原任务保护副本未完成，未应用。" >&2; exit 1
+  fi
+  ua_crontab_read "$check" || exit 1
+  cmp -s "$current" "$check" || { echo "定时任务被其他进程修改，已停止写入。" >&2; exit 1; }
+  if ! crontab "$planned"; then
+    echo "定时任务安装失败，未认定成功。原任务副本: $backup" >&2; exit 1
+  fi
+  ua_crontab_read "$verify" && cmp -s "$verify" "$planned" || { echo "任务写入结果未确认，请核对。原任务副本: $backup" >&2; exit 1; }
+  log_action "notify cron $action verified; previous crontab retained" || true
+  echo "UA Box 定时任务 $action 已核验；原任务副本: $backup"
+  )
+}
+
 
 init_ua_box
 
@@ -916,24 +1740,28 @@ list_remove_words() {
 }
 
 config_set_var() {
-  local var="$1"
-  local value="$2"
-  local tmp escaped
+  local var="$1" value="$2" tmp escaped assignment
+  [[ "$var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || return 1
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || { echo "配置值不能包含换行。" >&2; return 1; }
 
-  escaped="$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-  tmp="$UA_BOX_TMP_DIR/ua-box-config.$$"
-  awk -v var="$var" -v value="$escaped" '
+  # 单引号字面量，避免配置重新加载时执行 $()、反引号或变量展开。
+  escaped=${value//\'/\'\\\'\'}
+  assignment="$var='$escaped'"
+  tmp="$(mktemp "${UA_BOX_CONFIG}.tmp.XXXXXX")" || return 1
+  if ! UA_CONFIG_ASSIGNMENT="$assignment" awk -v var="$var" '
     BEGIN { found=0 }
     $0 ~ "^" var "=" {
-      print var "=\"" value "\"";
-      found=1;
-      next;
+      if (!found) print ENVIRON["UA_CONFIG_ASSIGNMENT"]
+      found=1
+      next
     }
     { print }
-    END {
-      if (!found) print var "=\"" value "\"";
-    }
-  ' "$UA_BOX_CONFIG" > "$tmp" && mv "$tmp" "$UA_BOX_CONFIG"
+    END { if (!found) print ENVIRON["UA_CONFIG_ASSIGNMENT"] }
+  ' "$UA_BOX_CONFIG" > "$tmp" || ! bash -n "$tmp" ||
+    ! chmod 600 "$tmp" || ! mv -f "$tmp" "$UA_BOX_CONFIG"; then
+    rm -f "$tmp"
+    return 1
+  fi
   # shellcheck disable=SC1090
   . "$UA_BOX_CONFIG"
 }
@@ -1099,7 +1927,7 @@ download_to() {
   local url="$1"
   local output="$2"
 
-  log_action "download $url -> $output"
+  log_action "download -> $output (URL omitted)"
 
   try_dl() {
     local target_url="$1"
@@ -1502,7 +2330,7 @@ toggle_container_port_bind() {
   local compose_file=""
   for dir in "/root/$container_name" "/root/nginx-proxy-manager" "/root/uptime-kuma"; do
     if [ -f "$dir/docker-compose.yml" ]; then
-      if grep -q "container_name:[[:space:]]*['\"]*$container_name['\"]*" "$dir/docker-compose.yml" || [ "$container_name" = "openlist" ]; then
+      if grep -q "container_name:[[:space:]]*['\"]*${container_name}['\"]*" "$dir/docker-compose.yml" || [ "$container_name" = "openlist" ]; then
         compose_file="$dir/docker-compose.yml"
         break
       fi
@@ -1561,7 +2389,7 @@ update_panel_container() {
   local compose_file=""
   for dir in "/root/$container_name" "/root/nginx-proxy-manager" "/root/uptime-kuma" "/root/openlist" "/root/filebrowser" "/root/it-tools"; do
     if [ -f "$dir/docker-compose.yml" ]; then
-      if grep -q "container_name:[[:space:]]*['\"]*$container_name['\"]*" "$dir/docker-compose.yml" || [ "$dir" = "/root/$container_name" ]; then
+      if grep -q "container_name:[[:space:]]*['\"]*${container_name}['\"]*" "$dir/docker-compose.yml" || [ "$dir" = "/root/$container_name" ]; then
         compose_file="$dir/docker-compose.yml"
         break
       fi
@@ -4038,7 +4866,7 @@ tmux_ssh_persistent_menu() {
     echo -e "${gl_kjlan}2.   ${gl_bai}关闭"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1)
@@ -4092,7 +4920,7 @@ workspace_menu() {
     echo -e "${gl_kjlan}17.  ${gl_bai}安装 tmux"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       [1-9]|10) tmux_open_session "${DEFAULT_WORKSPACE_PREFIX}${choice}"; pause ;;
@@ -4516,7 +5344,7 @@ rclone_menu() {
     echo -e "${gl_kjlan}13.  ${gl_bai}编辑 rclone.conf 配置文件 (高级/手动)"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) install_rclone; pause ;;
@@ -4620,12 +5448,7 @@ run_speed_io_test() {
   echo -e "${gl_kjlan}极速网络与磁盘 IO 自检${gl_bai}"
   echo -e "${gl_kjlan}------------------------${gl_bai}"
 
-  # 1. 磁盘 IO 测试
-  echo -e "${gl_huang}正在评估磁盘写入速度（测试 1GB 连续写入，请稍候...）${gl_bai}"
-  local io_res
-  io_res="$(dd if=/dev/zero of=ua_io_speed_test_file bs=1M count=1024 oflag=direct 2>&1 | awk '/copied/ {print $(NF-1), $NF; exit} {speed=$0} END {print speed}')"
-  rm -f ua_io_speed_test_file
-  echo -e "磁盘写入速度: ${gl_lv}${io_res:-未知}${gl_bai}"
+  ua_disk_io_test || return $?
   echo -e "${gl_kjlan}------------------------${gl_bai}"
 
   # 2. 网络延迟测试
@@ -4692,7 +5515,7 @@ test_scripts_menu() {
     echo -e "${gl_kjlan}31.  ${gl_bai}运行自定义脚本 URL"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) run_downloaded_script "$FUSION_TEST_SCRIPT" "$UA_BOX_TMP_DIR"/fusion-test.sh; pause ;;
@@ -5857,7 +6680,7 @@ system_cron_menu() {
     echo "2. 查看定时任务"
     echo "3. 清空当前用户定时任务"
     echo "0. 返回"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1)
@@ -6201,10 +7024,18 @@ system_init_optimize() {
   # 获取 / 目录剩余空间 (MB)
   local free_kb free_mb
   free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')"
-  free_mb=$(( free_kb / 1024 ))
-  [ -z "$free_mb" ] || ! printf '%s' "$free_mb" | grep -Eq '^[0-9]+$' && free_mb=0
+  if printf '%s' "$free_kb" | grep -Eq '^[0-9]+$'; then
+    free_mb=$(( free_kb / 1024 ))
+  else
+    free_mb=0
+  fi
 
-  swap_mb=$(( mem_mb * 2 ))
+  # 512MB～4GB 的机器默认建议 2GB；更大内存沿用原有策略。
+  if [ "$mem_mb" -le 4096 ]; then
+    swap_mb=2048
+  else
+    swap_mb=$(( mem_mb * 2 ))
+  fi
   # 限制最大 Swap 建议值不超过 8GB，且必须保留至少 2GB 硬盘空余空间以防爆盘
   if [ "$swap_mb" -gt 8192 ]; then
     swap_mb=8192
@@ -6227,14 +7058,13 @@ system_init_optimize() {
   echo -e "${gl_kjlan}  初始服务器一键优化${gl_bai}"
   echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
   echo -e "  将按顺序执行以下步骤："
-  echo -e "  ${gl_kjlan}[1]${gl_bai} 系统更新"
-  echo -e "  ${gl_kjlan}[2]${gl_bai} 安装常用工具"
+  echo -e "  ${gl_kjlan}[1/5]${gl_bai} 设置 Swap（建议 ${swap_mb}MB，当前内存 ${mem_mb}MB；已有 Swap 保留）"
+  echo -e "  ${gl_kjlan}[2/5]${gl_bai} 更新系统"
+  echo -e "  ${gl_kjlan}[3/5]${gl_bai} 安装常用工具"
   echo -e "        $INIT_TOOLS"
-  echo -e "  ${gl_kjlan}[3]${gl_bai} 设置 Swap 为内存的 2 倍 (${swap_mb}MB，当前内存 ${mem_mb}MB)"
-  echo -e "  ${gl_kjlan}[4]${gl_bai} 安装 Docker"
-  echo -e "  ${gl_kjlan}[5]${gl_bai} 修改 hostname（可选，默认跳过）"
-  echo -e "  ${gl_kjlan}[6]${gl_bai} 开启内核网络优化与系统环境调优 (含文件数限制/SSH加速/NTP)"
-  echo -e "  ${gl_kjlan}[7]${gl_bai} 默认开启 BBR 拥塞控制"
+  echo -e "  ${gl_kjlan}[4/5]${gl_bai} 安装 Docker"
+  echo -e "  ${gl_kjlan}[5/5]${gl_bai} 检查系统状态（内存、Swap、磁盘、负载）"
+  echo -e "  附加优化（安装 Docker 后、状态检查前）：可选 hostname、网络/系统环境调优、BBR"
   echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
 
   # ── 询问是否修改 hostname ────────────────────────────────
@@ -6273,8 +7103,19 @@ system_init_optimize() {
   local r_update=0 r_tools=0 r_swap=0 r_docker=0 r_hostname=0
   local tools_failed="" tools_ok=""
 
-  # ── [1] 系统更新 ─────────────────────────────────────────
-  echo -e "\n${gl_kjlan}[1/5] 系统更新...${gl_bai}"
+  # ── [1] 设置 Swap：先准备内存余量，再执行安装 ──────────
+  echo -e "\n${gl_kjlan}[1/5] 设置 Swap...${gl_bai}"
+  if system_init_swap "$swap_mb"; then
+    r_swap=1
+    log_action "init_optimize swap ready: target=${swap_mb}MB"
+  else
+    echo -e "$step_fail Swap 未就绪，已停止初始化；未执行系统更新和软件安装。"
+    log_action "init_optimize stopped: swap not ready"
+    return 1
+  fi
+
+  # ── [2] 系统更新 ─────────────────────────────────────────
+  echo -e "\n${gl_kjlan}[2/5] 更新系统...${gl_bai}"
   if system_update; then
     r_update=1
     echo -e "$step_ok 系统更新完成"
@@ -6282,8 +7123,8 @@ system_init_optimize() {
     echo -e "$step_fail 系统更新失败"
   fi
 
-  # ── [2] 安装常用工具 ─────────────────────────────────────
-  echo -e "\n${gl_kjlan}[2/5] 安装常用工具...${gl_bai}"
+  # ── [3] 安装常用工具 ─────────────────────────────────────
+  echo -e "\n${gl_kjlan}[3/5] 安装常用工具...${gl_bai}"
   local pm tool_pkg _batch_ok TOOLS_TO_INSTALL=""
   pm="$(pkg_manager)"
 
@@ -6344,39 +7185,6 @@ system_init_optimize() {
   fi
   log_action "init_optimize install tools: ok=[$tools_ok] fail=[$tools_failed]"
 
-  # ── [3] 设置 Swap ────────────────────────────────────────
-  if [ "$swap_mb" -eq 0 ]; then
-    echo -e "\n${gl_kjlan}[3/5] 设置 Swap...${gl_bai}"
-    echo -e "$step_skip 磁盘剩余空间不足（当前剩余 ${free_mb}MB，安全限制需留 2GB），已跳过 Swap 创建。"
-    r_swap=2
-  else
-    echo -e "\n${gl_kjlan}[3/5] 设置 Swap 为 ${swap_mb}MB...${gl_bai}"
-    local swap_result=0
-    (
-      swapoff /swapfile 2>/dev/null || true
-      sed -i '\|/swapfile swap swap|d' /etc/fstab 2>/dev/null || true
-      rm -f /swapfile
-      if has_cmd fallocate; then
-        fallocate -l "${swap_mb}M" /swapfile 2>/dev/null || \
-          dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
-      else
-        dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
-      fi
-      chmod 600 /swapfile
-      mkswap /swapfile > /dev/null
-      swapon /swapfile
-      grep -q '/swapfile swap swap' /etc/fstab || \
-        echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
-    ) && swap_result=1
-    if [ "$swap_result" -eq 1 ]; then
-      r_swap=1
-      log_action "init_optimize swap ${swap_mb}MB"
-      echo -e "$step_ok Swap 已设置为 ${swap_mb}MB"
-    else
-      echo -e "$step_fail Swap 设置失败"
-    fi
-  fi
-
   # ── [4] 安装 Docker ──────────────────────────────────────
   echo -e "\n${gl_kjlan}[4/5] 安装 Docker...${gl_bai}"
   if install_docker; then
@@ -6384,7 +7192,7 @@ system_init_optimize() {
   fi
 
   # ── [5] 修改 hostname ────────────────────────────────────
-  echo -e "\n${gl_kjlan}[5/7] 修改 hostname...${gl_bai}"
+  echo -e "\n${gl_kjlan}[附加优化] 修改 hostname...${gl_bai}"
   if [ "$do_hostname" = "y" ] || [ "$do_hostname" = "Y" ]; then
     _apply_hostname "$new_hostname" "$current_hostname"
     log_action "init_optimize hostname: $current_hostname -> $new_hostname"
@@ -6395,7 +7203,7 @@ system_init_optimize() {
   fi
 
   # ── [6] 系统环境与 TCP 协议栈高级优化 ──────────────────
-  echo -e "\n${gl_kjlan}[6/7] 开启网络内核协议栈与系统环境调优...${gl_bai}"
+  echo -e "\n${gl_kjlan}[附加优化] 开启网络内核协议栈与系统环境调优...${gl_bai}"
   local r_tcptune=0
   (
     local _local_changes=0
@@ -6488,7 +7296,7 @@ EOF
   fi
 
   # ── [7] 默认开启 BBR 拥塞控制 ─────────────────────────────
-  echo -e "\n${gl_kjlan}[7/7] 默认开启 BBR 拥塞控制...${gl_bai}"
+  echo -e "\n${gl_kjlan}[附加优化] 默认开启 BBR 拥塞控制...${gl_bai}"
   local r_bbr=0
   local virt_type
   virt_type="$(get_virt)"
@@ -6529,6 +7337,16 @@ SYSCTL
     fi
   fi
 
+  # ── [5] 检查系统状态（只读） ────────────────────────────
+  echo -e "\n${gl_kjlan}[5/5] 检查系统状态...${gl_bai}"
+  local r_status=0
+  if system_init_check_status; then
+    r_status=1
+    echo -e "$step_ok 系统状态检查完成"
+  else
+    echo -e "$step_fail 系统状态读取失败，请检查上面的错误信息"
+  fi
+
   # ── 汇总报告 ─────────────────────────────────────────────
   echo ""
   echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
@@ -6552,7 +7370,7 @@ SYSCTL
   if [ "$r_swap" -eq 1 ]; then
     local cur_swap
     cur_swap="$(free -m | awk '/^Swap:/ {print $2}')MB"
-    echo -e "  $step_ok Swap 设置为 ${swap_mb}MB（当前: $cur_swap）"
+    echo -e "  $step_ok Swap 已就绪（当前: $cur_swap；建议: ${swap_mb}MB）"
   elif [ "$r_swap" -eq 2 ]; then
     echo -e "  $step_skip Swap 设置已跳过（磁盘空间不足）"
   else
@@ -6590,7 +7408,8 @@ SYSCTL
   fi
 
   echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-  log_action "init_optimize done"
+  log_action "init_optimize done: status_check=$r_status"
+  [ "$r_status" -eq 1 ]
 }
 # ── /一键初始化优化 ──────────────────────────────────────────
 
@@ -6993,17 +7812,21 @@ get_compose_projects_summary() {
   docker info >/dev/null 2>&1 || return 0
 
   local ps_out
-  ps_out="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.State.Running}}' 2>/dev/null)"
+  if ! ps_out="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.State}}')"; then
+    echo "Compose 状态检测失败"
+    return 1
+  fi
   if [ -z "$ps_out" ]; then
     echo "-"
     return 0
   fi
 
   printf '%s\n' "$ps_out" | awk -F'\t' '
+    $1 ~ /-ua-(old|failed)-/ { next }
     $2 != "" {
       proj=$2
       total[proj]++
-      if ($3 == "true") running[proj]++
+      if ($3 == "running") running[proj]++
     }
     END {
       count = 0
@@ -7018,18 +7841,18 @@ get_compose_projects_summary() {
 }
 
 collect_bad_containers() {
-  local container_name container_status
-
+  local container_name container_state container_health inventory
   has_cmd docker || return 0
-  docker info >/dev/null 2>&1 || return 0
-  while IFS=$'\t' read -r container_name container_status; do
-    [ -z "$container_name" ] && continue
+  docker info >/dev/null 2>&1 || { echo "Docker 状态不可读取" >&2; return 1; }
+  inventory="$(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}')" || return 1
+  while IFS=$'\t' read -r container_name container_state container_health; do
+    [ -n "$container_name" ] || continue
     list_has_word "$container_name" "$UA_IGNORE_CONTAINERS" && continue
-    case "$container_status" in
-      Up*) ;;
-      *) printf '%s\n' "$container_name" ;;
-    esac
-  done < <(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
+    case "$container_name" in *-ua-old-*|*-ua-failed-*) continue ;; esac
+    if [ "$container_state" != running ] || [[ "$container_health" = *'(unhealthy)'* ]]; then
+      printf '%s\n' "$container_name"
+    fi
+  done <<< "$inventory"
 }
 
 collect_inactive_services() {
@@ -7070,6 +7893,14 @@ ua_abnormal_summary() {
   local found cpu_pct mem_pct disk_pct disk_warn disk_crit load_avg load_int cores bad_containers check_timeout failed_remotes remote rc output status svc
   local container_name container_status
 
+  # 人类可读报告保持原入口；通知通过独立 JSONL 事件判断状态，不解析报告文字。
+  _ua_alert_event() {
+    [ -n "${UA_ALERT_EVENTS_FILE:-}" ] || return 0
+    if ! python3 -B -c 'import json,sys; print(json.dumps(dict(zip(("type","scope","key","severity","message"),sys.argv[1:])),ensure_ascii=False))' "$@" >> "$UA_ALERT_EVENTS_FILE"; then
+      _UA_ALERT_RECORD_FAILED=1
+    fi
+    return 0
+  }
   found=0
   check_timeout="${RCLONE_STATUS_CHECK_TIMEOUT:-${RCLONE_CHECK_TIMEOUT:-5}}"
   disk_warn="${UA_STATUS_DISK_WARN:-80}"
@@ -7079,27 +7910,46 @@ ua_abnormal_summary() {
 
   echo -e "${gl_kjlan}异常汇总${gl_bai}"
 
-  cpu_pct="$(cpu_usage 2>/dev/null || echo 0)"
+  cpu_pct="$(cpu_usage 2>/dev/null)" || cpu_pct=""
   mem_pct="$(free | awk '/^Mem:/ {printf "%.0f", $3*100/$2}' 2>/dev/null)"
   disk_pct="$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}' 2>/dev/null)"
   load_avg="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
   cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
 
+  local metric_scope metric_value
+  for metric_scope in host.cpu host.memory host.disk; do
+    case "$metric_scope" in host.cpu) metric_value="$cpu_pct" ;; host.memory) metric_value="$mem_pct" ;; host.disk) metric_value="$disk_pct" ;; esac
+    if [[ "$metric_value" =~ ^[0-9]+$ ]]; then
+      _ua_alert_event checked "$metric_scope"
+    else
+      _ua_alert_event unknown "$metric_scope"
+    fi
+  done
+  if [[ "$load_avg" =~ ^[0-9]+([.][0-9]+)?$ && "$cores" =~ ^[0-9]+$ ]] && [ "$cores" -gt 0 ]; then
+    _ua_alert_event checked host.load
+  else
+    _ua_alert_event unknown host.load
+  fi
+
   if printf '%s\n' "$cpu_pct" | grep -Eq '^[0-9]+$' && [ "$cpu_pct" -ge 80 ]; then
+    _ua_alert_event issue host.cpu host:cpu warning "CPU 占用高: ${cpu_pct}%"
     echo "- CPU 占用高: ${cpu_pct}%"
     echo "  建议: 使用 top/htop 查看高占用进程，必要时重启异常服务。"
     found=1
   fi
   if printf '%s\n' "$mem_pct" | grep -Eq '^[0-9]+$' && [ "$mem_pct" -ge 85 ]; then
+    _ua_alert_event issue host.memory host:memory warning "内存占用高: ${mem_pct}%"
     echo "- 内存占用高: ${mem_pct}%"
     echo "  建议: 使用 free -h 和 docker stats 排查占用，必要时增加 swap 或限制容器内存。"
     found=1
   fi
   if printf '%s\n' "$disk_pct" | grep -Eq '^[0-9]+$' && [ "$disk_pct" -ge "$disk_crit" ]; then
+    _ua_alert_event issue host.disk disk:root critical "根分区占用严重: ${disk_pct}%"
     echo "- 根分区占用严重: ${disk_pct}% >= ${disk_crit}%"
     echo "  建议: 立即清理日志、缓存、旧备份或 Docker 无用数据。"
     found=1
   elif printf '%s\n' "$disk_pct" | grep -Eq '^[0-9]+$' && [ "$disk_pct" -ge "$disk_warn" ]; then
+    _ua_alert_event issue host.disk disk:root warning "根分区占用偏高: ${disk_pct}%"
     echo "- 根分区占用偏高: ${disk_pct}% >= ${disk_warn}%"
     echo "  建议: 使用 ncdu/du 定位大目录，并关注日志和备份增长。"
     found=1
@@ -7108,110 +7958,164 @@ ua_abnormal_summary() {
   if printf '%s\n' "$load_int" | grep -Eq '^[0-9]+$' &&
     printf '%s\n' "$cores" | grep -Eq '^[0-9]+$' &&
     [ "$cores" -gt 0 ] && [ "$load_int" -ge "$cores" ]; then
+    _ua_alert_event issue host.load host:load warning "系统负载偏高: ${load_avg} / ${cores}核"
     echo "- 系统负载偏高: ${load_avg} / ${cores}核"
     echo "  建议: 使用 uptime/top 查看负载来源，重点检查 CPU、磁盘 IO 和网络任务。"
     found=1
   fi
 
-  if has_cmd docker; then
-    if docker info >/dev/null 2>&1; then
-      local _bad _bname _bstatus
-      _bad=""
-      while IFS=$'\t' read -r _bname _bstatus; do
-        [ -z "$_bname" ] && continue
-        list_has_word "$_bname" "$UA_IGNORE_CONTAINERS" && continue
-        case "$_bstatus" in
-          Up*) ;;
-          *) _bad="${_bad}  $_bname  $_bstatus\n" ;;
-        esac
-      done < <(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
-      if [ -n "$_bad" ]; then
-        echo "- Docker 异常容器:"
-        printf '%b' "$_bad"
-        echo "  建议: 不再使用可执行 ua ignore container <名称>；仍需使用先查看日志再重启。"
-        found=1
-      fi
 
-      # 检测 Docker Compose 项目部分容器停止的异常
-      local ps_out bad_projects
-      ps_out="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.State.Running}}' 2>/dev/null)"
-      if [ -n "$ps_out" ]; then
-        bad_projects="$(printf '%s\n' "$ps_out" | awk -F'\t' '
-          $2 != "" {
-            proj=$2
-            total[proj]++
-            if ($3 == "true") running[proj]++
-          }
-          END {
-            for (p in total) {
-              run_count = running[p] ? running[p] : 0
-              if (run_count < total[p]) {
-                printf "%s (%d/%d运行中) ", p, run_count, total[p]
-              }
-            }
-          }
-        ')"
-        if [ -n "$bad_projects" ]; then
-          echo "- Compose 项目有容器已停止: $bad_projects"
-          echo "  建议: 运行 ua docker 并选择 8 进入项目管理，对该项目进行一键 Compose Up 重启拉起。"
+
+  local ignored_name
+  for ignored_name in $UA_IGNORE_CONTAINERS; do
+    _ua_alert_event ignored '' "container:$ignored_name"
+  done
+  for ignored_name in $UA_IGNORE_SERVICES; do
+    _ua_alert_event ignored '' "service:$ignored_name"
+  done
+  for ignored_name in $UA_IGNORE_RCLONE_REMOTES; do
+    _ua_alert_event ignored '' "rclone:$ignored_name"
+  done
+  if has_cmd docker; then
+    _ua_alert_event checked docker.daemon
+    if docker info >/dev/null 2>&1; then
+      local inventory filtered_inventory="" _bad="" invalid_inventory=0 _bname _bstate _bstatus _project projects project running total
+      _ua_alert_event checked probe:docker.inventory
+      if ! inventory="$(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Label "com.docker.compose.project"}}')"; then
+        _ua_alert_event unknown docker.container
+        _ua_alert_event unknown docker.compose
+        _ua_alert_event issue probe:docker.inventory probe:docker.inventory warning "Docker 容器列表检测失败"
+        echo "- Docker 容器状态检测失败，不能认定所有容器正常。"
+        found=1
+      else
+        while IFS=$'\t' read -r _bname _bstate _bstatus _project; do
+          [ -n "$_bname" ] || continue
+          case "$_bname" in *-ua-old-*|*-ua-failed-*) continue ;; esac
+          list_has_word "$_bname" "$UA_IGNORE_CONTAINERS" && continue
+          if [ -z "$_bstatus" ] || [[ ! "$_bstate" =~ ^(running|exited|created|restarting|paused|dead|removing)$ ]]; then
+            _ua_alert_event unknown "docker.container:$_bname"
+            invalid_inventory=1
+            continue
+          fi
+          if [ "$_bstate" = running ] && [[ "$_bstatus" = *'health: starting'* ]]; then
+            _ua_alert_event unknown "docker.container:$_bname"
+          else
+            _ua_alert_event checked "docker.container:$_bname"
+            if [ "$_bstate" != running ] || [[ "$_bstatus" = *'(unhealthy)'* ]]; then
+              _ua_alert_event issue "docker.container:$_bname" "container:$_bname" critical "容器异常（停止或健康检查失败）: $_bname"
+              _bad+="$_bname"$'\n'
+              found=1
+            fi
+          fi
+          filtered_inventory+="$_bname"$'\t'"$_bstate"$'\t'"$_bstatus"$'\t'"$_project"$'\n'
+        done <<< "$inventory"
+        if [ "$invalid_inventory" -eq 1 ]; then
+          _ua_alert_event unknown docker.compose
+          _ua_alert_event issue probe:docker.inventory probe:docker.inventory warning "Docker 列表包含无法确认的状态"
+          echo "- Docker 列表包含无法确认的状态，不能判断相关对象恢复。"
           found=1
         fi
+        if [ -n "$_bad" ]; then
+          echo "- Docker 异常容器（已停止或健康检查失败）:"
+          printf '%s' "$_bad"
+          echo "  建议: 先查看日志和健康检查结果，再决定是否重启。"
+        fi
+        projects="$(printf '%s' "$filtered_inventory" | awk -F'\t' '
+          $4 != "" {
+            total[$4]++
+            if ($2 == "running" && $3 !~ /unhealthy|health: starting/) ready[$4]++
+          }
+          END { for (p in total) printf "%s\t%d\t%d\n", p, ready[p]+0, total[p] }
+        ')"
+        while IFS=$'\t' read -r project running total; do
+          [ -n "$project" ] || continue
+          _ua_alert_event checked "docker.compose:$project"
+          if [ "$running" -lt "$total" ]; then
+            _ua_alert_event issue "docker.compose:$project" "compose:$project" critical "Compose 项目未全部就绪: $project ($running/$total)"
+            echo "- Compose 项目未全部就绪: $project ($running/$total)"
+            found=1
+          fi
+        done <<< "$projects"
       fi
     else
+      _ua_alert_event issue docker.daemon docker:daemon critical "Docker 服务未运行或不可访问"
+      _ua_alert_event unknown docker.container
+      _ua_alert_event unknown docker.compose
+      _ua_alert_event unknown probe:docker.inventory
       echo "- Docker 服务未运行或不可访问"
-      echo "  建议: 使用 systemctl status docker 查看原因，必要时执行 systemctl restart docker。"
+      echo "  建议: 使用 systemctl status docker 查看原因。"
       found=1
     fi
+  else
+    _ua_alert_event unknown docker
+    _ua_alert_event unknown probe:docker.inventory
   fi
 
   if has_cmd systemctl; then
-    local _monitor_svcs
+    local _monitor_svcs unit_list active_rc
     _monitor_svcs="${UA_MONITOR_SERVICES:-caddy}"
-    # shellcheck disable=SC2086
     for svc in $_monitor_svcs; do
-      list_has_word "$svc" "$UA_IGNORE_SERVICES" && continue
-      if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
-        ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-        echo "- 服务未运行: $svc"
-        echo "  建议: 需要该服务时执行 systemctl start $svc；不再使用可执行 ua ignore service $svc。"
-        found=1
+      if list_has_word "$svc" "$UA_IGNORE_SERVICES"; then
+        _ua_alert_event ignored '' "service:$svc"
+        continue
       fi
+      if ! unit_list="$(systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null)" || [ -z "$unit_list" ]; then
+        _ua_alert_event unknown "service:$svc"
+        continue
+      fi
+      active_rc=0
+      systemctl is-active --quiet "$svc" 2>/dev/null || active_rc=$?
+      case "$active_rc" in
+        0) _ua_alert_event checked "service:$svc" ;;
+        3)
+          _ua_alert_event checked "service:$svc"
+          _ua_alert_event issue "service:$svc" "service:$svc" critical "服务未运行: $svc"
+          echo "- 服务未运行: $svc"
+          found=1
+          ;;
+        *) _ua_alert_event unknown "service:$svc" ;;
+      esac
     done
+  else
+    _ua_alert_event unknown service
   fi
 
+
   if has_cmd rclone; then
-    if [ "${UA_STATUS_SKIP_RCLONE:-0}" = "1" ]; then
+    if [ "${UA_STATUS_SKIP_RCLONE:-0}" = 1 ]; then
+      _ua_alert_event unknown rclone
       echo "- rclone remote 检测已跳过（UA_STATUS_SKIP_RCLONE=1）"
     else
-      local _rclone_count
-      _rclone_count="$(rclone listremotes 2>/dev/null | wc -l)"
-      if [ "$_rclone_count" -gt 0 ]; then
-        echo -e "${gl_huang}检测 ${_rclone_count} 个 rclone remote，每个最多等待 ${check_timeout}s，请稍候...${gl_bai}"
-      fi
-      failed_remotes=""
-      while IFS= read -r remote; do
-        [ -z "$remote" ] && continue
-        list_has_word "$remote" "$UA_IGNORE_RCLONE_REMOTES" && continue
-        if has_cmd timeout; then
-          output="$(timeout "$check_timeout" rclone lsd "${remote}:" 2>&1 >/dev/null)"
-          rc=$?
-          [ "$rc" -eq 124 ] && status="timeout" || status="fail"
-        else
-          output="$(rclone lsd "${remote}:" 2>&1 >/dev/null)"
-          rc=$?
-          status="fail"
-        fi
-        if [ "$rc" -ne 0 ]; then
-          failed_remotes="${failed_remotes}${remote}(${status}) "
-        fi
-      done < <(rclone listremotes 2>/dev/null | sed 's/:$//')
-      if [ -n "$failed_remotes" ]; then
-        echo "- rclone remote 连接异常: $failed_remotes"
-        echo "  连接测试超时: ${check_timeout}s/remote"
-        echo "  建议: 执行 ua rclone 检测配置；确认不用的 remote 可执行 ua ignore rclone <名称>。"
-        found=1
+      local _rclone_list
+      if ! _rclone_list="$(rclone listremotes 2>/dev/null)"; then
+        _ua_alert_event unknown rclone
+        echo "- rclone remote 列表不可读取，不能判断恢复。"
+      else
+        while IFS= read -r remote; do
+          remote="${remote%:}"
+          [ -n "$remote" ] || continue
+          if list_has_word "$remote" "$UA_IGNORE_RCLONE_REMOTES"; then
+            _ua_alert_event ignored '' "rclone:$remote"
+            continue
+          fi
+          if ! has_cmd timeout; then
+            _ua_alert_event unknown "rclone:$remote"
+            echo "- 缺少 timeout，已跳过远程连接探测: $remote"
+            continue
+          fi
+          rc=0
+          timeout "$check_timeout" rclone lsd "${remote}:" >/dev/null 2>&1 || rc=$?
+          _ua_alert_event checked "rclone:$remote"
+          if [ "$rc" -ne 0 ]; then
+            _ua_alert_event issue "rclone:$remote" "rclone:$remote" warning "rclone remote 连接失败或超时: $remote"
+            echo "- rclone remote 连接异常: $remote"
+            found=1
+          fi
+        done <<< "$_rclone_list"
       fi
     fi
+  else
+    _ua_alert_event unknown rclone
   fi
 
   if has_cmd openssl; then
@@ -7220,7 +8124,9 @@ ua_abnormal_summary() {
       [ -d "$cert_dir" ] || continue
       while IFS= read -r crt_file; do
         [ -z "$crt_file" ] || [ ! -f "$crt_file" ] && continue
+        _ua_alert_event checked "certificate:$crt_file"
         if ! openssl x509 -checkend 604800 -noout -in "$crt_file" >/dev/null 2>&1; then
+          _ua_alert_event issue "certificate:$crt_file" "certificate:$crt_file" warning "证书即将过期或不可解析: $(basename "$crt_file" .crt)"
           expiring_certs="${expiring_certs}$(basename "$crt_file" .crt) "
         fi
       done < <(find "$cert_dir" -type f -name "*.crt" 2>/dev/null)
@@ -7238,85 +8144,42 @@ ua_abnormal_summary() {
 }
 
 ua_send_notification() {
-  local title="$1"
-  local body="$2"
-  local full_text sent_any=0
-
+  local title="$1" body="$2" channel="${3:-all}" full_text payload kind sent_any=0 failed=0
+  case "$channel" in all|telegram|webhook) ;; *) return 1 ;; esac
+  has_cmd python3 || { echo "需要 python3 生成及验证通知。" >&2; return 1; }
   full_text="【${title}】
-主机: $(hostname 2>/dev/null || echo 'unknown')
+主机: $(hostname 2>/dev/null || echo unknown)
 时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
-------------------------
 ${body}"
-
-  if [ -n "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -n "${UA_NOTIFY_TG_CHAT_ID:-}" ]; then
-    if curl -fsSL --max-time 15 -X POST "https://api.telegram.org/bot${UA_NOTIFY_TG_BOT_TOKEN}/sendMessage" \
-      --data-urlencode "chat_id=${UA_NOTIFY_TG_CHAT_ID}" \
-      --data-urlencode "text=${full_text}" >/dev/null 2>&1; then
-      echo -e "${gl_lv}✓ Telegram 告警消息推送成功。${gl_bai}"
-      sent_any=1
+  if [ "$channel" != webhook ] && [ -n "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -n "${UA_NOTIFY_TG_CHAT_ID:-}" ]; then
+    payload="$(python3 -c 'import json,sys; print(json.dumps({"chat_id":sys.argv[1],"text":sys.argv[2]}))' "$UA_NOTIFY_TG_CHAT_ID" "$full_text")" || return 1
+    if ua_notification_post telegram "https://api.telegram.org/bot${UA_NOTIFY_TG_BOT_TOKEN}/sendMessage" "$payload"; then
+      echo "Telegram 已确认接收。"; sent_any=1
     else
-      echo -e "${gl_hong}✗ Telegram 告警消息推送失败，请检查 Bot Token / Chat ID 或网络。${gl_bai}"
+      echo "Telegram 发送或平台确认失败。" >&2; failed=1
     fi
   fi
-
-  if [ -n "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
-    local escaped_json
-    escaped_json="$(printf '%s' "$full_text" | awk '
-      BEGIN { ORS="" }
-      {
-        gsub(/\\/, "\\\\")
-        gsub(/"/, "\\\"")
-        gsub(/\t/, "\\t")
-        gsub(/\r/, "")
-        if (NR > 1) printf "\\n"
-        printf "%s", $0
-      }
-    ')"
-    local payload="{\"msgtype\":\"text\",\"text\":{\"content\":\"${escaped_json}\"},\"content\":\"${escaped_json}\",\"title\":\"${title}\",\"body\":\"${escaped_json}\"}"
-    if curl -fsSL --max-time 15 -X POST "$UA_NOTIFY_WEBHOOK_URL" \
-      -H "Content-Type: application/json" \
-      -d "$payload" >/dev/null 2>&1; then
-      echo -e "${gl_lv}✓ Webhook 告警消息推送成功。${gl_bai}"
-      sent_any=1
+  if [ "$channel" != telegram ] && [ -n "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
+    if kind="$(ua_webhook_kind)" && payload="$(ua_health_operation notify-payload "$kind" "$title" "$full_text")" &&
+       ua_notification_post "$kind" "$UA_NOTIFY_WEBHOOK_URL" "$payload"; then
+      echo "Webhook 平台已确认接收。"; sent_any=1
     else
-      echo -e "${gl_hong}✗ Webhook 告警消息推送失败，请检查 Webhook URL。${gl_bai}"
+      echo "Webhook 类型未知、发送失败或平台未确认；请核对渠道配置。" >&2; failed=1
     fi
   fi
-
-  if [ "$sent_any" -eq 0 ]; then
-    if [ -z "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -z "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
-      echo -e "${gl_huang}提示: 尚未配置 Telegram Bot 或 Webhook 告警渠道（可通过 ua notify 配置）。${gl_bai}"
-    fi
-    return 1
-  fi
-  log_action "notification sent: $title"
+  [ "$sent_any" -eq 1 ] || { echo "没有通知渠道确认成功。" >&2; return 1; }
+  [ "$failed" -eq 0 ] || return 1
+  log_action "notification delivery acknowledged" || echo "通知已确认，但审计日志写入失败。" >&2
   return 0
 }
 
 ua_status_notify() {
   local force_test="${1:-}"
-  if [ "$force_test" = "--test" ] || [ "$force_test" = "test" ]; then
-    ua_send_notification "UA Box 告警通道测试" "这是一条来自 UA Box v${UA_BOX_VERSION} 的测试通知，您的告警推送配置工作正常！"
+  if [ "$force_test" = "--test" ] || [ "$force_test" = test ]; then
+    ua_send_notification "UA Box 告警通道测试" "这是一条测试通知；测试不会改变去重或恢复状态。"
     return $?
   fi
-
-  local summary_file="$UA_BOX_TMP_DIR/ua-abnormal-notify.$$"
-  _UA_LAST_ABNORMAL_FOUND=0
-  ua_abnormal_summary > "$summary_file" 2>&1
-
-  # 去除 ANSI 颜色控制符与首行标题
-  local clean_summary
-  clean_summary="$(sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$summary_file" | grep -v '^异常汇总$' | grep -v '^检测 .* 个 rclone remote')"
-  rm -f "$summary_file"
-
-  if printf '%s\n' "$clean_summary" | grep -q "暂无明显异常"; then
-    echo "巡检完成：当前系统无明显异常，无需发送告警。"
-    return 0
-  fi
-
-  echo "检测到系统异常，正在触发告警推送..."
-  printf '%s\n' "$clean_summary"
-  ua_send_notification "UA Box 状态巡检异常告警" "$clean_summary"
+  ua_notify_serialized
 }
 
 ua_notify_menu() {
@@ -7333,11 +8196,7 @@ ua_notify_menu() {
     else
       wh_stat="${gl_hui}未配置${gl_bai}"
     fi
-    if crontab -l 2>/dev/null | grep -q "status --notify"; then
-      cron_stat="${gl_lv}已开启 ($(crontab -l 2>/dev/null | grep 'status --notify' | head -n1))${gl_bai}"
-    else
-      cron_stat="${gl_hui}未开启${gl_bai}"
-    fi
+    cron_stat="$(ua_notify_cron_status)" || cron_stat="${cron_stat:-读取失败，状态未知}"
 
     echo -e "${gl_kjlan}状态巡检主动告警推送 (Telegram / Webhook)${gl_bai}"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -7351,6 +8210,7 @@ ua_notify_menu() {
     echo -e "${gl_kjlan}4.  ${gl_bai}立即执行一次异常巡检并推送 (ua status --notify)"
     echo -e "${gl_kjlan}5.  ${gl_bai}开启 Cron 定时自动巡检告警 (每 30 分钟)"
     echo -e "${gl_kjlan}6.  ${gl_bai}关闭 Cron 定时自动巡检告警"
+    echo "7.  设置重复告警冷却时间（当前 ${UA_NOTIFY_COOLDOWN_SECONDS:-3600} 秒，恢复立即通知）"
     echo -e "${gl_kjlan}0.  ${gl_bai}返回"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
@@ -7360,15 +8220,19 @@ ua_notify_menu() {
         local token chat_id
         read -r -e -p "请输入 Telegram Bot Token (留空清除): " token
         read -r -e -p "请输入 Telegram Chat ID (留空清除): " chat_id
-        config_set_var "UA_NOTIFY_TG_BOT_TOKEN" "$token"
-        config_set_var "UA_NOTIFY_TG_CHAT_ID" "$chat_id"
+        config_set_var "UA_NOTIFY_TG_BOT_TOKEN" "$token" || { pause; continue; }
+        config_set_var "UA_NOTIFY_TG_CHAT_ID" "$chat_id" || { pause; continue; }
         echo -e "${gl_lv}Telegram 告警配置已保存。${gl_bai}"
         pause
         ;;
       2)
-        local wh_url
+        local wh_url wh_type
         read -r -e -p "请输入 Webhook URL (留空清除): " wh_url
-        config_set_var "UA_NOTIFY_WEBHOOK_URL" "$wh_url"
+        read -r -e -p "渠道类型 auto/wecom/feishu/dingtalk/discord/bark，回车自动识别: " wh_type || { pause; continue; }
+        wh_type="${wh_type:-auto}"
+        case "$wh_type" in auto|wecom|feishu|dingtalk|discord|bark) ;; *) echo "未知类型。"; pause; continue ;; esac
+        config_set_var "UA_NOTIFY_WEBHOOK_TYPE" "$wh_type" || { pause; continue; }
+        config_set_var "UA_NOTIFY_WEBHOOK_URL" "$wh_url" || { pause; continue; }
         echo -e "${gl_lv}Webhook 告警配置已保存。${gl_bai}"
         pause
         ;;
@@ -7381,19 +8245,30 @@ ua_notify_menu() {
         pause
         ;;
       5)
-        need_root || { pause; continue; }
-        local ua_bin="/usr/local/bin/ua"
-        [ ! -x "$ua_bin" ] && ua_bin="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-        (crontab -l 2>/dev/null | grep -v "status --notify"; echo "*/30 * * * * $ua_bin status --notify >/dev/null 2>&1") | crontab -
-        log_action "enable cron status --notify (every 30m)"
-        echo -e "${gl_lv}✓ 已开启每 30 分钟自动异常巡检与告警推送。${gl_bai}"
+        if ua_notify_cron_update enable; then
+          echo "已核验每 30 分钟巡检任务。"
+        else
+          echo "定时任务设置未完成。" >&2
+        fi
         pause
         ;;
       6)
-        need_root || { pause; continue; }
-        crontab -l 2>/dev/null | grep -v "status --notify" | crontab - 2>/dev/null || true
-        log_action "disable cron status --notify"
-        echo -e "${gl_huang}已关闭定时自动巡检告警。${gl_bai}"
+        if ua_notify_cron_update disable; then
+          echo "已核验 UA Box 自动巡检任务已关闭。"
+        else
+          echo "关闭操作未完成，请核对实际任务。" >&2
+        fi
+        pause
+        ;;
+      7)
+        local cooldown
+        read -r -e -p "冷却秒数 0–604800（0 表示每次提醒，回车取消）: " cooldown || break
+        [ -n "$cooldown" ] || continue
+        if [[ "$cooldown" =~ ^[0-9]{1,6}$ ]] && ((10#$cooldown <= 604800)); then
+          config_set_var UA_NOTIFY_COOLDOWN_SECONDS "$((10#$cooldown))"
+        else
+          echo "冷却时间无效。"
+        fi
         pause
         ;;
       0) break ;;
@@ -7680,7 +8555,7 @@ ua_ignore_add() {
     next="$(list_add_words "$current" "$normalized")"
     current="$next"
   done
-  config_set_var "$var" "$current"
+  config_set_var "$var" "$current" || return 1
   log_action "ignore add $kind $*"
   echo "已加入忽略列表: $label -> $*"
 }
@@ -7705,7 +8580,7 @@ ua_ignore_remove() {
   done
   # shellcheck disable=SC2086
   next="$(list_remove_words "$current" $items)"
-  config_set_var "$var" "$next"
+  config_set_var "$var" "$next" || return 1
   log_action "ignore remove $kind $*"
   echo "已取消忽略: $label -> $*"
 }
@@ -7812,7 +8687,7 @@ ua_ignore_menu() {
     echo -e "${gl_kjlan}7.   ${gl_bai}取消忽略 rclone remote"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) ua_ignore_current; pause ;;
@@ -7834,6 +8709,7 @@ ua_settings_menu() {
     echo -e "${gl_kjlan}UA Box 设置${gl_bai}"
     echo -e "${gl_kjlan}-----------------------[ 状态与日志 ]------------------------${gl_bai}"
     echo -e "  ${gl_kjlan}1.  ${gl_bai}查看状态检查"
+    echo -e "  ${gl_kjlan}12. ${gl_bai}只读诊断 (ua doctor)"
     echo -e "  ${gl_kjlan}2.  ${gl_bai}查看最近运行日志"
     echo -e "  ${gl_kjlan}3.  ${gl_bai}清空运行日志"
     echo -e "${gl_kjlan}-----------------------[ 配置与备份 ]------------------------${gl_bai}"
@@ -7849,7 +8725,7 @@ ua_settings_menu() {
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
     echo -e "  ${gl_hong}0.  ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) ua_status; pause ;;
@@ -7888,6 +8764,7 @@ ua_settings_menu() {
       9) update_self; pause ;;
       10) ua_notify_menu ;;
       11) ua_migration_menu ;;
+      12) ua_doctor; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -7923,6 +8800,7 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua work                打开工作区模块
   ua rclone              打开 rclone 管理
   ua test                打开测试脚本菜单
+  ua doctor [--json]     只读诊断依赖、配置权限及功能前提；不会安装或修复
   ua status              显示状态检查
   ua status --notify     执行异常巡检并在发现异常时推送告警
   ua notify              打开状态巡检告警推送配置菜单
@@ -7937,7 +8815,7 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua log                 查看最近日志
   ua backup              备份当前脚本
   ua update              按配置 URL 更新脚本
-  ua init                一键初始化优化（系统更新+工具+Swap+Docker）
+  ua init                一键初始化优化（Swap→系统更新→工具→Docker→状态检查）
   ua bbr                 BBR 拥塞控制管理
   ua fw                  防火墙管理
   ua install <pkg>       安装指定软件包
@@ -7965,7 +8843,7 @@ main_menu() {
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
     echo -e "  ${gl_hong}0.  ${gl_bai}退出脚本"
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) system_info ;;
@@ -8054,6 +8932,10 @@ case "${1:-}" in
     ;;
   test|bench|测试)
     test_scripts_menu
+    ;;
+  doctor)
+    shift
+    ua_doctor "$@"
     ;;
   status|状态)
     shift

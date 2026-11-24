@@ -1,6 +1,10 @@
 logs/
 backups/
+state/
 *.log
 *.bak
 limit-shutdown.sh
 .DS_Store
+
+__pycache__/
+*.pyc
