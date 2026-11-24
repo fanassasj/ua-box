@@ -104,7 +104,7 @@ curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lso
 - Caddy 反代管理（支持宿主机原生部署与 Docker 容器化部署，双栈自适应管理）
 - Nginx Proxy Manager 可视化面板
 - **it-tools 工具箱**（支持 Docker 与 Docker Compose 双模部署）
-- **File Browser 文件浏览器** (支持可视化管理和传输服务器本地全盘文件，支持 Docker 与 Docker Compose 双模部署)
+- **File Browser 文件浏览器**（选择管理目录，默认 `/root/filebrowser/files`；支持 Docker 与 Docker Compose 双模部署）
 - **OpenList 网盘系统** (AList 社区开源分支，支持 Docker 和 Docker Compose 双模部署，内置管理员密码一键重置与日志提取)
 - **Uptime Kuma 服务监控面板** (轻量级自建站点与 Docker 健康状态监控，支持 Docker 和 Docker Compose 双模部署)
 
@@ -166,6 +166,80 @@ curl wget sudo socat htop btop iftop unzip tar tmux vim nano git jq ncdu fzf lso
 
 支持通过 `ua status --notify` 或 `ua notify` 配置 Telegram Bot / 通用 Webhook（兼容企微/飞书/钉钉/Discord/Bark）定时自动巡检并在发现异常时主动推送告警。确认无需处理的异常可通过 `ua ignore` 管理，不需要手动编辑配置文件。
 
+### 只读诊断与告警状态
+
+```bash
+ua doctor                # 只读检查依赖、配置权限、目录访问条件和功能前提
+ua doctor --json         # 结构化报告，适合自动检查
+ua notify                # 配置渠道；选项 7 设置重复告警冷却时间
+ua status --notify       # 执行一次巡检，按状态变化和冷却时间通知
+ua notify test           # 测试渠道，不改变去重或恢复记录
+```
+
+`doctor` 不创建日志、备份、状态或临时目录，不执行配置文件，不安装依赖、不自动修复、不启动服务，也不发送消息。它检查 Bash/Python 和基本工具、配置语法及权限、目录访问条件、可用磁盘空间、Docker 的只读连接及 Unix Socket 前提、Compose 配置输出能力、rclone/FUSE/systemd、bbolt 与通知依赖。配置里的动态 Shell 语句只标记为无法静态确认，不执行，也不显示凭据或连接地址。退出码为 `0`（通过）、`1`（存在提醒）、`2`（存在错误）；可选功能的 `SKIP` 表示未具备相应条件。访问权限只按现有元数据判断，不通过写文件验证；诊断通过不代表业务恢复验收通过。
+
+告警默认冷却 **3600 秒**。每个故障对象有独立标识，指标数值变化不会绕过去重；新故障、严重级别变化和下一次巡检确认的恢复无需等待冷却。持续故障到期后再次提醒，恢复通知确认送达后只发一次。冷却可设置为 `0–604800` 秒，`0` 表示每次巡检都提醒。
+
+通知按渠道分别确认和记账：一个渠道失败只重试该渠道，平台未确认时不更新其去重状态。状态默认保存在 `state/notify/state.json`，目录权限 `700`、文件权限 `600`，可通过 `UA_NOTIFY_STATE_DIR` 指定独立绝对路径；状态只保留故障信息和渠道指纹，不保存 Token、Webhook 地址或密码。`UA_NOTIFY_COOLDOWN_SECONDS` 可覆盖默认冷却时间。Cron 和手动巡检共用文件锁，避免并发重复发送；状态文件损坏、权限不安全或写入失败会报错，不会静默重置。
+
+恢复必须基于同一对象的明确正常结果：删除容器/项目、移除 remote、健康检查仍在启动、跳过检查、服务状态未知或探测失败都不会被当作恢复。明确加入忽略列表的对象会静默退役，不发送“已恢复”。通知是至少一次送达设计：若进程在平台接收后、保存确认记录前中断，或响应在网络中丢失，下次可能重复发送；没有平台幂等接口时不能承诺严格只发送一次。
+
+## 更新与迁移的可靠性
+
+更新与迁移共用一个持久化恢复引擎。操作前记录原容器 ID、名称、运行状态、网络、原目录身份及文件清单，日志使用临时文件替换与 `fsync`。SIGINT/SIGTERM 会触发恢复；进程被 SIGKILL 或主机重启后，可通过恢复记录继续核对实际状态，不能依赖内存中的完成标记。
+
+- **容器恢复**：各网络分别恢复，单个网络失败不会跳过旧容器启动。恢复后重新读取容器 ID、名称、运行状态、健康状态和网络；任何步骤或日志持久化失败都不报告完整恢复成功。日志磁盘不可写时继续尝试启动旧容器，并向终端输出实际观测状态。
+- **保留容器的重启隔离**：在日志中记录原始 `RestartPolicy` 后，将旧容器设为 `restart=no` 并读取实际值确认，随后才停写或切换目录。候选容器同样以 `no` 创建，验证通过并记录提升意图后才恢复正式策略。回滚先隔离、停止候选容器，再恢复被选定旧容器的原策略（含 on-failure 重试次数）。保留的其他实例保持 `no`；隔离、策略恢复或实际值校验失败均不报告恢复成功。日志包含旧容器与保留候选的实测策略，支持按日志重复恢复。
+- **原始数据保留**：停写后在同一文件系统的私有兄弟目录建立完整候选副本；数据库验证通过后使用 Linux `renameat2(RENAME_EXCHANGE)` 原子交换。新版本只使用候选数据，失败时交换回原始目录，保留失败版本数据用于检查。更新成功也保留旧容器和原始目录，不自动删除容器、数据卷或恢复副本。
+- **迁移不混用旧文件**：版本 2 归档携带完整目录根、文件数量、大小、SHA-256、权限及数据库验证记录。独立解包并验证全部内容后整目录切换，目标中的额外文件留在原目录副本，不混入恢复结果。多个目录通过日志协调，切换期间要求全部使用者停写；这不是跨目录的单次原子操作。
+- **回滚不复制覆盖原件**：根据持久化的设备号、inode 和原内容清单核对实际位置，使用原子交换恢复，不向唯一原始副本写入。发现未知目标身份、原件校验失败、挂载点、跨文件系统或不支持原子交换时拒绝盲目覆盖。重复恢复不撤销旧服务重新启动后的合法写入。
+- **恢复记录**：`backups/.container-update-<名称>.json` 保存当前操作，`backups/update-*.json` 保留已完成操作；目录记录位于 `backups/data-*.json` 或 `backups/pre-import-*/journal.json`。原始目录保存在目标旁权限为 `700` 的 `.ua-recovery-*` 目录。配置快照和日志可能含凭据，权限为 `600`，请勿公开。它们均不自动清理。
+- **归档兼容性**：只接受版本 2 完整性清单，旧版无清单归档不能自动恢复数据库。拒绝链接、特殊文件、路径越界、重复成员及未知配置赋值；原有归档保持不变。安装器仍先暂存校验，再逐文件原子替换，失败恢复原文件。
+
+项目部署模板对应的数据库与策略：
+
+| 面板 | 默认持久化位置 | 数据库 | 一致性与独立验证 |
+|---|---|---|---|
+| Uptime Kuma 1 | `/root/uptime-kuma/kuma.db` | SQLite | 完整停写副本 → SQLite backup API → 完整性/外键检查 → 独立解包重验 |
+| OpenList | `/root/openlist/data/data.db`，以配置为准 | 默认 SQLite，可配置外部数据库 | 识别配置与实际文件；SQLite 使用同一验证流程，外部配置阻止自动操作 |
+| Nginx Proxy Manager | 默认 `/root/nginx-proxy-manager/data/database.sqlite`，以实际配置为准 | 默认 SQLite，可配置外部数据库 | 共用实际后端识别函数；配置文件优先于环境变量，不能按残留文件推断 |
+| File Browser | `/root/filebrowser/filebrowser.db` | Bolt/bbolt，不能当成 SQLite | 停写完整副本 → 官方 `bbolt check` → 独立解包再校验 |
+| Caddy、it-tools | 配置、证书或无数据库 | 无内置业务数据库 | 完整目录清单与文件内容校验 |
+
+上游依据：[Kuma 1 数据库实现](https://github.com/louislam/uptime-kuma/blob/1.23.16/server/database.js)、[OpenList 数据库配置](https://openlistteam.github.io/docs/config/configuration.html)、[NPM 数据库配置](https://nginxproxymanager.com/setup/)、[File Browser Bolt 存储](https://github.com/filebrowser/filebrowser/blob/master/storage/bolt/bolt.go)。
+
+**安全边界**：自动更新仅支持本机 Unix Socket Docker、独立目录挂载及可验证的本地数据库。导出和迁移要求所有相关容器/宿主进程已经停写；运行中的共享卷使用者会阻止切换。外部 MySQL/PostgreSQL 等数据库必须先进行原生一致性逻辑备份，并在独立实例完成恢复演练；本实现未提供自动外部数据库恢复，因此明确阻止这类操作，不会把文件归档认定为数据库备份。旧版 File Browser 的全盘可写挂载 `/:/srv` 也会阻止自动更新，因为无法为全盘写入提供安全回退；本轮不会更改已有容器挂载。其他自定义数据库路径或存储驱动必须先验证适配。
+
+NPM 更新、导出及迁移采用同一后端识别结果：读取正式容器的 inspect 配置，并用 `docker cp` 只读获取该容器实际选择的 JSON 配置（包含镜像层旧配置），不执行容器命令。外部 MySQL/PostgreSQL、参数不完整、配置读取失败、自定义启动命令或运行实例不唯一时明确拒绝；日志不输出密码、配置内容或连接字符串。导出记录脱敏的后端类型、配置来源和实际 SQLite 路径；迁移核对源记录及已有目标实例的实际配置。旧 NPM 归档缺少后端记录时拒绝自动恢复，避免把遗留 SQLite 当成当前数据库。
+
+容器更新和迁移需要 Python 3；bbolt 备份还需要官方 `bbolt` 命令，缺少校验器时失败退出。未配置健康检查的容器只验证进程持续运行，不能据此确认全部业务功能。硬件断电、远程存储及真实 Docker 引擎版本差异仍需独立环境演练。
+
+```bash
+ua verify-backup /path/to/backup.tar.gz   # 独立解包、清单及数据库验证，不恢复生产目录
+ua recover /path/to/journal.json         # 确认后按实际身份继续恢复；不会盲目覆盖未知数据
+```
+
+## 开发验证
+
+测试只使用模拟 Docker/防火墙/服务命令、临时 SQLite/bbolt 数据库及隔离子进程，不操作现有容器或生产数据库。另使用 `systemd-escape` 和 `systemd-analyze verify` 检查服务名及临时单元文件语法，不启动服务。完整测试要求 `bbolt v1.4.3` 位于 PATH，缺少时真实 bbolt 测试会失败，不会跳过。
+
+```bash
+# 将官方校验器安装到选定的测试工具目录，不必安装到系统目录
+GOBIN=/tmp/ua-test-bin go install go.etcd.io/bbolt/cmd/bbolt@v1.4.3
+export PATH="/tmp/ua-test-bin:$PATH"
+bash -n ua-box
+bash -n install.sh
+bash -n install-local.sh
+shellcheck ua-box install.sh install-local.sh
+python3 -m unittest discover -s tests -v
+```
+
+Docker 策略模拟器覆盖 `always`、`unless-stopped`、`on-failure`、手动停止和 daemon 重启的差异，并检查模拟运行实例是否竞争端口或写入相同目录；它不实现真实端口分配、外部编排器或 Docker 网络驱动。本轮 P1 测试未使用真实 Docker，真实信号、SQLite 和 bbolt 验证均只发生在隔离测试文件/进程中。
+
+测试覆盖网络部分恢复、重命名与创建响应中断、SQLite WAL/结构迁移回退、bbolt 损坏、文件缺失/哈希不符、旧残留文件、复制失败、ENOSPC、日志写入失败、真实 SIGINT/SIGTERM/SIGKILL 和重复恢复。原有 17 项场景保留，其中容器成功路径加强为断言旧容器和原始数据均保留，迁移夹具升级为带完整清单的目录备份。GitHub Actions 使用固定版本 bbolt 执行同一套测试，并运行 Bash 语法和 ShellCheck 错误级检查；完整 ShellCheck 仍可能报告原项目的 warning/style 提示。
+
+`tests/test_doctor_notifications.py` 另外验证完整 doctor 命令不会执行配置或创建目录，并验证通知去重、冷却、严重级别变化、单项恢复、未知状态、单渠道失败、锁竞争及状态写入失败。所有 Docker、服务状态、rclone 和发送操作使用模拟命令；测试不调用真实 Docker 或通知平台。
+
 ## 快捷命令
 
 ```bash
@@ -181,10 +255,13 @@ ua test            # 测试脚本合集
 ua top             # 打开动态 Live 实时系统监控控制台 (CPU/内存/网络网速/容器)
 ua fzf             # 打开 fzf 全功能交互式模糊搜索导航面板
 ua status          # UA 状态检查
+ua doctor          # 只读诊断（加 --json 输出结构化报告）
 ua status --notify # 执行异常巡检并在发现异常时主动推送告警
 ua notify          # 打开状态巡检主动告警配置菜单 (Telegram / Webhook)
 ua export          # 一键打包导出全部面板配置与数据（支持联动上传 rclone）
-ua import          # 从迁移归档包一键恢复面板配置与数据
+ua import          # 从已验证的版本 2 归档整目录恢复
+ua verify-backup <归档> # 独立验证备份
+ua recover <记录>  # 核对实际状态并恢复
 ua ignore          # 异常忽略管理
 ua ignore current  # 忽略当前异常项
 ua ignore rclone quark # 忽略指定 rclone remote 异常
@@ -265,6 +342,17 @@ UA_BOX_UPDATE_URL="https://raw.githubusercontent.com/fanassasj/ua-box/main/ua-bo
 
 ## 安全说明
 
+- `UA_BOX_TMP_DIR` 指定临时文件的父目录；程序只清理自己创建的随机子目录。SIGINT/SIGTERM 分别退出为 130/143，监控界面的信号处理不影响返回后的菜单。
+- 批量容器操作先显示实际名单并确认，排除 `-ua-old-`、`-ua-failed-` 保留实例；已停止且带恢复操作标签的容器不参与批量启动，需使用恢复记录处理。
+- 切换端口绑定沿用原镜像 ID、环境、挂载、网络和其他端口；保留原容器并隔离重启策略。失败时核对身份恢复，未验证实际运行端口时不会提示成功。此操作不做数据库迁移或数据库回退。
+- Compose 端口切换通过实际容器标签定位项目及文件，在同目录暂存并用 `docker compose config --format json` 对比完整生效配置。当前支持单文件、单一明确的短格式 TCP 端口；多文件、变量/范围/长格式端口等不能可靠改写的配置会在停止容器前拒绝。不会运行项目级 `compose down`。
+- Docker 日志、IPv6 和手动配置编辑统一在暂存文件上校验，保留其他配置；缺少 `dockerd --validate` 或原 JSON 无效时拒绝修改。应用前确认重启影响；重启失败时恢复原配置并核验服务，原始备份不会被覆盖。进程被 SIGKILL 或宿主机掉电后的服务恢复仍需人工核对保留的备份。
+- 容器端口访问菜单管理当前 DOCKER-USER 的 DROP 规则。未指定来源时预检 IPv4/IPv6 两个地址族；缺少工具或链时拒绝操作。规则未自动持久化，不能替代外部连通性测试，也不会绕过其他网络限制。
+- 创建容器的命令参数和下载 URL 不进入审计日志，日志权限为 `600`。不会自动清理已有日志中的历史内容。
+- 新建面板不再使用递归 `777`。File Browser 默认管理独立目录，选择系统目录需要再次确认；凭据按实际镜像启动日志或版本说明获取。
+- SSH 切换端口前检查占用及防火墙结果，切换后核验监听；Fail2ban 仅更新 `[sshd]` 配置段。仍需保留原终端并用独立连接测试云安全组和端到端访问。
+- rclone 服务使用 `systemd-escape --path` 编码挂载路径，拒绝覆盖已有同名服务，校验单元文件和实际挂载结果；缺少 FUSE 时停止并提示安装。
+- 告警识别 `unhealthy` 并排除隔离保留实例。Webhook 使用渠道对应的 JSON 和业务响应校验；可在 `ua notify` 选择 `auto/wecom/feishu/dingtalk/discord/bark`，自建地址需明确类型。HTTP 成功不代表平台业务成功；真实推送尚需使用测试渠道验证。
 - 高风险操作会二次确认，支持输入 `yes` 或 `y` 继续，输入 `n` 取消。
 - 高风险操作会显示影响范围和对象/命令，例如重装系统、开放所有端口、卸载脚本、清空定时任务、删除容器数据。
 - rclone 配置检测不会显示 token、密码、client_secret。

@@ -8,8 +8,22 @@ UA_BOX_CONFIG="${UA_BOX_CONFIG:-$UA_BOX_HOME/config}"
 UA_BOX_LOG_DIR="${UA_BOX_LOG_DIR:-$UA_BOX_HOME/logs}"
 UA_BOX_LOG_FILE="${UA_BOX_LOG_FILE:-$UA_BOX_LOG_DIR/ua-box.log}"
 UA_BOX_BACKUP_DIR="${UA_BOX_BACKUP_DIR:-$UA_BOX_HOME/backups}"
-UA_BOX_TMP_DIR="${UA_BOX_TMP_DIR:-$(mktemp -d /tmp/ua-box.XXXXXX)}"
-trap 'rm -rf "$UA_BOX_TMP_DIR"' EXIT INT TERM
+# UA_BOX_TMP_DIR 指定父目录；只清理本进程创建的子目录。
+UA_BOX_READ_ONLY=0
+if [ "${1:-}" = doctor ]; then
+  UA_BOX_READ_ONLY=1
+  UA_BOX_TMP_DIR=""
+else
+  UA_BOX_TMP_DIR="$(mktemp -d "${UA_BOX_TMP_DIR:-${TMPDIR:-/tmp}}/ua-box.XXXXXX")" || exit 1
+fi
+readonly UA_BOX_OWN_TMP_DIR="$UA_BOX_TMP_DIR"
+ua_cleanup_tmp() {
+  [ -n "$UA_BOX_OWN_TMP_DIR" ] && [ -d "$UA_BOX_OWN_TMP_DIR" ] && rm -rf -- "$UA_BOX_OWN_TMP_DIR"
+  return 0
+}
+trap ua_cleanup_tmp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 gl_hui='\033[37m'
 gl_hong='\033[31m'
 gl_lv='\033[32m'
@@ -51,11 +65,13 @@ GITHUB_PROXY_URLS="https://ghp.ci https://gh-proxy.com https://ghproxy.net"
 UA_NOTIFY_TG_BOT_TOKEN=""
 UA_NOTIFY_TG_CHAT_ID=""
 UA_NOTIFY_WEBHOOK_URL=""
+UA_NOTIFY_COOLDOWN_SECONDS=3600
 
 init_ua_box() {
+  [ "$UA_BOX_READ_ONLY" = 1 ] && return 0
   mkdir -p "$UA_BOX_HOME" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR"
   if [ ! -f "$UA_BOX_CONFIG" ]; then
-    cat > "$UA_BOX_CONFIG" <<'EOF'
+    (umask 077; cat > "$UA_BOX_CONFIG" <<'EOF'
 # UA Box 配置文件
 # 修改后重新运行 ua 生效。
 
@@ -75,6 +91,7 @@ GITHUB_PROXY_URLS="https://ghp.ci https://gh-proxy.com https://ghproxy.net"
 UA_NOTIFY_TG_BOT_TOKEN=""
 UA_NOTIFY_TG_CHAT_ID=""
 UA_NOTIFY_WEBHOOK_URL=""
+UA_NOTIFY_COOLDOWN_SECONDS=3600
 
 WARP_MANAGER_SCRIPT="$WARP_MANAGER_SCRIPT"
 
@@ -95,6 +112,7 @@ BESTTRACE_SCRIPT="$BESTTRACE_SCRIPT"
 SUPERSPEED_SCRIPT="$SUPERSPEED_SCRIPT"
 LIMIT_SHUTDOWN_SCRIPT="$LIMIT_SHUTDOWN_SCRIPT"
 EOF
+    )
   fi
 
   # shellcheck disable=SC1090
@@ -103,12 +121,15 @@ EOF
 
 log_action() {
   local message="$*"
-  mkdir -p "$UA_BOX_LOG_DIR"
+  mkdir -p "$UA_BOX_LOG_DIR" || return 1
+  [ ! -L "$UA_BOX_LOG_FILE" ] && [ ! -L "${UA_BOX_LOG_FILE}.1" ] || return 1
   # 日志超过 5MB 自动轮转，保留最近一份
   if [ -f "$UA_BOX_LOG_FILE" ] && [ "$(wc -c < "$UA_BOX_LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
     mv "$UA_BOX_LOG_FILE" "${UA_BOX_LOG_FILE}.1"
   fi
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$message" >> "$UA_BOX_LOG_FILE"
+  (umask 077; printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$message" >> "$UA_BOX_LOG_FILE") || return 1
+  chmod 600 "$UA_BOX_LOG_FILE"
+  [ ! -f "${UA_BOX_LOG_FILE}.1" ] || chmod 600 "${UA_BOX_LOG_FILE}.1"
 }
 
 confirm_danger() {
@@ -176,13 +197,13 @@ select_with_fzf_or_menu() {
   fi
 
   local i item_count="${#input_items[@]}"
-  echo -e "${gl_kjlan}${prompt_msg}${gl_bai}"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}${prompt_msg}${gl_bai}" >&2
+  echo -e "${gl_kjlan}------------------------${gl_bai}" >&2
   for ((i=0; i<item_count; i++)); do
-    echo -e "${gl_kjlan}$((i+1)). ${gl_bai}${input_items[$i]}"
+    echo -e "${gl_kjlan}$((i+1)). ${gl_bai}${input_items[$i]}" >&2
   done
-  echo -e "${gl_kjlan}0. 取消${gl_bai}"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
+  echo -e "${gl_kjlan}0. 取消${gl_bai}" >&2
+  echo -e "${gl_kjlan}------------------------${gl_bai}" >&2
 
   local choice
   read -r -e -p "请输入序号选择 (0-$item_count): " choice
@@ -207,7 +228,7 @@ _ua_completion() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  main_commands="ps info sys system ssh ssh-port ssh-key f2b fail2ban tools panel docker dk work rclone test status notify export import ignore config log backup update init bbr fw fb ol top monitor fzf search find install remove settings"
+  main_commands="doctor ps info sys system ssh ssh-port ssh-key f2b fail2ban tools panel docker dk work rclone test status notify export import recover verify-backup ignore config log backup update init bbr fw fb ol top monitor fzf search find install remove settings"
 
   if [ "$COMP_CWORD" -eq 1 ]; then
     mapfile -t COMPREPLY < <(compgen -W "${main_commands}" -- "${cur}")
@@ -282,7 +303,10 @@ create_local_links() {
 }
 
 system_live_monitor() {
-  trap 'tput cnorm 2>/dev/null; clear; return 0' INT TERM
+  (
+  trap 'tput cnorm 2>/dev/null || true' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   tput civis 2>/dev/null || true
 
   local num_cpus
@@ -695,6 +719,7 @@ system_live_monitor() {
         ;;
     esac
   done
+  )
 }
 
 system_fzf_interactive_menu() {
@@ -749,7 +774,7 @@ system_fzf_interactive_menu() {
     *"13. 🛠"*) common_tools_menu ;;
     *"14. ⚡"*) system_init_optimize ;;
     *"15. 🧪"*) test_scripts_menu ;;
-    *"16. 🏥"*) system_status_check; pause ;;
+    *"16. 🏥"*) ua_status; pause ;;
     *"17. ⚙️"*) "${EDITOR:-nano}" "$UA_BOX_CONFIG" ;;
   esac
 }
@@ -819,8 +844,11 @@ update_self() {
   }
   local atomic_tmp
   atomic_tmp="$(mktemp "${src}.tmp.XXXXXX")" || return 1
-  cp "$tmp" "$atomic_tmp" && mv "$atomic_tmp" "$src"
-  chmod +x "$src"
+  if ! cp "$tmp" "$atomic_tmp" || ! chmod 755 "$atomic_tmp" || ! mv -f "$atomic_tmp" "$src"; then
+    rm -f "$atomic_tmp"
+    echo "更新文件替换失败，已保留原版本。" >&2
+    return 1
+  fi
   rm -f "$tmp"
   log_action "update_self from $update_url"
   create_local_links >/dev/null 2>&1 || true
@@ -916,24 +944,28 @@ list_remove_words() {
 }
 
 config_set_var() {
-  local var="$1"
-  local value="$2"
-  local tmp escaped
+  local var="$1" value="$2" tmp escaped assignment
+  [[ "$var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || return 1
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || { echo "配置值不能包含换行。" >&2; return 1; }
 
-  escaped="$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-  tmp="$UA_BOX_TMP_DIR/ua-box-config.$$"
-  awk -v var="$var" -v value="$escaped" '
+  # 单引号字面量，避免配置重新加载时执行 $()、反引号或变量展开。
+  escaped=${value//\'/\'\\\'\'}
+  assignment="$var='$escaped'"
+  tmp="$(mktemp "${UA_BOX_CONFIG}.tmp.XXXXXX")" || return 1
+  if ! UA_CONFIG_ASSIGNMENT="$assignment" awk -v var="$var" '
     BEGIN { found=0 }
     $0 ~ "^" var "=" {
-      print var "=\"" value "\"";
-      found=1;
-      next;
+      if (!found) print ENVIRON["UA_CONFIG_ASSIGNMENT"]
+      found=1
+      next
     }
     { print }
-    END {
-      if (!found) print var "=\"" value "\"";
-    }
-  ' "$UA_BOX_CONFIG" > "$tmp" && mv "$tmp" "$UA_BOX_CONFIG"
+    END { if (!found) print ENVIRON["UA_CONFIG_ASSIGNMENT"] }
+  ' "$UA_BOX_CONFIG" > "$tmp" || ! bash -n "$tmp" ||
+    ! chmod 600 "$tmp" || ! mv -f "$tmp" "$UA_BOX_CONFIG"; then
+    rm -f "$tmp"
+    return 1
+  fi
   # shellcheck disable=SC1090
   . "$UA_BOX_CONFIG"
 }
@@ -1099,7 +1131,7 @@ download_to() {
   local url="$1"
   local output="$2"
 
-  log_action "download $url -> $output"
+  log_action "download -> $output (URL omitted)"
 
   try_dl() {
     local target_url="$1"
@@ -1461,172 +1493,1677 @@ ask_deploy_mode() {
 }
 
 toggle_container_port_bind() {
-  local container_name="$1"
-  local host_port="$2"
-  local container_port="$3"
-
-  if ! docker_container_exists "$container_name"; then
-    echo "容器 $container_name 未安装。"
+  local container_name="$1" host_port="$2" container_port="$3" t_choice bind_ip
+  need_root || return 1
+  echo "1) 仅绑定 127.0.0.1"
+  echo "2) 绑定 0.0.0.0"
+  read -r -e -p "请选择端口模式 (1/2，其他输入取消): " t_choice || return 1
+  case "$t_choice" in
+    1) bind_ip=127.0.0.1 ;;
+    2) bind_ip=0.0.0.0 ;;
+    *) echo "已取消。"; return 0 ;;
+  esac
+  confirm_danger "切换端口绑定；保留旧容器，验证失败时恢复" "$container_name $bind_ip:$host_port:$container_port" || return 1
+  if run_recovery_operation bind "$container_name" "$host_port" "$container_port" "$bind_ip" "$UA_BOX_BACKUP_DIR" "${UA_CONTAINER_UPDATE_TIMEOUT:-120}"; then
+    log_action "container port binding verified $container_name $bind_ip:$host_port:$container_port"
+  else
+    echo "端口切换未完成，请查看恢复记录；不能认定已成功。" >&2
     return 1
   fi
+}
 
-  local current_ports
-  current_ports="$(docker container inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{$p}} -> {{(index $conf 0).HostIp}}:{{(index $conf 0).HostPort}}{{end}}' "$container_name" 2>/dev/null)"
-  echo -e "当前容器端口映射: ${gl_lv}${current_ports:-0.0.0.0 (全网卡暴露)}${gl_bai}"
+ua_recovery_program() {
+  cat <<'PY_UA_RECOVERY'
+"""Linux recovery operations. No mutation occurs on import; journals contain secrets."""
+import contextlib
+import copy
+import ctypes
+import errno
+import fcntl
+import fnmatch
+import hashlib
+import http.client
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import shutil
+import signal
+import socket
+import sqlite3
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import uuid
+from urllib.parse import quote
 
-  echo ""
-  echo "请选择要切换的端口映射模式："
-  echo "1) 🛡️ 锁定本地 127.0.0.1 (安全模式，禁止外网直连)"
-  echo "2) 🌐 开放公网 0.0.0.0 (公网模式，允许 IP:端口 直连)"
-  read -r -e -p "请输入选择 (1 或 2): " t_choice
-  
-  local new_bind=""
-  local bind_mode_flag=""
-  if [ "$t_choice" = "1" ]; then
-    new_bind="127.0.0.1:${host_port}:${container_port}"
-    bind_mode_flag="127.0.0.1"
-  elif [ "$t_choice" = "2" ]; then
-    new_bind="${host_port}:${container_port}"
-    bind_mode_flag="0.0.0.0"
-  else
-    echo "已取消操作。"
+
+class RecoveryError(RuntimeError):
+    pass
+
+
+class Interrupted(KeyboardInterrupt):
+    pass
+
+
+def fault(point):
+    """Test seam, deliberately not controlled by environment or user configuration."""
+
+
+@contextlib.contextmanager
+def signals(handling=True):
+    previous = {}
+    def cancelled(signum, frame):
+        raise Interrupted("signal " + str(signum))
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, cancelled if handling else signal.SIG_IGN)
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def sync_dir(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def save_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=".journal-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as out:
+            json.dump(data, out, ensure_ascii=False, sort_keys=True, indent=2)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+        sync_dir(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextlib.contextmanager
+def locked(paths):
+    with contextlib.ExitStack() as stack:
+        for path in sorted(set(map(str, paths))):
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            stream = stack.enter_context(os.fdopen(fd, "a"))
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for data in iter(lambda: source.read(1024 * 1024), b""):
+            hasher.update(data)
+    return hasher.hexdigest()
+
+
+def metadata(path):
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        raise RecoveryError("不支持链接或特殊文件: " + str(path))
+    record = {"type": "dir" if path.is_dir() else "file", "mode": stat.S_IMODE(info.st_mode),
+              "uid": info.st_uid, "gid": info.st_gid}
+    if record["type"] == "file":
+        record.update(size=info.st_size, sha256=digest(path))
+    return record
+
+
+def inventory(path):
+    path = Path(path)
+    result = {".": metadata(path)}
+    if path.is_dir():
+        for base, dirs, files in os.walk(path, followlinks=False):
+            for name in sorted(dirs + files):
+                child = Path(base) / name
+                result[child.relative_to(path).as_posix()] = metadata(child)
+    return result
+
+
+def identity(path):
+    try:
+        info = Path(path).lstat()
+        return [info.st_dev, info.st_ino]
+    except FileNotFoundError:
+        return None
+
+
+def check_path(path):
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise RecoveryError("目标必须是规范绝对路径: " + str(path))
+    for item in (path, *path.parents):
+        if item.is_symlink():
+            raise RecoveryError("目标或父目录是符号链接: " + str(item))
+    if path.exists():
+        metadata(path)
+    return path
+
+
+def require_space(parent, size):
+    if shutil.disk_usage(parent).free < size + max(1024 * 1024, size // 20):
+        raise RecoveryError("可用磁盘空间不足: " + str(parent))
+
+
+def copy_verified(source, target):
+    before = inventory(source)
+    require_space(target.parent, sum(r.get("size", 0) for r in before.values()))
+    def copy_file(source_file, target_file):
+        result = shutil.copy2(source_file, target_file)
+        fault("after_copy_file")
+        return result
+    if Path(source).is_dir():
+        shutil.copytree(source, target, copy_function=copy_file)
+    else:
+        copy_file(source, target)
+    # copy2 does not preserve ownership. Preserve it explicitly, including directories.
+    if os.geteuid() == 0:
+        for rel, record in before.items():
+            os.chown(target if rel == "." else target / rel, record["uid"], record["gid"])
+    if inventory(source) != before or inventory(target) != before:
+        raise RecoveryError("复制不完整或源文件在复制期间发生变化: " + str(source))
+    for rel, record in before.items():
+        item = target if rel == "." else target / rel
+        if record["type"] == "file":
+            with item.open("rb") as stream:
+                os.fsync(stream.fileno())
+    for base, dirs, files in os.walk(target) if target.is_dir() else []:
+        sync_dir(base)
+    sync_dir(target.parent)
+    fault("copy_complete")
+    return before
+
+
+def exchange(left, right):
+    """Atomic exchange on Linux; never fall back to copying over the old directory."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, "renameat2", None)
+    if function is None:
+        raise RecoveryError("系统缺少 renameat2；拒绝使用非原子目录覆盖。")
+    if function(-100, os.fsencode(left), -100, os.fsencode(right), 2) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(left))
+    sync_dir(Path(left).parent)
+    sync_dir(Path(right).parent)
+
+
+CONFIG_NAMES = set("""DEFAULT_WORKSPACE_PREFIX DEFAULT_RCLONE_MOUNT_ARGS UA_BOX_UPDATE_URL
+UA_IGNORE_CONTAINERS UA_IGNORE_SERVICES UA_IGNORE_RCLONE_REMOTES UA_STATUS_DISK_WARN
+UA_STATUS_DISK_CRIT UA_APT_UPDATE_INTERVAL UA_MONITOR_SERVICES UA_STATUS_SKIP_RCLONE
+UA_MAX_BACKUPS GITHUB_PROXY_URLS UA_NOTIFY_TG_BOT_TOKEN UA_NOTIFY_TG_CHAT_ID
+UA_NOTIFY_WEBHOOK_URL WARP_MANAGER_SCRIPT DOCKER_INSTALL_SCRIPT DOCKER_INSTALL_SCRIPTS
+RCLONE_INSTALL_SCRIPT YABS_SCRIPT BENCH_SCRIPT OPENAI_CHECK_SCRIPT REGION_UNLOCK_SCRIPT
+YEAHWU_UNLOCK_SCRIPT MTR_TRACE_SCRIPT IABC_SPEEDTEST_SCRIPT FUSION_TEST_SCRIPT GB5_SCRIPT
+REINSTALL_SCRIPT BESTTRACE_SCRIPT SUPERSPEED_SCRIPT LIMIT_SHUTDOWN_SCRIPT
+RCLONE_STATUS_CHECK_TIMEOUT RCLONE_CHECK_TIMEOUT UA_CONTAINER_UPDATE_TIMEOUT""".split())
+
+
+def safe_config(text):
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>()")
+    lexer.whitespace_split = True
+    seen, assignments = set(), []
+    for token in lexer:
+        name, sep, value = token.partition("=")
+        if not sep or name not in CONFIG_NAMES or name in seen:
+            raise RecoveryError("迁移配置含未知配置名、重复项或可执行语法: " + name)
+        seen.add(name)
+        if value not in ("$" + name, "${" + name + "}"):
+            assignments.append(name + "=" + shlex.quote(value))
+    return "# UA Box 已校验的迁移配置\n" + "\n".join(assignments) + "\n"
+
+
+def sqlite_verify(path):
+    # Only call on an independent copy. SQLite may create SHM files when reading WAL.
+    with contextlib.closing(sqlite3.connect(str(path))) as database:
+        result = database.execute("PRAGMA integrity_check").fetchall()
+        if result != [("ok",)]:
+            raise RecoveryError("SQLite 完整性检查失败: " + str(path))
+        if database.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RecoveryError("SQLite 外键完整性检查失败: " + str(path))
+        schema = database.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall()
+        return {"engine": "sqlite", "schema_sha256": hashlib.sha256(json.dumps(schema).encode()).hexdigest()}
+
+
+def normalize_sqlite(path):
+    destination = path.with_name(path.name + ".ua-snapshot")
+    if destination.exists():
+        raise RecoveryError("备份暂存文件冲突: " + str(destination))
+    with contextlib.closing(sqlite3.connect(str(path))) as source, contextlib.closing(sqlite3.connect(str(destination))) as target:
+        source.backup(target)
+        target.commit()
+        target.execute("PRAGMA journal_mode=DELETE")
+    report = sqlite_verify(destination)
+    shutil.copystat(path, destination)
+    if os.geteuid() == 0:
+        info = path.stat()
+        os.chown(destination, info.st_uid, info.st_gid)
+    os.replace(destination, path)
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(path) + suffix)
+        if companion.exists():
+            companion.unlink()  # Only an independent staging copy, never the source database.
+    return report
+
+
+def bbolt_verify(path):
+    binary = shutil.which("bbolt")
+    if not binary:
+        raise RecoveryError("检测到 Bolt/bbolt 数据库；缺少 bbolt check，不能认定备份有效。")
+    subprocess.run([binary, "check", str(path)], check=True, capture_output=True, timeout=120)
+    return {"engine": "bbolt", "check": "ok"}
+
+
+def inspect_databases(tree, normalize=False, expected=()):
+    tree = Path(tree)
+    candidates = [tree] if tree.is_file() else sorted(p for p in tree.rglob("*") if p.is_file())
+    found = {}
+    normalized_companions = set()
+    for path in candidates:
+        if path in normalized_companions and not path.exists():
+            continue
+        relative = "." if tree.is_file() else path.relative_to(tree).as_posix()
+        if path.name in ("config.json", "db-config.json"):
+            try:
+                config = json.loads(path.read_text())
+            except (ValueError, UnicodeError):
+                raise RecoveryError("无法识别数据库配置: " + str(path))
+            database = config.get("database", config if path.name == "db-config.json" else {})
+            kind = database.get("type", "sqlite3")
+            if kind not in ("sqlite", "sqlite3", ""):
+                raise RecoveryError("检测到外部数据库 " + str(kind) + "；需要独立逻辑备份和恢复演练，自动操作已阻止。")
+        with path.open("rb") as stream:
+            header = stream.read(32)
+        report = None
+        if header.startswith(b"SQLite format 3\x00"):
+            report = normalize_sqlite(path) if normalize else sqlite_verify(path)
+            if normalize:
+                normalized_companions.update(Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal"))
+        elif len(header) >= 24 and struct.unpack_from("<I", header, 16)[0] == 0xED0CDAED:
+            report = bbolt_verify(path)
+        elif path.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
+            raise RecoveryError("数据库损坏、为空或格式不受支持: " + str(path))
+        if report:
+            found[relative] = report
+    for name in expected:
+        if name not in found:
+            raise RecoveryError("数据库备份缺失: " + name)
+    return found
+
+
+def is_npm(runtime):
+    image = ((runtime.get("Config", {}).get("Labels") or {}).get("ua.recovery.image_ref")
+             or runtime.get("Config", {}).get("Image", ""))
+    return "nginx-proxy-manager" in image.lower()
+
+
+def npm_config_file(runtime, environment):
+    """Read the selected container config, including image-layer/legacy overrides, without exec."""
+    directory = environment.get("NODE_CONFIG_DIR", "./config")
+    mode = environment.get("NODE_ENV", "default")
+    working = runtime.get("Config", {}).get("WorkingDir")
+    if not isinstance(working, str) or not working.startswith("/") or not re.fullmatch(r"[A-Za-z0-9_-]+", mode):
+        raise RecoveryError("NPM 配置来源无法确认。")
+    path = PurePosixPath(directory)
+    if not path.is_absolute():
+        path = PurePosixPath(working) / path
+    if ".." in path.parts:
+        raise RecoveryError("NPM 配置来源无法确认。")
+    # Never expose docker cp stderr: config paths and environment may contain credentials.
+    result = subprocess.run(["docker", "cp", runtime["Id"] + ":" + str(path / (mode + ".json")), "-"],
+                            capture_output=True, timeout=30)
+    if result.returncode:
+        if b"Could not find the file" in result.stderr or b"no such file or directory" in result.stderr:
+            return None
+        raise RecoveryError("NPM 配置读取失败，不能推断数据库后端。")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:*") as archive:
+            members = archive.getmembers()
+            if len(members) != 1 or not members[0].isfile() or members[0].size > 1024 * 1024:
+                raise ValueError()
+            config = json.loads(archive.extractfile(members[0]).read())
+        if not isinstance(config, dict):
+            raise ValueError()
+        return config
+    except Exception:
+        raise RecoveryError("NPM 配置无法识别，不能推断数据库后端。") from None
+
+
+def identify_npm_backend(runtime, config_loader=None):
+    """One decision function for update/export/restore; never infer the backend from a DB file."""
+    unknown = {"backend": "unknown", "source": "unconfirmed"}
+    try:
+        if not is_npm(runtime):
+            return unknown
+        config_metadata = runtime["Config"]
+        entrypoint, command = config_metadata.get("Entrypoint") or [], config_metadata.get("Cmd") or []
+        if not ((entrypoint == ["/init"] and not command) or (not entrypoint and command == ["/init"])):
+            return unknown  # Custom startup can override inspect's environment before Node starts.
+        env, seen = {}, set()
+        for item in runtime["Config"]["Env"]:
+            key, sep, value = item.partition("=")
+            if not sep or key in seen:
+                return unknown
+            seen.add(key)
+            env[key] = value
+        # These indirections can change backend selectors outside inspect's environment.
+        selectors = ("DB_MYSQL_HOST", "DB_MYSQL_USER", "DB_MYSQL_NAME", "DB_POSTGRES_HOST",
+                     "DB_POSTGRES_USER", "DB_POSTGRES_NAME", "DB_SQLITE_FILE", "NODE_CONFIG_DIR", "NODE_ENV")
+        if any(key.endswith(("_FILE", "__FILE")) and key.removesuffix("__FILE").removesuffix("_FILE") in selectors
+               and value for key, value in env.items()):
+            return unknown
+        config = (config_loader or npm_config_file)(runtime, env)
+        if config is not None and "database" in config and config["database"] not in (None, False, "", 0):
+            database = config["database"]
+            engine = database.get("engine")
+            if engine in ("mysql", "mysql2", "pg", "postgres", "postgresql"):
+                return {"backend": "mysql" if engine in ("mysql", "mysql2") else "postgres", "source": "runtime-file"}
+            knex = database.get("knex", {})
+            if engine != "knex-native" or knex.get("client") not in ("sqlite3", "better-sqlite3"):
+                return unknown
+            filename = knex["connection"]["filename"]
+            source = "runtime-file"
+        else:
+            # Match NPM precedence; partial selectors are deliberately rejected instead of silently falling back.
+            for prefix, backend in (("DB_MYSQL_", "mysql"), ("DB_POSTGRES_", "postgres")):
+                if all(env.get(prefix + suffix) for suffix in ("HOST", "USER", "NAME")):
+                    return {"backend": backend, "source": "runtime-env"}
+            if any(value for key, value in env.items() if key.startswith(("DB_MYSQL_", "DB_POSTGRES_"))):
+                return unknown
+            filename, source = env.get("DB_SQLITE_FILE") or "/data/database.sqlite", "runtime-env"
+        path = PurePosixPath(filename)
+        if not path.is_absolute() or ".." in path.parts or not path.is_relative_to("/data") or str(path) == "/data":
+            return unknown
+        return {"backend": "sqlite", "source": source, "sqlite_file": str(path), "runtime_id": runtime["Id"]}
+    except Exception:
+        return unknown
+
+
+def require_npm_sqlite(decision):
+    if (not isinstance(decision, dict) or decision.get("backend") != "sqlite"
+            or decision.get("source") not in ("runtime-env", "runtime-file")):
+        raise RecoveryError("NPM 使用外部数据库或后端无法确认，已拒绝自动备份、更新或恢复。")
+    filename = decision.get("sqlite_file")
+    if not isinstance(filename, str):
+        raise RecoveryError("NPM 数据库位置无法确认。")
+    path = PurePosixPath(filename)
+    if not path.is_absolute() or ".." in path.parts or not path.is_relative_to("/data") or str(path) == "/data":
+        raise RecoveryError("NPM 数据库位置无法确认。")
+    return "data/" + path.relative_to("/data").as_posix()
+
+
+def npm_runtime_for_root(root, allow_absent=False):
+    """Use the actual stopped/running formal container, not compose text or quarantined instances."""
+    if not shutil.which("docker"):
+        raise RecoveryError("无法读取 NPM 实际运行配置，已拒绝推断数据库后端。")
+    Engine()  # Enforce a local Docker context for local filesystem evidence.
+    matches = []
+    for runtime in all_containers():
+        if not is_npm(runtime) or re.search(r"-ua-(old|failed)-[0-9a-f]{12}$", runtime.get("Name", "")):
+            continue
+        if any(m.get("Destination") == "/data" and Path(m["Source"]) == Path(root) / "data"
+               for m in runtime.get("Mounts", [])):
+            matches.append(runtime)
+    if not matches and allow_absent and not (Path(root) / "data").exists():
+        return None
+    if len(matches) != 1:
+        raise RecoveryError("NPM 实际运行配置缺失或不唯一，已拒绝推断数据库后端。")
+    return matches[0]
+
+
+def npm_backend_for_root(root):
+    decision = identify_npm_backend(npm_runtime_for_root(root))
+    require_npm_sqlite(decision)
+    return decision
+
+
+def profile_expected(name, tree, npm_backend=None):
+    name = name.strip("/")
+    if name == "root/uptime-kuma":
+        return ["kuma.db"]
+    if name == "root/nginx-proxy-manager":
+        return [require_npm_sqlite(npm_backend)]
+    if name == "root/filebrowser":
+        return ["filebrowser.db"]
+    if name == "root/openlist":
+        config = Path(tree) / "data/config.json"
+        if config.exists():
+            database = json.loads(config.read_text()).get("database", {})
+            if database.get("type", "sqlite3") not in ("sqlite", "sqlite3"):
+                raise RecoveryError("OpenList 配置使用外部数据库，自动迁移已阻止。")
+            filename = database.get("db_file", "data/data.db")
+            if Path(filename).is_absolute() or ".." in Path(filename).parts:
+                raise RecoveryError("OpenList 数据库不在完整迁移目录内。")
+            return [filename]
+        return ["data/data.db"]
+    return []
+
+
+class DirectoryTransaction:
+    """Sibling copies + atomic exchange. Originals and failed candidates are retained."""
+    def __init__(self, journal):
+        self.path = Path(journal)
+        self.data = json.loads(self.path.read_text())
+
+    @classmethod
+    def prepare(cls, pairs, journal, normalize=False, config_path=None):
+        path = Path(journal)
+        if path.exists():
+            raise RecoveryError("事务记录已存在，不能覆盖: " + str(path))
+        data = {"format": 2, "kind": "directories", "state": "preparing", "entries": []}
+        save_json(path, data)
+        for target, source in pairs:
+            target, source = check_path(target), Path(source)
+            if not target.parent.is_dir() or os.path.ismount(target):
+                raise RecoveryError("原子切换要求已存在的父目录且目标不是挂载点: " + str(target))
+            private = Path(tempfile.mkdtemp(prefix=".ua-recovery-", dir=target.parent))
+            os.chmod(private, 0o700)
+            slot = private / target.name
+            before = inventory(target) if target.exists() else None
+            copy_verified(source, slot)
+            databases = inspect_databases(slot, normalize=normalize)
+            if config_path is not None and target == Path(config_path):
+                slot.write_text(safe_config(slot.read_text()))
+                os.chmod(slot, 0o600)
+                if os.geteuid() == 0:
+                    os.chown(slot, os.geteuid(), os.getegid())
+            for rel, item in inventory(slot).items():
+                copied = slot if rel == "." else slot / rel
+                if item["type"] == "file":
+                    with copied.open("rb") as stream:
+                        os.fsync(stream.fileno())
+            sync_dir(slot if slot.is_dir() else slot.parent)
+            after = inventory(slot)
+            if before is not None and inventory(target) != before:
+                raise RecoveryError("目标在准备期间发生变化，未切换: " + str(target))
+            entry = {"target": str(target), "slot": str(slot), "before": before, "after": after,
+                     "old_id": identity(target), "new_id": identity(slot), "databases": databases}
+            data["entries"].append(entry)
+            save_json(path, data)
+        data["state"] = "prepared"
+        save_json(path, data)
+        return cls(path)
+
+    def lock_paths(self):
+        return [Path(e["target"]).parent / (".ua-recovery-" + Path(e["target"]).name + ".lock") for e in self.data["entries"]]
+
+    def commit(self):
+        with locked(self.lock_paths()):
+            return self._commit()
+
+    def rollback(self):
+        with locked(self.lock_paths()):
+            return self._rollback()
+
+    def _commit(self):
+        if self.data["state"] == "committed":
+            return
+        if self.data["state"] != "prepared":
+            raise RecoveryError("事务尚未准备完整。")
+        self.data["state"] = "switching"
+        save_json(self.path, self.data)
+        for entry in self.data["entries"]:
+            target, slot = Path(entry["target"]), Path(entry["slot"])
+            if identity(target) != entry["old_id"] or inventory(slot) != entry["after"]:
+                raise RecoveryError("切换前身份或内容校验失败: " + str(target))
+            if entry["before"] is not None and inventory(target) != entry["before"]:
+                raise RecoveryError("切换前原数据发生变化: " + str(target))
+            fault("before_exchange")
+            if entry["old_id"] is None:
+                os.rename(slot, target)
+                sync_dir(target.parent)
+            else:
+                exchange(target, slot)
+            fault("after_exchange")  # Journal intent exists even if killed before recording completion.
+        self.data["state"] = "committed"
+        save_json(self.path, self.data)
+
+    def _rollback(self):
+        errors = []
+        for entry in reversed(self.data["entries"]):
+            target, slot = Path(entry["target"]), Path(entry["slot"])
+            try:
+                check_path(target)
+                check_path(slot)
+                current = identity(target)
+                if current == entry["old_id"]:
+                    if current is not None and self.data["state"] != "rolled_back" and inventory(target) != entry["before"]:
+                        raise RecoveryError("原目录内容已变化，拒绝覆盖。")
+                    continue
+                if current != entry["new_id"]:
+                    raise RecoveryError("目标身份变化，拒绝覆盖未知数据。")
+                if entry["old_id"] is None:
+                    if slot.exists():
+                        raise RecoveryError("候选保留位置已被占用。")
+                    os.rename(target, slot)
+                    sync_dir(target.parent)
+                else:
+                    if identity(slot) != entry["old_id"] or inventory(slot) != entry["before"]:
+                        raise RecoveryError("原始备份身份或内容校验失败；备份未覆盖。")
+                    exchange(target, slot)
+                fault("after_rollback_exchange")
+                if identity(target) != entry["old_id"]:
+                    raise RecoveryError("回滚后的目标身份不匹配。")
+            except Exception as error:
+                errors.append({"target": str(target), "error": str(error)})
+        self.data["state"] = "rollback_failed" if errors else "rolled_back"
+        self.data["errors"] = errors
+        save_json(self.path, self.data)
+        if errors:
+            raise RecoveryError("目录回滚未完成: " + json.dumps(errors, ensure_ascii=False))
+
+
+def docker(*args):
+    return subprocess.check_output(["docker", *args], text=True, stderr=subprocess.PIPE, timeout=180).strip()
+
+
+class Engine:
+    def __init__(self):
+        context = os.environ.get("DOCKER_CONTEXT")
+        endpoint = os.environ.get("DOCKER_HOST") if not context else None
+        if not endpoint:
+            endpoint = json.loads(docker("context", "inspect", *([context] if context else [])))[0]["Endpoints"]["docker"]["Host"]
+        if not endpoint.startswith("unix://"):
+            raise RecoveryError("自动操作仅支持本机 Unix Socket Docker。")
+        self.socket_path, self.version = endpoint[7:], ""
+        self.version = "/v" + self.request("GET", "/version")["ApiVersion"]
+
+    def request(self, method, path, data=None):
+        conn = http.client.HTTPConnection("localhost", timeout=30)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(30)
+            sock.connect(self.socket_path)
+            conn.sock = sock
+            conn.request(method, self.version + path, None if data is None else json.dumps(data).encode(),
+                         {"Content-Type": "application/json"})
+            response = conn.getresponse()
+            raw = response.read()
+            result = json.loads(raw) if raw else {}
+            if response.status >= 300:
+                raise RecoveryError("Docker API: " + result.get("message", str(response.status)))
+            return result
+        finally:
+            conn.close()
+            sock.close()
+
+
+def get_container(identifier, missing=False):
+    try:
+        return json.loads(docker("container", "inspect", identifier))[0]
+    except subprocess.CalledProcessError as error:
+        if missing and any(text in str(error.stderr) for text in ("No such object", "No such container")):
+            # Do not confuse daemon unavailability with a genuinely missing container.
+            docker("info")
+            return None
+        raise error
+
+
+def all_containers():
+    ids = docker("ps", "-aq", "--no-trunc").split()
+    return json.loads(docker("container", "inspect", *ids)) if ids else []
+
+
+def overlaps(left, right):
+    left, right = Path(left), Path(right)
+    return left == right or left in right.parents or right in left.parents
+
+
+def offline_guard(roots, exclude=()):
+    roots = [Path(p) for p in roots]
+    if not roots:
+        return
+    native_caddy = (Path("/etc/caddy"), Path("/root/caddy"), Path("/root/caddy_data"), Path("/root/caddy_config"))
+    if any(overlaps(root, path) for root in roots for path in native_caddy) and shutil.which("systemctl"):
+        status = subprocess.run(["systemctl", "is-active", "caddy.service"], capture_output=True, text=True, timeout=15)
+        if status.returncode == 0:
+            raise RecoveryError("原生 Caddy 仍在运行，必须先停止其证书/配置写入。")
+        if status.returncode not in (3, 4):
+            raise RecoveryError("不能确认原生 Caddy 停写状态，操作已阻止。")
+    if shutil.which("docker"):
+        for container in all_containers():
+            if container["Id"] in exclude or not container["State"].get("Running"):
+                continue
+            for mount in container.get("Mounts", []):
+                if any(overlaps(mount["Source"], root) for root in roots):
+                    raise RecoveryError("仍有运行中的数据卷使用者: " + container["Id"][:12])
+    # Reject native processes with writable handles. No guessed 'stopped' acknowledgement.
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit() or int(process.name) == os.getpid():
+            continue
+        try:
+            for fd in (process / "fd").iterdir():
+                try:
+                    name = Path(os.readlink(fd))
+                    if not name.is_absolute() or not any(overlaps(name, root) for root in roots):
+                        continue
+                    info = (process / "fdinfo" / fd.name).read_text()
+                    flags = int(next(line.split()[1] for line in info.splitlines() if line.startswith("flags:")), 8)
+                    if flags & os.O_ACCMODE:
+                        raise RecoveryError("仍有宿主机写入句柄，PID=" + process.name)
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        except PermissionError as error:
+            raise RecoveryError("无法确认进程停写状态: " + process.name) from error
+
+
+def endpoint_config(endpoint, old_id):
+    result = {k: copy.deepcopy(endpoint[k]) for k in ("IPAMConfig", "Links", "Aliases", "DriverOpts", "GwPriority")
+              if endpoint.get(k) is not None}
+    if "Aliases" in result:
+        result["Aliases"] = [x for x in result["Aliases"] if x not in (old_id, old_id[:12])]
+    return result
+
+
+def create_config(old, image_id):
+    config = copy.deepcopy(old["Config"])
+    config["Image"] = image_id
+    config["Labels"] = config.get("Labels") or {}
+    if config.get("Hostname") == old["Id"][:12]:
+        config.pop("Hostname")
+    if "com.docker.compose.image" in (config.get("Labels") or {}):
+        config["Labels"]["com.docker.compose.image"] = image_id
+    host = copy.deepcopy(old["HostConfig"])
+    binds = list(host.get("Binds") or [])
+    targets = {b.split(":")[1] for b in binds if ":" in b}
+    targets.update(m.get("Target") for m in host.get("Mounts") or [])
+    for mount in old.get("Mounts", []):
+        if mount["Type"] == "volume" and mount["Destination"] not in targets:
+            binds.append(mount["Name"] + ":" + mount["Destination"] + (":rw" if mount["RW"] else ":ro"))
+    host["Binds"] = binds
+    config["HostConfig"] = host
+    config["NetworkingConfig"] = {"EndpointsConfig": {
+        n: endpoint_config(e, old["Id"]) for n, e in old.get("NetworkSettings", {}).get("Networks", {}).items()
+        if n not in ("host", "none")}}
+    return config
+
+
+def wait_ready(container, timeout):
+    deadline, consecutive = time.monotonic() + timeout, 0
+    while time.monotonic() < deadline:
+        state = get_container(container)["State"]
+        if not state.get("Running") or state.get("Restarting"):
+            raise RecoveryError("容器未保持运行。")
+        health = state.get("Health", {}).get("Status")
+        if health == "unhealthy":
+            raise RecoveryError("容器健康检查失败。")
+        consecutive += 1
+        if health == "healthy" or (health is None and consecutive >= 3):
+            return
+        time.sleep(1)
+    raise RecoveryError("容器启动/健康检查超时。")
+
+
+def data_roots(old, npm_backend=None):
+    if is_npm(old):
+        require_npm_sqlite(npm_backend if npm_backend is not None else identify_npm_backend(old))
+    env = dict(item.split("=", 1) for item in old["Config"].get("Env") or [] if "=" in item)
+    if not is_npm(old) and any(value for key, value in env.items() if key.startswith(("DB_MYSQL_", "DB_POSTGRES_"))):
+        raise RecoveryError("外部 MySQL/PostgreSQL 必须先独立完成一致性备份及恢复演练；自动更新已阻止。")
+    if env.get("UPTIME_KUMA_DB_TYPE", "sqlite") not in ("sqlite", "sqlite3", ""):
+        raise RecoveryError("外部 Kuma 数据库不支持自动回退。")
+    roots = []
+    for mount in old.get("Mounts", []):
+        if not mount.get("RW", True):
+            continue
+        path = check_path(mount["Source"])
+        if path in (Path("/"), Path("/root"), Path("/var"), Path("/etc")):
+            raise RecoveryError("全盘或系统目录可写挂载无法提供完整数据回退，拒绝自动更新: " + str(path))
+        if not path.exists() or not path.is_dir():
+            raise RecoveryError("自动更新要求独立持久化目录挂载: " + str(path))
+        roots.append(path)
+    return sorted(set(p for p in roots if not any(other != p and other in p.parents for other in roots)))
+
+
+def database_expectations(old, roots, npm_backend=None):
+    image = ((old["Config"].get("Labels") or {}).get("ua.recovery.image_ref") or old["Config"]["Image"]).lower()
+    expected = []
+    names = []
+    if "uptime-kuma" in image:
+        names = ["kuma.db"]
+    elif "nginx-proxy-manager" in image:
+        relative = require_npm_sqlite(npm_backend if npm_backend is not None else identify_npm_backend(old))
+        mounts = [m for m in old.get("Mounts", []) if m.get("Destination") == "/data"]
+        if len(mounts) != 1:
+            raise RecoveryError("NPM 数据库挂载无法确认。")
+        path = Path(mounts[0]["Source"]) / PurePosixPath(relative).relative_to("data")
+        if not path.is_file() or not any(path.is_relative_to(root) for root in roots):
+            raise RecoveryError("实际使用的 NPM 数据库不在备份目录内或不存在。")
+        return [path]
+    elif "openlist" in image:
+        names = ["data.db"]
+    elif "filebrowser/filebrowser" in image:
+        names = ["filebrowser.db"]
+    for name in names:
+        matches = [p for root in roots for p in root.rglob(name)]
+        if len(matches) != 1:
+            raise RecoveryError("必须确认唯一数据库位置及完整性: " + name)
+        expected.extend(matches)
+    return expected
+
+
+NO_RESTART = {"Name": "no", "MaximumRetryCount": 0}
+
+
+def restart_policy(container):
+    policy = container.get("HostConfig", {}).get("RestartPolicy") or NO_RESTART
+    name, retries = policy.get("Name", "no") or "no", policy.get("MaximumRetryCount", 0)
+    if name not in ("no", "always", "unless-stopped", "on-failure") or not isinstance(retries, int) or retries < 0:
+        raise RecoveryError("无法确认容器重启策略，操作已阻止。")
+    return {"Name": name, "MaximumRetryCount": retries if name == "on-failure" else 0}
+
+
+def set_restart_policy(engine, identifier, policy):
+    """Reconcile an acknowledged or response-lost update against actual daemon state."""
+    if restart_policy(get_container(identifier)) == policy:
+        return
+    try:
+        engine.request("POST", "/containers/" + quote(identifier, safe="") + "/update", {"RestartPolicy": policy})
+    except Exception:
+        if restart_policy(get_container(identifier)) != policy:
+            raise RecoveryError("容器重启策略更新失败，未确认策略已恢复。") from None
+    fault("after_restart_policy_update")
+    if restart_policy(get_container(identifier)) != policy:
+        raise RecoveryError("容器重启策略实际值与目标不符。")
+
+
+def record_restart_policy(record, path, container):
+    """Persist the real pre-quarantine policy before changing any retained container."""
+    policies = record.setdefault("restart_policies", {})
+    retained = policies.setdefault("retained_original", {})
+    if container["Id"] not in retained:
+        retained[container["Id"]] = restart_policy(container)
+        save_json(path, record)
+
+
+def _recover_container(journal):
+    path = Path(journal)
+    record = json.loads(path.read_text())
+    engine, old = Engine(), record["old"]
+    original_policy = restart_policy(old)
+    record_restart_policy(record, path, old)
+    errors, log_errors = [], []
+    def persist():
+        try:
+            save_json(path, record)
+        except OSError as error:
+            log_errors.append(str(error))
+            print("恢复日志写入失败，将继续尝试恢复旧容器: " + str(error), file=sys.stderr)
+    def attempt(step, action):
+        event = {"step": step, "time": time.time()}
+        try:
+            action()
+        except Exception as error:
+            event["error"] = str(error)
+            errors.append({"step": step, "error": str(error)})
+        finally:
+            try:
+                observed = get_container(old["Id"])
+                event["old"] = {"id": observed["Id"], "name": observed["Name"],
+                                "state": observed["State"],
+                                "networks": sorted(observed.get("NetworkSettings", {}).get("Networks", {})),
+                                "restart_policy": restart_policy(observed)}
+            except Exception as error:
+                event["observation_error"] = str(error)
+                errors.append({"step": "observe:" + step, "error": str(error)})
+            record.setdefault("events", []).append(event)
+            record["errors"] = list(errors)
+            persist()
+    with signals(False):
+        # Discover actual state by immutable ID and operation label, never by a stale boolean.
+        old_isolated = True
+        attempt("isolate_old_restart", lambda: set_restart_policy(engine, old["Id"], NO_RESTART))
+        old_isolated = restart_policy(get_container(old["Id"])) == NO_RESTART
+        candidate = get_container(record.get("new_id") or record["name"], missing=True)
+        if candidate is None and record.get("new_id"):
+            candidate = get_container(record["name"], missing=True)
+        if candidate and candidate["Id"] == old["Id"]:
+            candidate = None
+        if candidate and (candidate["Config"].get("Labels") or {}).get("ua.recovery.operation") != record["operation"]:
+            errors.append({"step": "candidate_identity", "error": "名称已被未知容器占用，未操作该容器。"})
+            candidate_safe = False
+            candidate = None
+        else:
+            candidate_safe = True
+        if candidate:
+            record["new_id"] = candidate["Id"]
+            # If this write fails, do not mutate an unrecorded retained instance.
+            record_restart_policy(record, path, candidate)
+            attempt("isolate_candidate_restart", lambda: set_restart_policy(engine, candidate["Id"], NO_RESTART))
+            if candidate["State"].get("Running"):
+                attempt("stop_candidate", lambda: docker("stop", candidate["Id"]))
+            actual = get_container(candidate["Id"])
+            candidate_safe = not actual["State"].get("Running") and restart_policy(actual) == NO_RESTART
+            if candidate_safe:
+                if actual["Name"].lstrip("/") != record["failed_name"]:
+                    attempt("rename_candidate", lambda: docker("rename", candidate["Id"], record["failed_name"]))
+                for network in list(actual.get("NetworkSettings", {}).get("Networks", {})):
+                    if network not in ("host", "none"):
+                        attempt("detach_candidate:" + network, lambda n=network: docker("network", "disconnect", n, candidate["Id"]))
+        data_safe = candidate_safe and old_isolated
+        attempt("restore_compose_binding", lambda: restore_compose_binding(record))
+        transaction = record.get("data_journal")
+        if transaction and data_safe:
+            try:
+                data_transaction = DirectoryTransaction(transaction)
+                if any(identity(e["target"]) != e["old_id"] for e in data_transaction.data["entries"]):
+                    offline_guard([Path(e["target"]) for e in data_transaction.data["entries"]])
+                data_transaction.rollback()
+            except Exception as error:
+                errors.append({"step": "data_rollback", "error": str(error)})
+                data_safe = False
+        def restore_old_name():
+            actual = get_container(old["Id"])
+            if actual["Name"].lstrip("/") != record["name"]:
+                docker("rename", old["Id"], record["name"])
+        attempt("rename_old", restore_old_name)
+        expected_networks = record["payload"]["NetworkingConfig"]["EndpointsConfig"]
+        def restore_network(network, endpoint):
+            fault("before_restore_network")
+            actual = get_container(old["Id"])
+            if network not in actual.get("NetworkSettings", {}).get("Networks", {}):
+                engine.request("POST", "/networks/" + quote(network, safe="") + "/connect",
+                               {"Container": old["Id"], "EndpointConfig": endpoint})
+        for network, endpoint in expected_networks.items():
+            attempt("connect:" + network, lambda n=network, e=endpoint: restore_network(n, e))
+        # Only the selected instance regains its original policy; retained peers stay isolated.
+        if data_safe:
+            attempt("restore_old_restart", lambda: set_restart_policy(engine, old["Id"], original_policy))
+        # Network failure MUST NOT skip the independent start attempt.
+        if old["State"].get("Running") and data_safe:
+            attempt("start_old", lambda: docker("start", old["Id"]))
+            attempt("verify_old_readiness", lambda: wait_ready(old["Id"], record["timeout"]))
+        elif not data_safe:
+            errors.append({"step": "start_old_blocked", "error": "无法验证数据回退或新写入者停写状态，保留停止状态。"})
+        actual = get_container(old["Id"])
+        networks = actual.get("NetworkSettings", {}).get("Networks", {})
+        for network, endpoint in expected_networks.items():
+            current = networks.get(network)
+            if (current is None or (endpoint.get("IPAMConfig") and current.get("IPAMConfig") != endpoint["IPAMConfig"])
+                    or not set(endpoint.get("Aliases") or []).issubset(set((current or {}).get("Aliases") or []))):
+                errors.append({"step": "verify_network:" + network, "error": "网络未完整恢复。"})
+        correct = (actual["Id"] == old["Id"] and actual["Name"].lstrip("/") == record["name"]
+                   and bool(actual["State"].get("Running")) == bool(old["State"].get("Running")) and data_safe
+                   and restart_policy(actual) == original_policy)
+        record["observed"] = {"id": actual["Id"], "name": actual["Name"], "state": actual["State"],
+                              "networks": sorted(networks), "data_restored": data_safe if record.get("operation_type") != "bind" else None,
+                              "writer_isolation_verified": data_safe, "restart_policy": restart_policy(actual)}
+        if candidate:
+            retained = get_container(candidate["Id"])
+            record["observed"]["retained_candidate"] = {"id": retained["Id"], "running": retained["State"].get("Running"),
+                                                         "restart_policy": restart_policy(retained)}
+        record["errors"] = errors
+        record["state"] = "recovered" if correct and not errors else "recovery_incomplete"
+        record["log_errors"] = log_errors
+        persist()
+        if log_errors:
+            print("恢复结果无法完整持久化，当前观测状态: " + json.dumps(record["observed"], ensure_ascii=False), file=sys.stderr)
+            raise RecoveryError("日志写入失败，不能认定恢复记录完整；请核对现有日志与终端观测状态。")
+        if record["state"] != "recovered":
+            raise RecoveryError("恢复未完成；真实状态已记录: " + str(path))
+        verified_part = "端口配置" if record.get("operation_type") == "bind" else "数据恢复"
+        print("已验证旧容器名称、ID、运行状态、网络和" + verified_part + ": " + str(path))
+    return record
+
+
+def recover_container(journal):
+    try:
+        return _recover_container(journal)
+    except BaseException as error:
+        with signals(False):
+            record = json.loads(Path(journal).read_text())
+            record["state"] = "recovery_incomplete"
+            record["recovery_error"] = str(error)
+            try:
+                save_json(journal, record)
+            except OSError as log_error:
+                print("无法持久化恢复失败结果: " + str(log_error), file=sys.stderr)
+        raise
+
+
+def update_container(name, backup_dir, timeout):
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name) or not 3 <= int(timeout) <= 3600:
+        raise RecoveryError("容器名或超时参数无效。")
+    os.umask(0o077)
+    backup_dir = Path(backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with locked([backup_dir / ".recovery.lock"]):
+        pending_bind = backup_dir / (".container-bind-" + name + ".json")
+        if pending_bind.exists() and json.loads(pending_bind.read_text())["state"] not in ("committed", "recovered"):
+            raise RecoveryError("存在未完成的端口切换，请先恢复: " + str(pending_bind))
+        active = backup_dir / (".container-update-" + name + ".json")
+        if active.exists():
+            record = json.loads(active.read_text())
+            if record["state"] not in ("committed", "recovered"):
+                recover_container(active)
+                return
+        engine = Engine()
+        old = get_container(name)
+        if old["HostConfig"].get("AutoRemove") or old["HostConfig"].get("NetworkMode", "").startswith("container:"):
+            raise RecoveryError("自动删除或共享其他容器网络的部署不支持自动恢复。")
+        npm_backend = identify_npm_backend(old) if is_npm(old) else None
+        roots = data_roots(old, npm_backend)
+        expected = database_expectations(old, roots, npm_backend)
+        # Check external database configuration and verifier availability before stopping anything.
+        for root in roots:
+            for config in list(root.rglob("config.json")) + list(root.rglob("db-config.json")):
+                data = json.loads(config.read_text())
+                db = data.get("database", data if config.name == "db-config.json" else {})
+                if db.get("type", "sqlite") not in ("sqlite", "sqlite3", ""):
+                    raise RecoveryError("外部数据库必须使用独立逻辑备份与验证流程，自动更新已阻止。")
+        if any(p.name == "filebrowser.db" for p in expected) and not shutil.which("bbolt"):
+            raise RecoveryError("缺少 bbolt check，不能验证 File Browser 数据库。")
+        reference = (old["Config"].get("Labels") or {}).get("ua.recovery.image_ref") or old["Config"]["Image"]
+        if reference.startswith("sha256:"):
+            raise RecoveryError("镜像仅有本地 ID 且没有可验证更新引用；请先明确镜像仓库标签。")
+        docker("pull", reference)
+        image_id = json.loads(docker("image", "inspect", reference))[0]["Id"]
+        operation = uuid.uuid4().hex
+        payload = create_config(old, image_id)
+        original_policy = restart_policy(old)
+        payload["HostConfig"]["RestartPolicy"] = dict(NO_RESTART)
+        payload.setdefault("Labels", {})["ua.recovery.operation"] = operation
+        payload["Labels"]["ua.recovery.image_ref"] = reference
+        record = {"format": 2, "kind": "container", "operation": operation, "name": name,
+                  "old": old, "payload": payload, "timeout": int(timeout), "state": "intent",
+                  "restart_policies": {"old_original": original_policy, "candidate_requested": original_policy,
+                                       "candidate_initial": dict(NO_RESTART), "retained_original": {old["Id"]: original_policy}},
+                  "backup_name": name + "-ua-old-" + operation[:12],
+                  "failed_name": name + "-ua-failed-" + operation[:12]}
+        if npm_backend is not None:
+            record["database_backend"] = npm_backend  # Sanitized evidence, no environment/password values.
+        save_json(active, record)
+        snapshot = backup_dir / ("container-" + name + "-" + operation + ".json")
+        save_json(snapshot, old)
+        try:
+            set_restart_policy(engine, old["Id"], NO_RESTART)
+            if old["State"].get("Running"):
+                docker("stop", old["Id"])
+            if get_container(old["Id"])["State"].get("Running"):
+                raise RecoveryError("无法确认旧容器已经停写。")
+            offline_guard(roots)
+            if roots:
+                data_journal = backup_dir / ("data-" + operation + ".json")
+                transaction = DirectoryTransaction.prepare([(p, p) for p in roots], data_journal, normalize=True)
+                record["data_journal"] = str(data_journal)
+                save_json(active, record)  # Durable BEFORE the first directory exchange.
+                for expected_db in expected:
+                    root = next(p for p in roots if p == expected_db or p in expected_db.parents)
+                    entry = next(e for e in transaction.data["entries"] if e["target"] == str(root))
+                    if expected_db.relative_to(root).as_posix() not in entry["databases"]:
+                        raise RecoveryError("数据库副本未通过验证。")
+                offline_guard(roots)
+                transaction.commit()
+            record["state"] = "replacing"
+            save_json(active, record)
+            for network in payload["NetworkingConfig"]["EndpointsConfig"]:
+                docker("network", "disconnect", network, old["Id"])
+            docker("rename", old["Id"], record["backup_name"])
+            fault("after_container_rename")
+            candidate = engine.request("POST", "/containers/create?name=" + quote(name, safe=""), payload)
+            record["new_id"] = candidate["Id"]
+            save_json(active, record)
+            docker("start", candidate["Id"])
+            wait_ready(candidate["Id"], int(timeout))
+            actual = get_container(candidate["Id"])
+            if actual["Name"].lstrip("/") != name or (actual["Config"].get("Labels") or {}).get("ua.recovery.operation") != operation:
+                raise RecoveryError("新容器实际身份不匹配。")
+            old_actual = get_container(old["Id"])
+            if restart_policy(old_actual) != NO_RESTART or old_actual["State"].get("Running"):
+                raise RecoveryError("旧容器重启隔离未保持，拒绝提升候选容器。")
+            record["state"] = "promoting"
+            save_json(active, record)
+            set_restart_policy(engine, candidate["Id"], original_policy)
+            fault("after_candidate_promotion")
+            wait_ready(candidate["Id"], int(timeout))
+            if restart_policy(get_container(candidate["Id"])) != original_policy:
+                raise RecoveryError("正式容器重启策略未确认。")
+            record["state"] = "committed"
+            save_json(active, record)
+            # Keep a permanent operation journal as well as the per-name active pointer.
+            save_json(backup_dir / ("update-" + operation + ".json"), record)
+            print("更新已验证；旧容器与原始数据均保留。恢复记录: " + str(active))
+        except BaseException:
+            with signals(False):
+                try:
+                    recover_container(active)
+                except Exception as error:
+                    print(str(error), file=sys.stderr)
+            raise
+
+
+TREES = ("root/caddy", "root/caddy_data", "root/caddy_config", "root/openlist", "root/filebrowser",
+         "root/uptime-kuma", "root/nginx-proxy-manager", "root/it-tools")
+
+
+def allowed_path(name, config_path, rclone_path):
+    return (name in (config_path.lstrip("/"), rclone_path.lstrip("/"), "etc/caddy/Caddyfile")
+            or any(name == p or name.startswith(p + "/") for p in TREES)
+            or (name.startswith("etc/systemd/system/") and name.count("/") == 3
+                and fnmatch.fnmatchcase(name.rsplit("/", 1)[1], "rclone-mount-*.service")))
+
+
+def canonical_name(name):
+    result = str(PurePosixPath(name))
+    if not name or name.startswith("/") or ".." in PurePosixPath(name).parts or result == ".":
+        raise RecoveryError("非法归档路径: " + name)
+    return result
+
+
+def build_archive(pairs, archive_path, guard=offline_guard):
+    """Quiesced sources -> independent copy -> DB backup/restore validation -> manifest."""
+    archive_path = Path(archive_path)
+    if archive_path.exists():
+        raise RecoveryError("拒绝覆盖已有备份: " + str(archive_path))
+    guard([source for _, source in pairs])
+    with tempfile.TemporaryDirectory(prefix="ua-export-") as temporary:
+        stage = Path(temporary)
+        roots, entries, databases, backends = [], {}, {}, {}
+        originals = {}
+        for name, source in pairs:
+            name = canonical_name(name)
+            if any(overlaps(Path('/' + name), Path('/' + old)) for old in roots):
+                raise RecoveryError("备份根目录不能重叠。")
+            backend = npm_backend_for_root(source) if name == "root/nginx-proxy-manager" else None
+            if backend is not None:
+                backends[name] = backend
+            destination = stage / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            originals[str(source)] = copy_verified(Path(source), destination)
+            roots.append(name)
+            databases[name] = inspect_databases(destination, normalize=True, expected=profile_expected(name, destination, backend))
+            for relative, record in inventory(destination).items():
+                entries[name if relative == "." else name + "/" + relative] = record
+        guard([source for _, source in pairs])
+        for source, before in originals.items():
+            if inventory(Path(source)) != before:
+                raise RecoveryError("停写校验失败，源数据发生变化。")
+        manifest = {"format": 2, "roots": roots, "entries": entries, "databases": databases,
+                    "database_backends": backends}
+        save_json(stage / "UA-MANIFEST.json", manifest)
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_archive = tempfile.mkstemp(prefix=".ua-export-", dir=archive_path.parent)
+        os.close(descriptor)
+        try:
+            with tarfile.open(temporary_archive, "w:gz", dereference=True) as archive:
+                archive.add(stage / "UA-MANIFEST.json", arcname="UA-MANIFEST.json")
+                for name in roots:
+                    archive.add(stage / name, arcname=name)
+            # Independent unpack + hash + database verification, not just tar readability.
+            with verified_archive(temporary_archive) as verified:
+                pass
+            with open(temporary_archive, "rb") as stream:
+                os.fsync(stream.fileno())
+            # Link is no-clobber and atomic on the same filesystem.
+            os.link(temporary_archive, archive_path)
+            sync_dir(archive_path.parent)
+        finally:
+            if os.path.exists(temporary_archive):
+                os.unlink(temporary_archive)
+    return manifest
+
+
+@contextlib.contextmanager
+def verified_archive(archive_path):
+    with tempfile.TemporaryDirectory(prefix="ua-verify-") as temporary:
+        stage = Path(temporary)
+        names, members = set(), []
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive:
+                name = canonical_name(member.name.rstrip("/"))
+                if name in names or not (member.isdir() or member.isfile()):
+                    raise RecoveryError("归档包含重复路径、链接或特殊文件: " + name)
+                names.add(name)
+                members.append((name, member))
+            if "UA-MANIFEST.json" not in names:
+                raise RecoveryError("缺少版本 2 完整性清单；旧版归档不能自动恢复数据库。")
+            require_space(stage, sum(member.size for _, member in members))
+            for name, member in members:
+                dest = stage / name
+                if member.isdir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.extractfile(member) as source, dest.open("xb") as target:
+                        shutil.copyfileobj(source, target)
+            manifest = json.loads((stage / "UA-MANIFEST.json").read_text())
+            if manifest.get("format") != 2 or not manifest.get("roots"):
+                raise RecoveryError("完整性清单版本或根目录无效。")
+            roots = [canonical_name(name) for name in manifest["roots"]]
+            if len(roots) != len(set(roots)) or any(overlaps(Path('/'+a), Path('/'+b)) for i,a in enumerate(roots) for b in roots[i+1:]):
+                raise RecoveryError("清单根目录重复或重叠。")
+            if names - {"UA-MANIFEST.json"} != set(manifest["entries"]):
+                raise RecoveryError("备份文件数量或路径与清单不一致。")
+            for name, record in manifest["entries"].items():
+                canonical_name(name)
+                if not any(name == root or name.startswith(root + "/") for root in roots):
+                    raise RecoveryError("清单包含未声明的数据根目录。")
+                path = stage / name
+                actual = metadata(path)
+                if actual["type"] != record["type"] or (actual["type"] == "file" and (actual["size"] != record["size"] or actual["sha256"] != record["sha256"])):
+                    raise RecoveryError("备份内容或校验和不匹配: " + name)
+            # Only apply archived permissions after extraction and content verification.
+            for name in sorted(manifest["entries"], key=lambda n: len(PurePosixPath(n).parts), reverse=True):
+                record = manifest["entries"][name]
+                if os.geteuid() == 0:
+                    os.chown(stage / name, record["uid"], record["gid"])
+                os.chmod(stage / name, record["mode"] & 0o777)
+            for name in roots:
+                if inspect_databases(stage / name, expected=profile_expected(name, stage / name, manifest.get("database_backends", {}).get(name))) != manifest["databases"].get(name):
+                    raise RecoveryError("数据库验证记录不匹配或数据库缺失: " + name)
+        yield stage, manifest
+
+
+def restore_archive(archive_path, apply, config_path, rclone_path, backup_dir, root=Path("/"), guard=None):
+    root = Path(root)
+    with verified_archive(archive_path) as (stage, manifest):
+        names = manifest["roots"]
+        for name in manifest["entries"]:
+            if not allowed_path(name, config_path, rclone_path):
+                raise RecoveryError("不允许恢复的路径: " + name)
+        # Data trees must be complete roots, not partial overlays of individual database files.
+        for name in names:
+            owner = next((tree for tree in TREES if name == tree or name.startswith(tree + "/")), None)
+            if owner and name != owner:
+                raise RecoveryError("必须提供完整面板根目录: " + owner)
+            expected_type = "dir" if owner else "file"
+            if manifest["entries"][name]["type"] != expected_type:
+                raise RecoveryError("迁移根目录或配置文件类型不匹配: " + name)
+            check_path(root / name)
+        if not apply:
+            print("完整性、文件数量与数据库验证通过: " + str(len(manifest["entries"])))
+            return
+        backup_dir = Path(backup_dir)
+        backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with locked([backup_dir / ".recovery.lock"]):
+            guard = guard or offline_guard
+            targets = [root / name for name in names]
+            for name, target in zip(names, targets):
+                if name == "root/nginx-proxy-manager":
+                    archived = manifest.get("database_backends", {}).get(name)
+                    require_npm_sqlite(archived)
+                    runtime = npm_runtime_for_root(target, allow_absent=True)
+                    if runtime is not None:
+                        actual = identify_npm_backend(runtime)
+                        require_npm_sqlite(actual)
+                        if actual["sqlite_file"] != archived["sqlite_file"]:
+                            raise RecoveryError("NPM 源与目标实际数据库位置不一致，已拒绝恢复。")
+            guard(targets)
+            # New parent directories contain no previous data. Track creation in the journal.
+            for target in targets:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            recovery = Path(tempfile.mkdtemp(prefix="pre-import-", dir=backup_dir))
+            journal = recovery / "journal.json"
+            transaction = DirectoryTransaction.prepare(list(zip(targets, (stage / name for name in names))),
+                                                       journal, config_path=root / config_path.lstrip("/"))
+            try:
+                guard(targets)
+                transaction.commit()
+            except BaseException:
+                with signals(False):
+                    transaction.rollback()
+                raise
+            print("整目录恢复已完成；原始目录与回滚记录保留: " + str(journal))
+
+
+def recover_journal(path):
+    data = json.loads(Path(path).read_text())
+    if data.get("kind") == "container":
+        with locked([Path(path).parent / ".recovery.lock"]):
+            return recover_container(path)
+    if data.get("kind") != "directories":
+        raise RecoveryError("未知恢复记录。")
+    targets = [Path(e["target"]) for e in data["entries"]]
+    parent = Path(path).parent
+    lock_parent = parent.parent if parent.name.startswith("pre-import-") else parent
+    with locked([lock_parent / ".recovery.lock"]):
+        offline_guard(targets)
+        with signals(False):
+            DirectoryTransaction(path).rollback()
+    print("原目录身份及内容已核对，恢复完成。")
+
+
+def atomic_bytes(path, content, info=None):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=".ua-config-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            if info:
+                os.fchown(stream.fileno(), info.st_uid, info.st_gid)
+                os.fchmod(stream.fileno(), stat.S_IMODE(info.st_mode))
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_dir(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def restart_docker_service():
+    if shutil.which("systemctl"):
+        command = ["systemctl", "restart", "docker"]
+        verify = ["systemctl", "is-active", "--quiet", "docker"]
+    elif shutil.which("service"):
+        command, verify = ["service", "docker", "restart"], ["service", "docker", "status"]
+    else:
+        raise RecoveryError("缺少 Docker 服务管理工具。")
+    for args in (command, verify):
+        if subprocess.run(args, capture_output=True, timeout=180).returncode:
+            raise RecoveryError("Docker 服务重启或状态核验失败。")
+
+
+def configure_daemon(path, patch, mode="merge"):
+    """Fail closed, validate staged config, preserve the unique original on restart failure."""
+    path = check_path(path)
+    patch = json.loads(patch)
+    if not isinstance(patch, dict) or mode not in ("merge", "replace"):
+        raise RecoveryError("Docker 配置必须是 JSON 对象。")
+    if not shutil.which("dockerd"):
+        raise RecoveryError("缺少 dockerd，不能校验配置，未修改原文件。")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with locked([path.parent / ".ua-daemon-config.lock"]):
+        if path.exists() and not path.is_file():
+            raise RecoveryError("Docker 配置不是普通文件。")
+        original = path.read_bytes() if path.exists() else None
+        info = path.stat() if original is not None else None
+        current = json.loads(original) if original is not None else {}
+        if not isinstance(current, dict):
+            raise RecoveryError("已有 Docker 配置不是对象，未覆盖。")
+        desired = copy.deepcopy(current) if mode == "merge" else {}
+        for key, value in patch.items():
+            if mode == "merge" and isinstance(value, dict):
+                if key in desired and not isinstance(desired[key], dict):
+                    raise RecoveryError("已有 Docker 配置字段类型不兼容，未覆盖。")
+                desired[key] = {**desired.get(key, {}), **value}
+            else:
+                desired[key] = value
+        content = (json.dumps(desired, indent=2) + "\n").encode()
+        fd, stage = tempfile.mkstemp(prefix=".ua-daemon-", suffix=".json", dir=path.parent)
+        os.close(fd)
+        backup = path.with_name(path.name + ".ua-box." + uuid.uuid4().hex + ".bak")
+        try:
+            Path(stage).write_bytes(content)
+            validation = subprocess.run(["dockerd", "--validate", "--config-file", stage], capture_output=True, timeout=30)
+            if validation.returncode:
+                raise RecoveryError("dockerd 拒绝暂存配置，原文件未修改。")
+            if (path.read_bytes() if path.exists() else None) != original:
+                raise RecoveryError("配置被其他进程修改，未覆盖。")
+            if original is not None:
+                with backup.open("xb") as stream:
+                    os.chmod(backup, 0o600)
+                    stream.write(original)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                sync_dir(path.parent)
+            with signals(False):
+                restart_attempted = False
+                try:
+                    atomic_bytes(path, content, info)
+                    fault("after_daemon_config_write")
+                    restart_attempted = True
+                    restart_docker_service()
+                except BaseException:
+                    backup_note = str(backup) if original is not None else "原配置不存在"
+                    try:
+                        observed = path.read_bytes() if path.exists() else None
+                        if observed != original:
+                            if observed != content:
+                                raise RecoveryError("配置被外部修改，不能覆盖。")
+                            if original is None:
+                                path.unlink()
+                                sync_dir(path.parent)
+                            else:
+                                atomic_bytes(path, original, info)
+                        if (path.read_bytes() if path.exists() else None) != original:
+                            raise RecoveryError("原配置恢复未通过核对。")
+                    except Exception:
+                        raise RecoveryError("配置恢复未完成，请手动核对；保留原始备份: " + backup_note) from None
+                    if not restart_attempted:
+                        raise RecoveryError("配置写入未完成，原配置已核对；未重启 Docker。备份: " + backup_note) from None
+                    try:
+                        restart_docker_service()
+                    except Exception:
+                        raise RecoveryError("原配置已恢复，但 Docker 服务恢复未确认；请手动核对。备份: " + backup_note) from None
+                    raise RecoveryError("新配置应用失败；已恢复原配置并核验 Docker 服务。备份: " + backup_note) from None
+            print("Docker 配置和服务状态已核验。已有容器日志策略不会自动改变。")
+        finally:
+            if os.path.exists(stage):
+                os.unlink(stage)
+
+
+def compose_command(old, source):
+    labels = old["Config"].get("Labels") or {}
+    working = labels.get("com.docker.compose.project.working_dir")
+    project = labels.get("com.docker.compose.project")
+    if not working or not project or not Path(working).is_dir():
+        raise RecoveryError("Compose 项目身份不完整，未操作容器。")
+    # Do not guess directories, switch projects, or run 'down'.
+    return ["docker", "compose", "--project-name", project, "--project-directory", working,
+            "-f", str(source), "config", "--format", "json"]
+
+
+def compose_config(old, source):
+    result = subprocess.run(compose_command(old, source), capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RecoveryError("Compose 配置校验失败，未输出可能包含密码的配置/错误内容。")
+    return json.loads(result.stdout)
+
+
+def prepare_compose_binding(old, host_port, container_port, address):
+    labels = old["Config"].get("Labels") or {}
+    if not labels.get("com.docker.compose.project"):
+        return None
+    paths = labels.get("com.docker.compose.project.config_files", "").split(",")
+    if len(paths) != 1 or not paths[0]:
+        raise RecoveryError("多文件 Compose 配置暂不支持自动改端口；请在原项目中修改并校验，未操作容器。")
+    source = check_path(paths[0])
+    if not source.is_file():
+        raise RecoveryError("Compose 原文件不存在。")
+    original, info = source.read_bytes(), source.stat()
+    before = compose_config(old, source)
+    service = labels.get("com.docker.compose.service")
+    if service not in before.get("services", {}):
+        raise RecoveryError("Compose 服务身份不匹配。")
+    # A narrow textual edit keeps interpolation, comments, permissions and all other services intact.
+    # Long/ranged/variable syntax is deliberately refused unless it can be verified without guessing.
+    pattern = re.compile(r"^(\s*-\s*)(['\"]?)(?:(?:[0-9.]+|\[[0-9a-fA-F:]+\]):)?" + re.escape(host_port) +
+                         ":" + re.escape(container_port) + r"(/tcp)?\2(\s*(?:#.*)?)$")
+    lines, matches = [], 0
+    for line in original.decode().splitlines(keepends=True):
+        match = pattern.fullmatch(line.rstrip("\r\n"))
+        if match:
+            matches += 1
+            if matches == 1:
+                newline = "\r\n" if line.endswith("\r\n") else "\n"
+                line = match[1] + '"' + address + ":" + host_port + ":" + container_port + (match[3] or "") + '"' + match[4] + newline
+            else:
+                # Ambiguous multiple matches might belong to another service; don't guess.
+                raise RecoveryError("Compose 端口出现多个匹配，请在原项目中明确修改。")
+        lines.append(line)
+    if not matches:
+        raise RecoveryError("Compose 端口语法无法可靠识别，请在原项目中明确修改。")
+    content = "".join(lines).encode()
+    fd, stage = tempfile.mkstemp(prefix=".ua-port-", suffix=source.suffix, dir=source.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+        after = compose_config(old, stage)
+    finally:
+        os.unlink(stage)
+    desired = copy.deepcopy(before)
+    ports = desired["services"][service].get("ports", [])
+    selected = [p for p in ports if str(p.get("published")) == host_port and str(p.get("target")) == container_port and p.get("protocol", "tcp") == "tcp"]
+    if len(selected) != 1:
+        raise RecoveryError("Compose 实际生效端口无法唯一确认。")
+    selected[0]["host_ip"] = address
+    if after != desired:
+        raise RecoveryError("Compose 暂存配置包含预期之外的变化，未操作容器。")
+    return {"path": str(source), "original": original.hex(), "content": content.hex(),
+            "before": hashlib.sha256(original).hexdigest(), "after": hashlib.sha256(content).hexdigest(),
+            "identity": identity(source), "mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid}
+
+
+def restore_compose_binding(record):
+    binding = record.get("compose_binding")
+    if not binding:
+        return
+    source = check_path(binding["path"])
+    if digest(source) == binding["before"]:
+        return
+    if digest(source) != binding["after"]:
+        raise RecoveryError("Compose 文件被外部修改，未覆盖该文件。")
+    atomic_bytes(source, bytes.fromhex(binding["original"]), source.stat())
+
+
+def rebind_container(name, host_port, container_port, address, backup_dir, timeout):
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name) or not 3 <= int(timeout) <= 3600:
+        raise RecoveryError("容器名称或超时无效。")
+    if address not in ("127.0.0.1", "0.0.0.0") or any(not p.isdigit() or not 1 <= int(p) <= 65535 for p in (host_port, container_port)):
+        raise RecoveryError("端口绑定参数无效。")
+    os.umask(0o077)
+    backup_dir = Path(backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with locked([backup_dir / ".recovery.lock"]):
+        active = backup_dir / (".container-bind-" + name + ".json")
+        for prefix in (".container-bind-", ".container-update-"):
+            journal = backup_dir / (prefix + name + ".json")
+            if journal.exists() and json.loads(journal.read_text())["state"] not in ("committed", "recovered"):
+                raise RecoveryError("存在未完成的操作，请先恢复: " + str(journal))
+        old, engine = get_container(name), Engine()
+        host = old["HostConfig"]
+        if host.get("AutoRemove") or host.get("PublishAllPorts") or host.get("NetworkMode") in ("host", "none") or host.get("NetworkMode", "").startswith("container:"):
+            raise RecoveryError("当前容器网络/删除模式不支持安全端口切换。")
+        if re.search(r"-ua-(old|failed)-", old["Name"]):
+            raise RecoveryError("隔离容器不能直接切换端口，请通过恢复记录操作。")
+        payload = create_config(old, old["Image"])
+        key = container_port + "/tcp"
+        bindings = payload["HostConfig"].get("PortBindings", {})
+        if not any(p.get("HostPort") == host_port for p in bindings.get(key) or []):
+            raise RecoveryError("实际端口映射与输入不符。")
+        others = [p for p in bindings[key] if p.get("HostPort") != host_port]
+        bindings[key] = others + [{"HostIp": address, "HostPort": host_port}]
+        compose_binding = prepare_compose_binding(old, host_port, container_port, address)
+        operation, original_policy = uuid.uuid4().hex, restart_policy(old)
+        payload["HostConfig"]["RestartPolicy"] = dict(NO_RESTART)
+        payload.setdefault("Labels", {})["ua.recovery.operation"] = operation
+        payload["Labels"]["ua.recovery.image_ref"] = (old["Config"].get("Labels") or {}).get("ua.recovery.image_ref") or old["Config"]["Image"]
+        record = {"format": 2, "kind": "container", "operation_type": "bind", "operation": operation, "name": name,
+                  "old": old, "payload": payload, "timeout": int(timeout), "state": "intent",
+                  "backup_name": name + "-ua-old-" + operation[:12], "failed_name": name + "-ua-failed-" + operation[:12],
+                  "restart_policies": {"old_original": original_policy, "candidate_requested": original_policy,
+                                       "candidate_initial": dict(NO_RESTART), "retained_original": {old["Id"]: original_policy}}}
+        if compose_binding:
+            record["compose_binding"] = compose_binding
+        save_json(backup_dir / ("bind-" + operation + ".json"), record)
+        save_json(active, record)
+        try:
+            if compose_binding:
+                source = check_path(compose_binding["path"])
+                if identity(source) != compose_binding["identity"] or digest(source) != compose_binding["before"]:
+                    raise RecoveryError("Compose 原文件身份改变。")
+                atomic_bytes(source, bytes.fromhex(compose_binding["content"]), source.stat())
+                fault("after_compose_binding_write")
+            set_restart_policy(engine, old["Id"], NO_RESTART)
+            if old["State"].get("Running"):
+                docker("stop", old["Id"])
+            if get_container(old["Id"])["State"].get("Running"):
+                raise RecoveryError("旧容器未确认停止。")
+            for network in payload["NetworkingConfig"]["EndpointsConfig"]:
+                docker("network", "disconnect", network, old["Id"])
+            docker("rename", old["Id"], record["backup_name"])
+            fault("after_container_rename")
+            candidate = engine.request("POST", "/containers/create?name=" + quote(name, safe=""), payload)
+            record["new_id"] = candidate["Id"]
+            save_json(active, record)
+            if old["State"].get("Running"):
+                docker("start", candidate["Id"])
+                wait_ready(candidate["Id"], int(timeout))
+            actual = get_container(candidate["Id"])
+            if actual["Name"].lstrip("/") != name or actual["HostConfig"].get("PortBindings") != bindings:
+                raise RecoveryError("新容器身份或全部端口映射不匹配。")
+            if old["State"].get("Running") and actual.get("NetworkSettings", {}).get("Ports", {}).get(key) != bindings[key]:
+                raise RecoveryError("运行中的实际端口绑定未确认。")
+            retained = get_container(old["Id"])
+            if retained["State"].get("Running") or restart_policy(retained) != NO_RESTART:
+                raise RecoveryError("旧容器隔离未保持。")
+            if compose_binding and digest(compose_binding["path"]) != compose_binding["after"]:
+                raise RecoveryError("Compose 文件在操作期间被修改。")
+            set_restart_policy(engine, candidate["Id"], original_policy)
+            record["state"] = "committed"
+            save_json(active, record)
+            save_json(backup_dir / ("bind-" + operation + ".json"), record)
+            print("端口绑定、容器身份及旧实例隔离已核验；恢复记录: " + str(active))
+        except BaseException:
+            with signals(False):
+                try:
+                    recover_container(active)
+                except Exception as error:
+                    print(str(error), file=sys.stderr)
+            raise
+
+
+def update_fail2ban_port(path, port):
+    path = check_path(path)
+    text, info = path.read_text(), path.stat()
+    lines, active, found, seen_port = [], False, False, False
+    for line in text.splitlines(keepends=True):
+        section = re.match(r"^\s*\[([^]]+)\]\s*(?:[#;].*)?$", line.rstrip())
+        if section:
+            if active and not seen_port:
+                lines.append("port = " + port + "\n")
+            active = section[1] == "sshd"
+            found |= active
+            seen_port = False
+        if active and re.match(r"^\s*port\s*=", line):
+            line = "port = " + port + "\n"
+            seen_port = True
+        lines.append(line)
+    if active and not seen_port:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append("port = " + port + "\n")
+    if not found:
+        raise RecoveryError("没有 sshd 配置段，未修改。")
+    atomic_bytes(path, "".join(lines).encode(), info)
+
+
+def write_rclone_unit(destination, executable, remote, mount, config, extra):
+    arguments = [executable, "mount", remote, mount, "--config=" + config, *shlex.split(extra)]
+    def unit_arg(value):
+        if any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise RecoveryError("挂载参数不能包含控制字符。")
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+    command = " ".join(map(unit_arg, arguments))
+    content = ("[Unit]\nDescription=UA Box rclone mount\nAfter=network-online.target\nWants=network-online.target\n"
+               "StartLimitIntervalSec=300\nStartLimitBurst=5\n[Service]\nType=simple\nExecStart=" + command +
+               "\nRestart=on-failure\nRestartSec=15\n[Install]\nWantedBy=multi-user.target\n")
+    Path(destination).write_text(content)
+    os.chmod(destination, 0o600)
+
+
+def notification_payload(kind, title, body):
+    if kind in ("wecom", "dingtalk"):
+        return {"msgtype": "text", "text": {"content": body}}
+    if kind == "feishu":
+        return {"msg_type": "text", "content": {"text": body}}
+    if kind == "discord":
+        return {"content": body}
+    if kind == "bark":
+        return {"title": title, "body": body}
+    raise RecoveryError("Webhook 类型未知，请配置 wecom/feishu/dingtalk/discord/bark。")
+
+
+def verify_notification(kind, status, payload):
+    if not 200 <= int(status) < 300:
+        raise RecoveryError("通知 HTTP 请求失败。")
+    if kind == "discord" and int(status) == 204:
+        return
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise RecoveryError("通知响应不是对象。")
+    success = ((kind == "telegram" and data.get("ok") is True)
+               or (kind in ("wecom", "dingtalk") and type(data.get("errcode")) is int and data["errcode"] == 0)
+               or (kind == "feishu" and (type(data.get("code")) is int and data["code"] == 0
+                                        or type(data.get("StatusCode")) is int and data["StatusCode"] == 0))
+               or (kind == "bark" and type(data.get("code")) is int and data["code"] == 200)
+               or (kind == "discord" and "id" in data))
+    if not success:
+        raise RecoveryError("通知平台未确认接收成功。")
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    try:
+        os.umask(0o077)
+        with signals():
+            command, *args = args
+            if command == "update":
+                update_container(*args)
+            elif command == "bind":
+                rebind_container(*args)
+            elif command == "daemon-config":
+                configure_daemon(*args)
+            elif command == "daemon-config-file":
+                configure_daemon(args[0], Path(args[1]).read_text(), "replace")
+            elif command == "fail2ban-port":
+                update_fail2ban_port(*args)
+            elif command == "rclone-unit":
+                write_rclone_unit(*args)
+            elif command == "notify-payload":
+                print(json.dumps(notification_payload(*args)))
+            elif command == "notify-verify":
+                verify_notification(args[0], args[1], Path(args[2]).read_text())
+            elif command == "recover":
+                recover_journal(*args)
+            elif command == "verify":
+                with verified_archive(args[0]) as verified:
+                    print("备份内容、文件数量和数据库独立验证通过。")
+            elif command == "restore":
+                archive, mode, config, rclone, backup = args
+                if mode not in ("check", "apply"):
+                    raise RecoveryError("恢复模式无效。")
+                restore_archive(archive, mode == "apply", config, rclone, backup)
+            elif command == "export":
+                destination, *paths = args
+                build_archive([(str(Path(path)).lstrip("/"), Path(path)) for path in paths], destination)
+                print("一致性备份与独立恢复验证通过: " + destination)
+            else:
+                raise RecoveryError("未知恢复操作。")
+    except (Exception, KeyboardInterrupt) as error:
+        print("操作失败，不能认定已恢复: " + str(error), file=sys.stderr)
+        return 1
     return 0
-  fi
 
-  echo "正在重构 $container_name 容器端口绑定模式 [$bind_mode_flag] ..."
-  local was_in_ua_net=0
-  if docker container inspect --format '{{range $net, $v := .NetworkSettings.Networks}}{{$net}} {{end}}' "$container_name" 2>/dev/null | grep -qw "ua-net"; then
-    was_in_ua_net=1
-  fi
 
-  local compose_file=""
-  for dir in "/root/$container_name" "/root/nginx-proxy-manager" "/root/uptime-kuma"; do
-    if [ -f "$dir/docker-compose.yml" ]; then
-      if grep -q "container_name:[[:space:]]*['\"]*$container_name['\"]*" "$dir/docker-compose.yml" || [ "$container_name" = "openlist" ]; then
-        compose_file="$dir/docker-compose.yml"
-        break
-      fi
-    fi
-  done
+if __name__ == "__main__":
+    sys.exit(main())
+PY_UA_RECOVERY
+}
 
-  if [ -n "$compose_file" ]; then
-    if [ "$t_choice" = "1" ]; then
-      sed -i -E "s/\"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?${host_port}:${container_port}\"?/\"127.0.0.1:${host_port}:${container_port}\"/g" "$compose_file"
-    else
-      sed -i -E "s/\"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?${host_port}:${container_port}\"?/\"${host_port}:${container_port}\"/g" "$compose_file"
-    fi
-    local compose_dir
-    compose_dir="$(dirname "$compose_file")"
-    (cd "$compose_dir" && (docker compose down 2>/dev/null || docker-compose down 2>/dev/null) && (docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null))
-  else
-    local img_name
-    img_name="$(docker container inspect --format '{{.Config.Image}}' "$container_name" 2>/dev/null)"
-    docker stop "$container_name" >/dev/null 2>&1 || true
-    docker rm "$container_name" >/dev/null 2>&1 || true
-    
-    if [ "$container_name" = "it-tools" ]; then
-      docker run -d --name it-tools --restart unless-stopped -p "$new_bind" "${img_name:-corentinth/it-tools:latest}"
-    elif [ "$container_name" = "filebrowser" ]; then
-      docker run -d --name filebrowser --restart unless-stopped -v /:/srv -v /root/filebrowser:/database -p "$new_bind" "${img_name:-filebrowser/filebrowser:latest}"
-    elif [ "$container_name" = "kuma" ]; then
-      docker run -d --name kuma --restart always -p "$new_bind" -v /root/uptime-kuma:/app/data "${img_name:-louislam/uptime-kuma:1}"
-    elif [ "$container_name" = "openlist" ]; then
-      docker run -d --name openlist --restart always -p "$new_bind" -v /root/openlist/data:/opt/openlist/data -e UMASK=022 -e TZ=Asia/Shanghai --user "0:0" "${img_name:-openlistteam/openlist:latest}"
-    fi
-  fi
-
-  if [ "$was_in_ua_net" -eq 1 ] || docker_container_exists caddy; then
-    if docker network inspect ua-net >/dev/null 2>&1; then
-      docker network connect ua-net "$container_name" >/dev/null 2>&1 || true
-    fi
-  fi
-  echo -e "${gl_lv}端口安全模式切换完成！当前模式: ${bind_mode_flag}${gl_bai}"
+run_recovery_operation() {
+  has_cmd python3 || install_pkg python3 || return 1
+  python3 -c "$(ua_recovery_program)" "$@"
 }
 
 update_panel_container() {
-  local container_name="$1"
   need_root || return 1
   docker_require || return 1
-
-  if ! docker_container_exists "$container_name"; then
-    echo "容器 $container_name 尚未安装，请先选择安装。"
+  if run_recovery_operation update "$1" "$UA_BOX_BACKUP_DIR" "${UA_CONTAINER_UPDATE_TIMEOUT:-120}"; then
+    log_action "update panel container verified $1"
+  else
+    log_action "update panel container failed $1; inspect recovery journal"
     return 1
   fi
-
-  local was_in_ua_net=0
-  if docker container inspect --format '{{range $net, $v := .NetworkSettings.Networks}}{{$net}} {{end}}' "$container_name" 2>/dev/null | grep -qw "ua-net"; then
-    was_in_ua_net=1
-  fi
-
-  local compose_file=""
-  for dir in "/root/$container_name" "/root/nginx-proxy-manager" "/root/uptime-kuma" "/root/openlist" "/root/filebrowser" "/root/it-tools"; do
-    if [ -f "$dir/docker-compose.yml" ]; then
-      if grep -q "container_name:[[:space:]]*['\"]*$container_name['\"]*" "$dir/docker-compose.yml" || [ "$dir" = "/root/$container_name" ]; then
-        compose_file="$dir/docker-compose.yml"
-        break
-      fi
-    fi
-  done
-
-  echo -e "${gl_kjlan}正在拉取最新镜像并无损更新容器: ${container_name} ...${gl_bai}"
-  if [ -n "$compose_file" ]; then
-    local compose_dir
-    compose_dir="$(dirname "$compose_file")"
-    if (cd "$compose_dir" && (docker compose pull 2>/dev/null || docker-compose pull) && (docker compose up -d 2>/dev/null || docker-compose up -d)); then
-      echo -e "${gl_lv}✓ Compose 项目 ($container_name) 镜像拉取并重建完成！${gl_bai}"
-    else
-      echo -e "${gl_hong}✗ Compose 更新失败，请检查网络连接。${gl_bai}"
-      return 1
-    fi
-  else
-    local img_name
-    img_name="$(docker container inspect --format '{{.Config.Image}}' "$container_name" 2>/dev/null)"
-    [ -z "$img_name" ] && { echo "无法获取容器镜像名。"; return 1; }
-
-    docker pull "$img_name" || { echo -e "${gl_hong}✗ 镜像拉取失败。${gl_bai}"; return 1; }
-
-    local port_args=()
-    local p_line
-    while IFS= read -r p_line; do
-      [ -n "$p_line" ] && port_args+=("-p" "$p_line")
-    done < <(docker container inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{if $conf}}{{with index $conf 0}}{{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}}{{"\n"}}{{end}}{{end}}{{end}}' "$container_name" 2>/dev/null | sed 's|/tcp$||')
-
-    docker stop "$container_name" >/dev/null 2>&1 || true
-    docker rm "$container_name" >/dev/null 2>&1 || true
-
-    if [ "$container_name" = "it-tools" ]; then
-      [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "127.0.0.1:8080:80")
-      docker run -d --name it-tools --restart unless-stopped "${port_args[@]}" "$img_name"
-    elif [ "$container_name" = "filebrowser" ]; then
-      [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "127.0.0.1:8082:80")
-      docker run -d --name filebrowser --restart unless-stopped -v /:/srv -v /root/filebrowser:/database "${port_args[@]}" "$img_name"
-    elif [ "$container_name" = "kuma" ]; then
-      [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "127.0.0.1:3001:3001")
-      docker run -d --name kuma --restart always "${port_args[@]}" -v /root/uptime-kuma:/app/data "$img_name"
-    elif [ "$container_name" = "openlist" ]; then
-      [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "127.0.0.1:5244:5244" "-p" "127.0.0.1:5245:5245")
-      docker run -d --name openlist --restart always "${port_args[@]}" -v /root/openlist/data:/opt/openlist/data -e UMASK=022 -e TZ=Asia/Shanghai --user "0:0" "$img_name"
-    else
-      local npm_name
-      npm_name="$(npm_container_name)"
-      if [ "$container_name" = "$npm_name" ]; then
-        [ "${#port_args[@]}" -eq 0 ] && port_args=("-p" "80:80" "-p" "443:443" "-p" "127.0.0.1:81:81")
-        docker run -d --name "$npm_name" --restart unless-stopped "${port_args[@]}" -v /root/nginx-proxy-manager/data:/data -v /root/nginx-proxy-manager/letsencrypt:/etc/letsencrypt "$img_name"
-      fi
-    fi
-    echo -e "${gl_lv}✓ 容器 ($container_name) 已使用最新镜像重建启动！${gl_bai}"
-  fi
-
-  if [ "$was_in_ua_net" -eq 1 ] || docker_container_exists caddy; then
-    if docker network inspect ua-net >/dev/null 2>&1; then
-      docker network connect ua-net "$container_name" >/dev/null 2>&1 || true
-    fi
-  fi
-  docker image prune -f >/dev/null 2>&1 || true
-  log_action "update panel container $container_name"
 }
 
+ua_recover() {
+  need_root || return 1
+  [ -f "${1:-}" ] || { echo "用法: ua recover <恢复记录.json>"; return 1; }
+  confirm_danger "按恢复记录核对身份并恢复原目录/旧容器" "$1" || return 1
+  run_recovery_operation recover "$1"
+}
 
+ua_verify_backup() {
+  [ -f "${1:-}" ] || { echo "用法: ua verify-backup <备份.tar.gz>"; return 1; }
+  run_recovery_operation verify "$1"
+}
 
 run_warp_manager() {
   need_root || return 1
@@ -1776,7 +3313,7 @@ caddy_docker_install() {
   port_443="${u_443:-443}"
 
   for p in "$port_80" "$port_443"; do
-    if ! printf '%s\n' "$p" | grep -Eq '^[0-9]+$'; then
+    if ! valid_port "$p"; then
       echo "错误: 端口必须是纯数字。"
       return 1
     fi
@@ -2041,8 +3578,12 @@ panel_setup_caddy_proxy() {
         read -r -e -p "是否自动收紧端口为 127.0.0.1 (仅保留 Caddy 域名安全访问，禁止公网直连)？[Y/n]: " lock_port
         lock_port="${lock_port:-Y}"
         if [[ "$lock_port" =~ ^[Yy]$ ]]; then
-          echo "1" | toggle_container_port_bind "$container_name" "$curr_port" "$container_port" >/dev/null 2>&1 || true
-          echo -e "${gl_lv}✓ 已成功锁定 $container_name 端口至 127.0.0.1 本地防护模式！${gl_bai}"
+          if run_recovery_operation bind "$container_name" "$curr_port" "$container_port" 127.0.0.1 "$UA_BOX_BACKUP_DIR" "${UA_CONTAINER_UPDATE_TIMEOUT:-120}"; then
+            echo -e "${gl_lv}已核验 $container_name 的端口绑定为 127.0.0.1。${gl_bai}"
+          else
+            echo "反代已配置，但端口收紧未完成，请核对恢复记录与实际端口。" >&2
+            return 1
+          fi
         fi
       fi
     fi
@@ -2411,7 +3952,7 @@ npm_install() {
   port_81="${u_81:-81}"
 
   for p in "$port_80" "$port_443" "$port_81"; do
-    if ! printf '%s\n' "$p" | grep -Eq '^[0-9]+$'; then
+    if ! valid_port "$p"; then
       echo "错误: 端口必须是纯数字。"
       return 1
     fi
@@ -2426,7 +3967,7 @@ npm_install() {
   deploy_mode="$(ask_deploy_mode "Nginx Proxy Manager")"
 
   mkdir -p /root/nginx-proxy-manager/data /root/nginx-proxy-manager/letsencrypt
-  chmod -R 777 /root/nginx-proxy-manager
+  chmod 750 /root/nginx-proxy-manager /root/nginx-proxy-manager/data /root/nginx-proxy-manager/letsencrypt || return 1
   log_action "install Nginx Proxy Manager (80:$port_80, 443:$port_443, 81:$port_81)"
   
   if [ "$deploy_mode" = "2" ]; then
@@ -2539,7 +4080,7 @@ it_tools_install() {
 
   read -r -e -p "请输入 Web 端口，回车默认 8080: " port
   port="${port:-8080}"
-  if ! printf '%s\n' "$port" | grep -Eq '^[0-9]+$'; then
+  if ! valid_port "$port"; then
     echo "端口必须是数字。"
     return 1
   fi
@@ -2641,7 +4182,7 @@ filebrowser_install() {
   local port
   read -r -e -p "请输入 Web 端口，回车默认 8082: " port
   port="${port:-8082}"
-  if ! printf '%s\n' "$port" | grep -Eq '^[0-9]+$'; then
+  if ! valid_port "$port"; then
     echo "端口必须是数字。"
     return 1
   fi
@@ -2654,7 +4195,17 @@ filebrowser_install() {
   bind_ip="$(ask_port_bind_ip "File Browser")"
   deploy_mode="$(ask_deploy_mode "File Browser")"
 
-  mkdir -p /root/filebrowser
+  local managed_dir
+  read -r -e -p "请输入文件管理目录，回车默认 /root/filebrowser/files: " managed_dir || return 1
+  managed_dir="${managed_dir:-/root/filebrowser/files}"
+  [[ "$managed_dir" = /* && "$managed_dir" != *$'\n'* && "$managed_dir" != *$'\r'* ]] || return 1
+  mkdir -p -- "$managed_dir" || return 1
+  managed_dir="$(readlink -f -- "$managed_dir")" || return 1
+  case "$managed_dir" in /|/root|/etc|/var|/usr|/home)
+    confirm_danger "允许文件管理器读写系统目录" "$managed_dir" || return 1 ;;
+  esac
+  [[ "$managed_dir" != *:* && "$managed_dir" != *\'* ]] || { echo "目录不能包含冒号或单引号。"; return 1; }
+  mkdir -p /root/filebrowser || return 1
   log_action "install filebrowser port=$port"
   if [ "$deploy_mode" = "2" ]; then
     cat > /root/filebrowser/docker-compose.yml <<EOF
@@ -2667,21 +4218,21 @@ services:
     ports:
       - '${bind_ip}${port}:80'
     volumes:
-      - '/:/srv'
+      - '${managed_dir}:/srv'
       - '/root/filebrowser:/database'
 EOF
-    (cd /root/filebrowser && (docker compose up -d 2>/dev/null || docker-compose up -d))
+    (cd /root/filebrowser && (docker compose up -d 2>/dev/null || docker-compose up -d)) || return 1
   else
     docker run -d \
       --name filebrowser \
       --restart unless-stopped \
-      -v /:/srv \
+      -v "$managed_dir:/srv" \
       -v /root/filebrowser:/database \
       -p "${bind_ip}${port}":80 \
-      filebrowser/filebrowser:latest
+      filebrowser/filebrowser:latest || return 1
   fi
   echo "File Browser 已部署。访问: http://$(get_display_ip):$port"
-  echo "默认用户名和密码为: admin / admin"
+  echo "初始凭据请查看容器启动日志，或按所用镜像版本的说明设置。"
   check_and_prompt_caddy_proxy "File Browser" "$port" "filebrowser" "80"
 }
 
@@ -2756,7 +4307,7 @@ openlist_install() {
   port_dav="${port_dav:-5245}"
 
   for p in "$port" "$port_dav"; do
-    if ! printf '%s\n' "$p" | grep -Eq '^[0-9]+$'; then
+    if ! valid_port "$p"; then
       echo "端口必须是纯数字。"
       return 1
     fi
@@ -2771,7 +4322,7 @@ openlist_install() {
 
   data_dir="/root/openlist"
   mkdir -p "$data_dir/data"
-  chmod -R 777 "$data_dir/data"
+  chmod 750 "$data_dir/data" || return 1
 
   if [ "$deploy_mode" = "2" ]; then
     if ! docker compose version >/dev/null 2>&1 && ! has_cmd docker-compose; then
@@ -2924,7 +4475,7 @@ uptime_kuma_install() {
   local port
   read -r -e -p "请输入 Web 端口，回车默认 3001: " port
   port="${port:-3001}"
-  if ! printf '%s\n' "$port" | grep -Eq '^[0-9]+$'; then
+  if ! valid_port "$port"; then
     echo "端口必须是数字。"
     return 1
   fi
@@ -3200,7 +4751,7 @@ docker_network_menu() {
     echo -e "${gl_kjlan}4.   ${gl_bai}删除网络"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1)
@@ -3245,7 +4796,7 @@ docker_volume_menu() {
     echo -e "${gl_kjlan}3.   ${gl_bai}清理未使用卷"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1)
@@ -3273,27 +4824,16 @@ docker_volume_menu() {
 
 docker_edit_daemon() {
   need_root || return 1
-  mkdir -p /etc/docker
-  "${EDITOR:-nano}" /etc/docker/daemon.json
-  # 检查 JSON 语法，避免重启后 Docker 无法启动
+  local stage="$UA_BOX_TMP_DIR/daemon-edit.json"
   if [ -f /etc/docker/daemon.json ]; then
-    if has_cmd python3; then
-      if ! python3 -m json.tool /etc/docker/daemon.json >/dev/null 2>&1; then
-        echo -e "${gl_hong}daemon.json JSON 语法错误，已取消重启，请修复后重试。${gl_bai}"
-        return 1
-      fi
-    elif has_cmd jq; then
-      if ! jq . /etc/docker/daemon.json >/dev/null 2>&1; then
-        echo -e "${gl_hong}daemon.json JSON 语法错误，已取消重启，请修复后重试。${gl_bai}"
-        return 1
-      fi
-    fi
-  fi
-  if has_cmd systemctl; then
-    systemctl restart docker
+    cp /etc/docker/daemon.json "$stage" || return 1
   else
-    svc restart docker
+    (umask 077; printf '{}\n' > "$stage") || return 1
   fi
+  chmod 600 "$stage" || return 1
+  "${EDITOR:-nano}" "$stage" || return 1
+  confirm_danger "校验并应用 Docker 配置，重启可能中断服务" "/etc/docker/daemon.json" || return 1
+  run_recovery_operation daemon-config-file /etc/docker/daemon.json "$stage"
 }
 
 docker_uninstall() {
@@ -3354,29 +4894,43 @@ docker_container_action() {
 }
 
 docker_container_all_action() {
-  local action="$1"
-
+  local action="$1" inventory id name state labels
+  local ids=() names=()
+  case "$action" in start|stop|restart|rm) ;; *) return 1 ;; esac
+  inventory="$(docker ps -a --no-trunc --format '{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label "ua.recovery.operation"}}')" || return 1
+  while IFS=$'\t' read -r id name state labels; do
+    [ -n "$id" ] || continue
+    case "$name" in *-ua-old-*|*-ua-failed-*) echo "跳过隔离保留容器: $name" >&2; continue ;; esac
+    # 自动恢复管理的停止实例必须通过恢复流程核对后启动。
+    [ "$action" = start ] && [ "$state" != running ] && [ -n "$labels" ] && continue
+    case "$action" in
+      start) [ "$state" = running ] && continue ;;
+      stop|restart) [ "$state" != running ] && continue ;;
+    esac
+    ids+=("$id"); names+=("$name")
+  done <<< "$inventory"
+  [ "${#ids[@]}" -gt 0 ] || { echo "没有可操作的容器。"; return 0; }
+  printf '将执行 %s，目标容器:\n' "$action"
+  printf '  %s\n' "${names[@]}"
+  confirm_danger "批量 Docker $action" "${names[*]}" || return 1
+  log_action "docker $action selected containers: ${names[*]}"
   case "$action" in
-    start|rm)
-      if [ -z "$(docker ps -a -q 2>/dev/null)" ]; then
-        echo "没有可操作的容器。"; return 0
-      fi
-      ;;
-    stop|restart)
-      if [ -z "$(docker ps -q 2>/dev/null)" ]; then
-        echo "没有可操作的容器。"; return 0
-      fi
-      ;;
-    *) return 1 ;;
+    rm) docker rm -f "${ids[@]}" ;;
+    *) docker "$action" "${ids[@]}" ;;
   esac
+}
 
-  log_action "docker $action all containers"
-  case "$action" in
-    rm)      docker ps -a -q | xargs -r docker rm -f ;;
-    start)   docker ps -a -q | xargs -r docker start ;;
-    stop)    docker ps -q    | xargs -r docker stop ;;
-    restart) docker ps -q    | xargs -r docker restart ;;
-  esac
+docker_select_container() {
+  local prompt="${1:-选择容器}" inventory row selected
+  local rows=()
+  inventory="$(docker ps -a --no-trunc --format '{{.ID}} {{.Names}} {{.Status}}')" || return 1
+  while IFS= read -r row; do
+    [ -n "$row" ] && rows+=("$row")
+  done <<< "$inventory"
+  [ "${#rows[@]}" -gt 0 ] || { echo "没有可选择的容器。" >&2; return 1; }
+  selected="$(select_with_fzf_or_menu "$prompt" "${rows[@]}")" || return 1
+  [ -n "$selected" ] || return 1
+  printf '%s\n' "${selected%% *}"
 }
 
 docker_container_shell() {
@@ -3428,7 +4982,7 @@ docker_container_create() {
   echo -e "${gl_huang}将执行: ${gl_bai}$_full_cmd"
   read -r -e -p "确认执行？输入 y 继续，回车取消: " _confirm
   [ "$_confirm" != "y" ] && [ "$_confirm" != "Y" ] && echo "已取消。" && return 0
-  log_action "create container: $cmd"
+  log_action "create container: command arguments omitted"
   sh -c "$_full_cmd"
 }
 
@@ -3442,51 +4996,65 @@ docker_container_stats_once() {
 }
 
 docker_container_port_access() {
-  local mode="$1"
-  local proto port source_ip
-
+  local mode="$1" proto port source_ip family tool check_rc failed=0
+  local families=(4 6) rule=()
   need_root || return 1
-  if ! has_cmd iptables; then
-    echo "未找到 iptables，无法管理 Docker 容器端口访问规则。"
-    return 1
-  fi
-
-  echo "该功能通过 DOCKER-USER 链放行/阻断容器端口流量，不会为未发布的端口创建 Docker 映射。"
-  read -r -e -p "请输入容器端口: " port
-  read -r -e -p "请输入协议，回车默认 tcp: " proto
-  read -r -e -p "限制来源 IP/CIDR，回车表示所有来源: " source_ip
+  case "$mode" in open|close) ;; *) return 1 ;; esac
+  has_cmd python3 || { echo "需要 python3 校验 IP/CIDR。" >&2; return 1; }
+  echo "管理 DOCKER-USER 防火墙规则，输入的是容器端口，不改变端口映射。"
+  echo "规则仅作用于当前防火墙状态；防火墙或主机重启后需重新核对。"
+  read -r -e -p "请输入容器端口: " port || return 1
+  read -r -e -p "请输入协议，回车默认 tcp: " proto || return 1
+  read -r -e -p "限制来源 IP/CIDR，回车同时处理 IPv4/IPv6: " source_ip || return 1
   proto="${proto:-tcp}"
-
-  if [ -z "$port" ]; then
-    echo "未输入端口。"
-    return 1
+  valid_port "$port" && [[ "$proto" = tcp || "$proto" = udp ]] || { echo "端口或协议无效。" >&2; return 1; }
+  if [ -n "$source_ip" ]; then
+    family="$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False).version)' "$source_ip" 2>/dev/null)" || { echo "来源 IP/CIDR 无效。" >&2; return 1; }
+    families=("$family")
+    rule=(-s "$source_ip")
   fi
-
-  iptables -N DOCKER-USER 2>/dev/null || true
-
-  if [ "$mode" = "close" ]; then
-    if [ -n "$source_ip" ]; then
-      iptables -C DOCKER-USER -s "$source_ip" -p "$proto" --dport "$port" -j DROP 2>/dev/null ||
-        iptables -I DOCKER-USER 1 -s "$source_ip" -p "$proto" --dport "$port" -j DROP
-    else
-      iptables -C DOCKER-USER -p "$proto" --dport "$port" -j DROP 2>/dev/null ||
-        iptables -I DOCKER-USER 1 -p "$proto" --dport "$port" -j DROP
+  rule+=(-p "$proto" --dport "$port" -j DROP)
+  # 预检所有地址族；缺失时不能声称端口已经完全关闭。
+  for family in "${families[@]}"; do
+    tool=iptables; [ "$family" = 6 ] && tool=ip6tables
+    if ! has_cmd "$tool" || ! "$tool" -w -S DOCKER-USER >/dev/null 2>&1; then
+      echo "IPv$family 缺少可用的 DOCKER-USER 链，未执行操作。" >&2
+      return 1
     fi
-    log_action "close Docker container port $proto/$port ${source_ip:-all}"
-    echo "已关闭容器端口访问: $proto/$port ${source_ip:-所有来源}"
-  else
-    if [ -n "$source_ip" ]; then
-      while iptables -C DOCKER-USER -s "$source_ip" -p "$proto" --dport "$port" -j DROP 2>/dev/null; do
-        iptables -D DOCKER-USER -s "$source_ip" -p "$proto" --dport "$port" -j DROP
-      done
+  done
+  for family in "${families[@]}"; do
+    tool=iptables; [ "$family" = 6 ] && tool=ip6tables
+    if [ "$mode" = close ]; then
+      check_rc=0
+      "$tool" -w -C DOCKER-USER "${rule[@]}" 2>/dev/null || check_rc=$?
+      if [ "$check_rc" -eq 1 ]; then
+        "$tool" -w -I DOCKER-USER 1 "${rule[@]}" || failed=1
+      elif [ "$check_rc" -ne 0 ]; then
+        failed=1
+      fi
+      "$tool" -w -C DOCKER-USER "${rule[@]}" 2>/dev/null || failed=1
     else
-      while iptables -C DOCKER-USER -p "$proto" --dport "$port" -j DROP 2>/dev/null; do
-        iptables -D DOCKER-USER -p "$proto" --dport "$port" -j DROP
+      while true; do
+        check_rc=0
+        "$tool" -w -C DOCKER-USER "${rule[@]}" 2>/dev/null || check_rc=$?
+        [ "$check_rc" -eq 1 ] && break
+        [ "$check_rc" -eq 0 ] || { failed=1; break; }
+        "$tool" -w -D DOCKER-USER "${rule[@]}" || { failed=1; break; }
       done
     fi
-    log_action "open Docker container port $proto/$port ${source_ip:-all}"
-    echo "已放行容器端口访问: $proto/$port ${source_ip:-所有来源}"
-  fi
+    if [ "$failed" -eq 0 ]; then
+      echo "IPv$family: 已核对 $mode 规则 ($proto/$port)。"
+    else
+      echo "IPv$family: 规则处理失败，可能存在部分变更，请核对。" >&2
+    fi
+  done
+  [ "$failed" -eq 0 ] || return 1
+  log_action "verified Docker firewall rule $mode $proto/$port ${source_ip:-IPv4+IPv6}"
+  echo "仅核验了上述 DROP 规则；最终连通性仍取决于其他网络规则。"
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
 docker_container_rename() {
@@ -3519,13 +5087,13 @@ docker_container_menu() {
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}11.  ${gl_bai}进入指定容器           ${gl_kjlan}12.  ${gl_bai}查看容器日志"
     echo -e "${gl_kjlan}13.  ${gl_bai}查看容器网络           ${gl_kjlan}14.  ${gl_bai}查看容器占用"
-    echo -e "${gl_kjlan}17.  ${gl_bai}重命名容器"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    echo -e "${gl_kjlan}15.  ${gl_bai}开启容器端口访问       ${gl_kjlan}16.  ${gl_bai}关闭容器端口访问"
+    echo -e "${gl_kjlan}15.  ${gl_bai}移除端口阻断规则       ${gl_kjlan}16.  ${gl_bai}添加端口阻断规则"
+    echo -e "${gl_kjlan}17.  ${gl_bai}重命名容器"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级选单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) docker_container_create; pause ;;
@@ -3559,12 +5127,7 @@ docker_container_menu() {
         ;;
       6) docker_container_all_action start; pause ;;
       7) docker_container_all_action stop; pause ;;
-      8)
-        if confirm_danger "删除所有 Docker 容器" "docker rm -f \$(docker ps -a -q)"; then
-          docker_container_all_action rm
-        fi
-        pause
-        ;;
+      8) docker_container_all_action rm; pause ;;
       9) docker_container_all_action restart; pause ;;
       11)
         read -r -e -p "请输入容器名/ID (直接回车打开搜索列表): " name
@@ -3702,7 +5265,7 @@ docker_compose_menu() {
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上级"
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
     
-    read -r -e -p "请输入项目编号或选择操作: " choice
+    read -r -e -p "请输入项目编号或选择操作: " choice || break
     [ -z "$choice" ] && continue
     if [ "$choice" = "0" ]; then
       break
@@ -3760,157 +5323,17 @@ docker_compose_menu() {
 
 docker_limit_container_logs() {
   need_root || return 1
-  mkdir -p /etc/docker
-  local daemon_file="/etc/docker/daemon.json"
-
-  echo -e "${gl_kjlan}Docker 容器日志体积限制${gl_bai}"
-  echo -e "该操作将限制所有新建/重建的容器日志最大为 50MB，并仅保留最近 3 个文件，彻底杜绝磁盘爆满问题。"
-  echo -e "已运行的容器在下次重建(docker rm & docker run)时该配置会生效。"
-  echo -e "${gl_kjlan}------------------------${gl_bai}"
-
-  if [ -f "$daemon_file" ]; then
-    echo "检测到已存在 daemon.json。正在尝试安全合并限制参数..."
-    cp "$daemon_file" "${daemon_file}.ua-box.bak.$(date +%Y%m%d-%H%M%S)"
-    prune_old_backups "/etc/docker" "daemon.json.ua-box*" "${UA_MAX_BACKUPS:-10}"
-    
-    local success=0
-    if has_cmd python3; then
-      python3 -c '
-import json, sys
-try:
-    with open(sys.argv[1], "r") as f:
-        data = json.load(f)
-except Exception:
-    data = {}
-data["log-driver"] = "json-file"
-data["log-opts"] = {"max-size": "50m", "max-file": "3"}
-with open(sys.argv[1], "w") as f:
-    json.dump(data, f, indent=2)
-' "$daemon_file" && success=1
-    elif has_cmd jq; then
-      local tmp_json
-      tmp_json="$(jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}}' "$daemon_file" 2>/dev/null)"
-      if [ -n "$tmp_json" ]; then
-        echo "$tmp_json" > "$daemon_file"
-        success=1
-      fi
-    fi
-
-    if [ "$success" -eq 1 ]; then
-      echo -e "${gl_lv}成功将限制参数安全合并进现有的 daemon.json 中！${gl_bai}"
-    else
-      echo -e "${gl_huang}警告: 未找到 python3/jq 或合并解析出错。将覆盖写入全新的限制配置。${gl_bai}"
-      cat > "$daemon_file" <<'EOF'
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "50m",
-    "max-file": "3"
-  }
-}
-EOF
-    fi
-  else
-    cat > "$daemon_file" <<'EOF'
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "50m",
-    "max-file": "3"
-  }
-}
-EOF
-    echo -e "${gl_lv}已创建并写入限制容器日志配置到 /etc/docker/daemon.json${gl_bai}"
-  fi
-
-  # 语法校验以防写入乱码导致 docker 启动失败
-  local check_rc=0
-  if has_cmd python3; then
-    python3 -m json.tool "$daemon_file" >/dev/null 2>&1 || check_rc=$?
-  elif has_cmd jq; then
-    jq . "$daemon_file" >/dev/null 2>&1 || check_rc=$?
-  fi
-
-  if [ "$check_rc" -eq 0 ]; then
-    echo "正在重启 Docker 以重载配置..."
-    if has_cmd systemctl; then
-      systemctl restart docker && echo -e "${gl_lv}Docker 服务已重启，日志配置已全局生效！${gl_bai}"
-    else
-      svc restart docker && echo -e "${gl_lv}Docker 服务已重启，日志配置已全局生效！${gl_bai}"
-    fi
-  else
-    echo -e "${gl_hong}错误: 配置文件 JSON 语法校验失败，已自动恢复备份。${gl_bai}"
-    local latest_bak
-    # shellcheck disable=SC2012
-    latest_bak="$(ls -t "${daemon_file}.ua-box.bak."* 2>/dev/null | head -n 1)"
-    if [ -n "$latest_bak" ] && [ -f "$latest_bak" ]; then
-      cp "$latest_bak" "$daemon_file" && echo "已恢复先前配置文件。"
-    else
-      rm -f "$daemon_file"
-    fi
-  fi
+  echo "设置新建/重建容器的日志轮转：每文件 50MB，保留 3 个文件。"
+  echo "将重启 Docker，可能中断现有服务；已创建容器的日志设置不会因此改变。"
+  confirm_danger "修改 Docker 日志配置并重启 Docker" "/etc/docker/daemon.json" || return 1
+  run_recovery_operation daemon-config /etc/docker/daemon.json '{"log-driver":"json-file","log-opts":{"max-size":"50m","max-file":"3"}}'
 }
 
 docker_setup_ipv6() {
   need_root || return 1
-  docker_require || return 1
-
-  echo -e "${gl_kjlan}一键配置 Docker IPv6 双栈网络支持${gl_bai}"
-  echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
-  echo "将向 /etc/docker/daemon.json 中注入/配置官方推荐的双栈属性："
-  echo "  - \"ipv6\": true"
-  echo "  - \"fixed-cidr-v6\": \"fd00:172:17::/64\""
-  echo "  - \"experimental\": true"
-  echo "  - \"ip6tables\": true"
-  echo "这将开启官方原生的 IPv6 入站/出站及基于 ip6tables 的端口映射与 NAT66 支持。"
-  read -r -e -p "是否确认开启 Docker IPv6 支持？[Y/n]: " ipv6_confirm
-  ipv6_confirm="${ipv6_confirm:-y}"
-  if [[ ! "$ipv6_confirm" =~ ^[Yy]$ ]]; then
-    echo "已取消操作。"
-    return 0
-  fi
-
-  local daemon_file="/etc/docker/daemon.json"
-  mkdir -p /etc/docker
-
-  if [ -f "$daemon_file" ]; then
-    cp "$daemon_file" "${daemon_file}.ua-box.$(date +%Y%m%d-%H%M%S).bak"
-    prune_old_backups "/etc/docker" "daemon.json.ua-box*" "${UA_MAX_BACKUPS:-10}"
-  fi
-
-  if has_cmd jq; then
-    local tmp_json
-    tmp_json="$(mktemp)"
-    if [ -f "$daemon_file" ] && jq . "$daemon_file" >/dev/null 2>&1; then
-      jq '. + {"ipv6": true, "fixed-cidr-v6": "fd00:172:17::/64", "experimental": true, "ip6tables": true}' "$daemon_file" > "$tmp_json"
-    else
-      cat > "$tmp_json" <<EOF
-{
-  "ipv6": true,
-  "fixed-cidr-v6": "fd00:172:17::/64",
-  "experimental": true,
-  "ip6tables": true
-}
-EOF
-    fi
-    mv "$tmp_json" "$daemon_file"
-  else
-    cat > "$daemon_file" <<EOF
-{
-  "ipv6": true,
-  "fixed-cidr-v6": "fd00:172:17::/64",
-  "experimental": true,
-  "ip6tables": true
-}
-EOF
-  fi
-
-  log_action "enable docker ipv6 (daemon.json)"
-  echo "正在重启 Docker 服务以应用 IPv6 配置..."
-  systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null || true
-
-  echo -e "${gl_lv}✓ Docker IPv6 双栈配置已生效！${gl_bai}"
-  echo "默认桥接网络 (bridge) 已分配 IPv6 ULA 段 fd00:172:17::/64，并通过 ip6tables 自动提供 NAT 与 端口映射。"
+  echo "配置 Docker IPv6；实际可达性仍取决于宿主机网络和防火墙。"
+  confirm_danger "修改 IPv6 配置并重启 Docker，可能中断现有服务" "/etc/docker/daemon.json" || return 1
+  run_recovery_operation daemon-config /etc/docker/daemon.json '{"ipv6":true,"fixed-cidr-v6":"fd00:172:17::/64","ip6tables":true}'
 }
 
 docker_menu() {
@@ -3945,7 +5368,7 @@ docker_menu() {
     echo -e "${gl_kjlan}20.  ${gl_bai}卸载 Docker"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) install_docker; pause ;;
@@ -4038,7 +5461,7 @@ tmux_ssh_persistent_menu() {
     echo -e "${gl_kjlan}2.   ${gl_bai}关闭"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1)
@@ -4092,7 +5515,7 @@ workspace_menu() {
     echo -e "${gl_kjlan}17.  ${gl_bai}安装 tmux"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       [1-9]|10) tmux_open_session "${DEFAULT_WORKSPACE_PREFIX}${choice}"; pause ;;
@@ -4366,72 +5789,39 @@ rclone_choose_remote_lsd() {
 rclone_mount_systemd() {
   need_root || return 1
   rclone_require || return 1
-
-  local remote_path mount_point extra config_file rclone_path service_name service_file
-  read -r -e -p "请输入远程路径，如 remote:path : " remote_path
-  read -r -e -p "请输入本地挂载点: " mount_point
-  read -r -e -p "额外参数，回车使用默认: " extra
-  [ -z "$extra" ] && extra="$DEFAULT_RCLONE_MOUNT_ARGS"
-
-  if [ -z "$remote_path" ] || [ -z "$mount_point" ]; then
-    echo "远程路径和本地挂载点不能为空。"
+  has_cmd systemd-escape || { echo "需要 systemd-escape。" >&2; return 1; }
+  local remote_path mount_point extra config_file rclone_path service_name service_file stage
+  read -r -e -p "请输入远程路径，如 remote:path : " remote_path || return 1
+  read -r -e -p "请输入本地挂载点: " mount_point || return 1
+  read -r -e -p "额外参数，回车使用默认: " extra || return 1
+  extra="${extra:-$DEFAULT_RCLONE_MOUNT_ARGS}"
+  [ -n "$remote_path" ] && [ -n "$mount_point" ] || return 1
+  has_cmd fusermount3 || has_cmd fusermount || { echo "请先安装 FUSE 挂载组件。" >&2; return 1; }
+  mkdir -p -- "$mount_point" || return 1
+  mount_point="$(readlink -f -- "$mount_point")" || return 1
+  mountpoint -q -- "$mount_point" && { echo "挂载点已被占用，未创建服务。" >&2; return 1; }
+  service_name="$(systemd-escape --path -- "$mount_point")" || return 1
+  service_file="/etc/systemd/system/rclone-mount-${service_name}.service"
+  [ ! -e "$service_file" ] && [ ! -L "$service_file" ] || { echo "同名服务已存在，未覆盖: $service_file" >&2; return 1; }
+  config_file="$(rclone_config_file_path)"
+  rclone_path="$(command -v rclone)" || return 1
+  stage="$(mktemp /etc/systemd/system/.ua-rclone.XXXXXX.service)" || return 1
+  if ! run_recovery_operation rclone-unit "$stage" "$rclone_path" "$remote_path" "$mount_point" "$config_file" "$extra" ||
+     ! systemd-analyze verify "$stage"; then
+    rm -f -- "$stage"; return 1
+  fi
+  # 硬链接是不可覆盖的原子发布，避免检查后覆盖其他进程创建的服务。
+  ln -- "$stage" "$service_file" || { rm -f -- "$stage"; return 1; }
+  rm -f -- "$stage"
+  systemctl daemon-reload && systemctl enable "${service_file##*/}" && systemctl restart "${service_file##*/}" || {
+    echo "挂载服务启动未完成，已保留服务文件供检查: $service_file" >&2; return 1;
+  }
+  if ! systemctl is-active --quiet "${service_file##*/}" || ! mountpoint -q -- "$mount_point"; then
+    echo "服务或挂载点未就绪，请查看 journalctl -u ${service_file##*/}" >&2
     return 1
   fi
-
-  # 自动检查并补全 FUSE 挂载依赖 (fusermount3 / fusermount)
-  if ! has_cmd fusermount3 && ! has_cmd fusermount; then
-    echo -e "${gl_huang}检测到系统缺少 FUSE 挂载组件 (fusermount)，正在自动安装 fuse3/fuse...${gl_bai}"
-    install_pkg fuse3 || install_pkg fuse || {
-      echo -e "${gl_hong}警告: 自动安装 fuse3/fuse 失败，rclone mount 可能会启动失败。${gl_bai}"
-    }
-  fi
-
-  # 转换绝对路径
-  mkdir -p "$mount_point"
-  mount_point="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
-
-  # 生成合法的服务名后缀
-  service_name="$(echo "$mount_point" | sed 's|^/||; s|/|-|g; s|[^a-zA-Z0-9-]||g')"
-  [ -z "$service_name" ] && service_name="default"
-  service_file="/etc/systemd/system/rclone-mount-${service_name}.service"
-
-  config_file="$(rclone_config_file_path)"
-  rclone_path="$(command -v rclone 2>/dev/null || echo "/usr/bin/rclone")"
-
-  # 写入服务文件：限制 5分钟(300s)内最多重试 5 次，规避无限循环重启
-  cat > "$service_file" <<EOF
-[Unit]
-Description=RClone Mount Service for ${service_name}
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
-
-[Service]
-Type=simple
-ExecStart=${rclone_path} mount "${remote_path}" "${mount_point}" --config="${config_file}" ${extra}
-ExecStop=/bin/umount -l "${mount_point}"
-Restart=on-failure
-RestartSec=15
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable "rclone-mount-${service_name}.service"
-  systemctl restart "rclone-mount-${service_name}.service"
-
-  sleep 1.5
-  if systemctl is-active --quiet "rclone-mount-${service_name}.service"; then
-    log_action "rclone systemd mount configured: ${service_name} -> ${mount_point}"
-    echo -e "${gl_lv}✓ RClone 开机自启守护服务已成功配置并启动！${gl_bai}"
-    echo "服务名称: rclone-mount-${service_name}.service"
-    echo "挂载点: $mount_point"
-  else
-    echo -e "${gl_hong}✗ 服务启动失败！${gl_bai} 请执行以下命令查看日志排查原因："
-    echo "journalctl -u rclone-mount-${service_name}.service -n 50 --no-pager"
-  fi
+  log_action "rclone mount verified: $service_name -> $mount_point"
+  echo "已核验挂载点，服务: ${service_file##*/}"
 }
 
 rclone_unmount_point() {
@@ -4440,10 +5830,19 @@ rclone_unmount_point() {
   [ -z "$mount_point" ] && echo "挂载点不能为空。" && return 1
 
   mount_point="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
-  service_name="$(echo "$mount_point" | sed 's|^/||; s|/|-|g; s|[^a-zA-Z0-9-]||g')"
+  service_name="$(systemd-escape --path -- "$mount_point")" || return 1
   [ -z "$service_name" ] && service_name="default"
   service_file="/etc/systemd/system/rclone-mount-${service_name}.service"
 
+  if [ ! -f "$service_file" ]; then
+    local legacy_name legacy_file
+    legacy_name="$(printf '%s\n' "$mount_point" | sed 's|^/||; s|/|-|g; s|[^a-zA-Z0-9-]||g')"
+    legacy_file="/etc/systemd/system/rclone-mount-${legacy_name:-default}.service"
+    if [ -f "$legacy_file" ] && grep -Fq -- "\"$mount_point\"" "$legacy_file"; then
+      service_file="$legacy_file"
+      service_name="${legacy_name:-default}"
+    fi
+  fi
   if [ -f "$service_file" ]; then
     echo "检测到该挂载点由 Systemd 守护服务运行，正在卸载并删除该开机自启服务..."
     systemctl disable --now "rclone-mount-${service_name}.service" 2>/dev/null || true
@@ -4516,7 +5915,7 @@ rclone_menu() {
     echo -e "${gl_kjlan}13.  ${gl_bai}编辑 rclone.conf 配置文件 (高级/手动)"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) install_rclone; pause ;;
@@ -4692,7 +6091,7 @@ test_scripts_menu() {
     echo -e "${gl_kjlan}31.  ${gl_bai}运行自定义脚本 URL"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}----------------------------------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) run_downloaded_script "$FUSION_TEST_SCRIPT" "$UA_BOX_TMP_DIR"/fusion-test.sh; pause ;;
@@ -5212,22 +6611,30 @@ ssh_get_current_port() {
 
 ssh_allow_port_firewall() {
   local port="$1"
-  [ -z "$port" ] && return 0
-  if has_cmd ufw && ufw status 2>/dev/null | grep -q "active"; then
-    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
-    log_action "firewall allow SSH port ${port}/tcp (ufw)"
+  valid_port "$port" || return 1
+  if has_cmd ufw && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${port}/tcp" || return 1
   elif has_cmd firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-    log_action "firewall allow SSH port ${port}/tcp (firewalld)"
+    firewall-cmd --permanent --add-port="${port}/tcp" && firewall-cmd --reload || return 1
   elif has_cmd iptables; then
-    iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
-    log_action "firewall allow SSH port ${port}/tcp (iptables)"
+    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
+    if has_cmd ip6tables; then
+      ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
+    fi
+  else
+    echo "无法自动确认防火墙放行，未修改 SSH。" >&2
+    return 1
   fi
+  log_action "firewall SSH port allowance acknowledged $port/tcp"
+}
+
+ssh_update_fail2ban_port() {
+  run_recovery_operation fail2ban-port "$1" "$2"
 }
 
 system_change_ssh_port() {
   need_root || return 1
+  has_cmd ss || { echo "缺少 ss，无法核验监听端口，未修改 SSH。" >&2; return 1; }
   local cur_port new_port backup
   cur_port="$(ssh_get_current_port)"
   
@@ -5250,6 +6657,10 @@ system_change_ssh_port() {
     echo "输入端口与当前端口相同，无需修改。"
     return 0
   fi
+  if is_port_taken "$new_port"; then
+    echo "目标端口已占用，未修改 SSH。" >&2
+    return 1
+  fi
 
   if [ "$new_port" -eq 80 ] || [ "$new_port" -eq 443 ] || [ "$new_port" -eq 3306 ] || [ "$new_port" -eq 6379 ]; then
     echo -e "${gl_huang}提醒: 端口 ${new_port} 常用于 Web/数据库服务，是否确定要设置为 SSH 端口？${gl_bai}"
@@ -5263,7 +6674,7 @@ system_change_ssh_port() {
   prune_old_backups "/etc/ssh" "sshd_config.ua-box.*.bak" "${UA_MAX_BACKUPS:-10}"
 
   echo "1. 正在通过防火墙放行新端口 ${new_port}/tcp..."
-  ssh_allow_port_firewall "$new_port"
+  ssh_allow_port_firewall "$new_port" || { echo "防火墙放行失败，未修改 SSH 配置。" >&2; return 1; }
 
   echo "2. 正在修改 /etc/ssh/sshd_config..."
   if ! ssh_set_global_option /etc/ssh/sshd_config Port "$new_port"; then
@@ -5287,13 +6698,25 @@ system_change_ssh_port() {
     return 1
   fi
 
+  if ! ss -H -ltn "sport = :$new_port" 2>/dev/null | grep -q .; then
+    cp "$backup" /etc/ssh/sshd_config
+    ssh_restart_service >/dev/null 2>&1 || { echo "SSH 恢复服务失败，请保留当前会话并手动检查。" >&2; return 1; }
+    echo "新端口未监听，已恢复原配置；请核对实际连接。" >&2
+    return 1
+  fi
+
   # 5. 若已配置 Fail2ban jail.local，自动同步更新监控端口
   if [ -f /etc/fail2ban/jail.local ] && grep -q '^\[sshd\]' /etc/fail2ban/jail.local 2>/dev/null; then
     local f2b_port_val="ssh"
     [ "$new_port" != "22" ] && f2b_port_val="ssh,${new_port}"
-    sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port    = ${f2b_port_val}/" /etc/fail2ban/jail.local 2>/dev/null || true
+    if ! ssh_update_fail2ban_port /etc/fail2ban/jail.local "$f2b_port_val"; then
+      echo "SSH 端口已修改，但 Fail2ban 配置更新失败，请手动核对。" >&2
+      return 1
+    fi
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
-      systemctl reload fail2ban >/dev/null 2>&1 || systemctl restart fail2ban >/dev/null 2>&1 || true
+      systemctl reload fail2ban >/dev/null 2>&1 || systemctl restart fail2ban >/dev/null 2>&1 || {
+        echo "SSH 端口已修改，但 Fail2ban 服务重载失败，请手动核对。" >&2; return 1;
+      }
       echo "5. 已同步更新 Fail2ban 防暴破监控端口 (${f2b_port_val})。"
     fi
   fi
@@ -5857,7 +7280,7 @@ system_cron_menu() {
     echo "2. 查看定时任务"
     echo "3. 清空当前用户定时任务"
     echo "0. 返回"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1)
@@ -6993,17 +8416,21 @@ get_compose_projects_summary() {
   docker info >/dev/null 2>&1 || return 0
 
   local ps_out
-  ps_out="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.State.Running}}' 2>/dev/null)"
+  if ! ps_out="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.State}}')"; then
+    echo "Compose 状态检测失败"
+    return 1
+  fi
   if [ -z "$ps_out" ]; then
     echo "-"
     return 0
   fi
 
   printf '%s\n' "$ps_out" | awk -F'\t' '
+    $1 ~ /-ua-(old|failed)-/ { next }
     $2 != "" {
       proj=$2
       total[proj]++
-      if ($3 == "true") running[proj]++
+      if ($3 == "running") running[proj]++
     }
     END {
       count = 0
@@ -7018,18 +8445,18 @@ get_compose_projects_summary() {
 }
 
 collect_bad_containers() {
-  local container_name container_status
-
+  local container_name container_state container_health inventory
   has_cmd docker || return 0
-  docker info >/dev/null 2>&1 || return 0
-  while IFS=$'\t' read -r container_name container_status; do
-    [ -z "$container_name" ] && continue
+  docker info >/dev/null 2>&1 || { echo "Docker 状态不可读取" >&2; return 1; }
+  inventory="$(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}')" || return 1
+  while IFS=$'\t' read -r container_name container_state container_health; do
+    [ -n "$container_name" ] || continue
     list_has_word "$container_name" "$UA_IGNORE_CONTAINERS" && continue
-    case "$container_status" in
-      Up*) ;;
-      *) printf '%s\n' "$container_name" ;;
-    esac
-  done < <(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
+    case "$container_name" in *-ua-old-*|*-ua-failed-*) continue ;; esac
+    if [ "$container_state" != running ] || [[ "$container_health" = *'(unhealthy)'* ]]; then
+      printf '%s\n' "$container_name"
+    fi
+  done <<< "$inventory"
 }
 
 collect_inactive_services() {
@@ -7070,6 +8497,14 @@ ua_abnormal_summary() {
   local found cpu_pct mem_pct disk_pct disk_warn disk_crit load_avg load_int cores bad_containers check_timeout failed_remotes remote rc output status svc
   local container_name container_status
 
+  # 人类可读报告保持原入口；通知通过独立 JSONL 事件判断状态，不解析报告文字。
+  _ua_alert_event() {
+    [ -n "${UA_ALERT_EVENTS_FILE:-}" ] || return 0
+    if ! python3 -B -c 'import json,sys; print(json.dumps(dict(zip(("type","scope","key","severity","message"),sys.argv[1:])),ensure_ascii=False))' "$@" >> "$UA_ALERT_EVENTS_FILE"; then
+      _UA_ALERT_RECORD_FAILED=1
+    fi
+    return 0
+  }
   found=0
   check_timeout="${RCLONE_STATUS_CHECK_TIMEOUT:-${RCLONE_CHECK_TIMEOUT:-5}}"
   disk_warn="${UA_STATUS_DISK_WARN:-80}"
@@ -7079,27 +8514,46 @@ ua_abnormal_summary() {
 
   echo -e "${gl_kjlan}异常汇总${gl_bai}"
 
-  cpu_pct="$(cpu_usage 2>/dev/null || echo 0)"
+  cpu_pct="$(cpu_usage 2>/dev/null)" || cpu_pct=""
   mem_pct="$(free | awk '/^Mem:/ {printf "%.0f", $3*100/$2}' 2>/dev/null)"
   disk_pct="$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}' 2>/dev/null)"
   load_avg="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
   cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
 
+  local metric_scope metric_value
+  for metric_scope in host.cpu host.memory host.disk; do
+    case "$metric_scope" in host.cpu) metric_value="$cpu_pct" ;; host.memory) metric_value="$mem_pct" ;; host.disk) metric_value="$disk_pct" ;; esac
+    if [[ "$metric_value" =~ ^[0-9]+$ ]]; then
+      _ua_alert_event checked "$metric_scope"
+    else
+      _ua_alert_event unknown "$metric_scope"
+    fi
+  done
+  if [[ "$load_avg" =~ ^[0-9]+([.][0-9]+)?$ && "$cores" =~ ^[0-9]+$ ]] && [ "$cores" -gt 0 ]; then
+    _ua_alert_event checked host.load
+  else
+    _ua_alert_event unknown host.load
+  fi
+
   if printf '%s\n' "$cpu_pct" | grep -Eq '^[0-9]+$' && [ "$cpu_pct" -ge 80 ]; then
+    _ua_alert_event issue host.cpu host:cpu warning "CPU 占用高: ${cpu_pct}%"
     echo "- CPU 占用高: ${cpu_pct}%"
     echo "  建议: 使用 top/htop 查看高占用进程，必要时重启异常服务。"
     found=1
   fi
   if printf '%s\n' "$mem_pct" | grep -Eq '^[0-9]+$' && [ "$mem_pct" -ge 85 ]; then
+    _ua_alert_event issue host.memory host:memory warning "内存占用高: ${mem_pct}%"
     echo "- 内存占用高: ${mem_pct}%"
     echo "  建议: 使用 free -h 和 docker stats 排查占用，必要时增加 swap 或限制容器内存。"
     found=1
   fi
   if printf '%s\n' "$disk_pct" | grep -Eq '^[0-9]+$' && [ "$disk_pct" -ge "$disk_crit" ]; then
+    _ua_alert_event issue host.disk disk:root critical "根分区占用严重: ${disk_pct}%"
     echo "- 根分区占用严重: ${disk_pct}% >= ${disk_crit}%"
     echo "  建议: 立即清理日志、缓存、旧备份或 Docker 无用数据。"
     found=1
   elif printf '%s\n' "$disk_pct" | grep -Eq '^[0-9]+$' && [ "$disk_pct" -ge "$disk_warn" ]; then
+    _ua_alert_event issue host.disk disk:root warning "根分区占用偏高: ${disk_pct}%"
     echo "- 根分区占用偏高: ${disk_pct}% >= ${disk_warn}%"
     echo "  建议: 使用 ncdu/du 定位大目录，并关注日志和备份增长。"
     found=1
@@ -7108,110 +8562,164 @@ ua_abnormal_summary() {
   if printf '%s\n' "$load_int" | grep -Eq '^[0-9]+$' &&
     printf '%s\n' "$cores" | grep -Eq '^[0-9]+$' &&
     [ "$cores" -gt 0 ] && [ "$load_int" -ge "$cores" ]; then
+    _ua_alert_event issue host.load host:load warning "系统负载偏高: ${load_avg} / ${cores}核"
     echo "- 系统负载偏高: ${load_avg} / ${cores}核"
     echo "  建议: 使用 uptime/top 查看负载来源，重点检查 CPU、磁盘 IO 和网络任务。"
     found=1
   fi
 
-  if has_cmd docker; then
-    if docker info >/dev/null 2>&1; then
-      local _bad _bname _bstatus
-      _bad=""
-      while IFS=$'\t' read -r _bname _bstatus; do
-        [ -z "$_bname" ] && continue
-        list_has_word "$_bname" "$UA_IGNORE_CONTAINERS" && continue
-        case "$_bstatus" in
-          Up*) ;;
-          *) _bad="${_bad}  $_bname  $_bstatus\n" ;;
-        esac
-      done < <(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
-      if [ -n "$_bad" ]; then
-        echo "- Docker 异常容器:"
-        printf '%b' "$_bad"
-        echo "  建议: 不再使用可执行 ua ignore container <名称>；仍需使用先查看日志再重启。"
-        found=1
-      fi
 
-      # 检测 Docker Compose 项目部分容器停止的异常
-      local ps_out bad_projects
-      ps_out="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.State.Running}}' 2>/dev/null)"
-      if [ -n "$ps_out" ]; then
-        bad_projects="$(printf '%s\n' "$ps_out" | awk -F'\t' '
-          $2 != "" {
-            proj=$2
-            total[proj]++
-            if ($3 == "true") running[proj]++
-          }
-          END {
-            for (p in total) {
-              run_count = running[p] ? running[p] : 0
-              if (run_count < total[p]) {
-                printf "%s (%d/%d运行中) ", p, run_count, total[p]
-              }
-            }
-          }
-        ')"
-        if [ -n "$bad_projects" ]; then
-          echo "- Compose 项目有容器已停止: $bad_projects"
-          echo "  建议: 运行 ua docker 并选择 8 进入项目管理，对该项目进行一键 Compose Up 重启拉起。"
+
+  local ignored_name
+  for ignored_name in $UA_IGNORE_CONTAINERS; do
+    _ua_alert_event ignored '' "container:$ignored_name"
+  done
+  for ignored_name in $UA_IGNORE_SERVICES; do
+    _ua_alert_event ignored '' "service:$ignored_name"
+  done
+  for ignored_name in $UA_IGNORE_RCLONE_REMOTES; do
+    _ua_alert_event ignored '' "rclone:$ignored_name"
+  done
+  if has_cmd docker; then
+    _ua_alert_event checked docker.daemon
+    if docker info >/dev/null 2>&1; then
+      local inventory filtered_inventory="" _bad="" invalid_inventory=0 _bname _bstate _bstatus _project projects project running total
+      _ua_alert_event checked probe:docker.inventory
+      if ! inventory="$(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Label "com.docker.compose.project"}}')"; then
+        _ua_alert_event unknown docker.container
+        _ua_alert_event unknown docker.compose
+        _ua_alert_event issue probe:docker.inventory probe:docker.inventory warning "Docker 容器列表检测失败"
+        echo "- Docker 容器状态检测失败，不能认定所有容器正常。"
+        found=1
+      else
+        while IFS=$'\t' read -r _bname _bstate _bstatus _project; do
+          [ -n "$_bname" ] || continue
+          case "$_bname" in *-ua-old-*|*-ua-failed-*) continue ;; esac
+          list_has_word "$_bname" "$UA_IGNORE_CONTAINERS" && continue
+          if [ -z "$_bstatus" ] || [[ ! "$_bstate" =~ ^(running|exited|created|restarting|paused|dead|removing)$ ]]; then
+            _ua_alert_event unknown "docker.container:$_bname"
+            invalid_inventory=1
+            continue
+          fi
+          if [ "$_bstate" = running ] && [[ "$_bstatus" = *'health: starting'* ]]; then
+            _ua_alert_event unknown "docker.container:$_bname"
+          else
+            _ua_alert_event checked "docker.container:$_bname"
+            if [ "$_bstate" != running ] || [[ "$_bstatus" = *'(unhealthy)'* ]]; then
+              _ua_alert_event issue "docker.container:$_bname" "container:$_bname" critical "容器异常（停止或健康检查失败）: $_bname"
+              _bad+="$_bname"$'\n'
+              found=1
+            fi
+          fi
+          filtered_inventory+="$_bname"$'\t'"$_bstate"$'\t'"$_bstatus"$'\t'"$_project"$'\n'
+        done <<< "$inventory"
+        if [ "$invalid_inventory" -eq 1 ]; then
+          _ua_alert_event unknown docker.compose
+          _ua_alert_event issue probe:docker.inventory probe:docker.inventory warning "Docker 列表包含无法确认的状态"
+          echo "- Docker 列表包含无法确认的状态，不能判断相关对象恢复。"
           found=1
         fi
+        if [ -n "$_bad" ]; then
+          echo "- Docker 异常容器（已停止或健康检查失败）:"
+          printf '%s' "$_bad"
+          echo "  建议: 先查看日志和健康检查结果，再决定是否重启。"
+        fi
+        projects="$(printf '%s' "$filtered_inventory" | awk -F'\t' '
+          $4 != "" {
+            total[$4]++
+            if ($2 == "running" && $3 !~ /unhealthy|health: starting/) ready[$4]++
+          }
+          END { for (p in total) printf "%s\t%d\t%d\n", p, ready[p]+0, total[p] }
+        ')"
+        while IFS=$'\t' read -r project running total; do
+          [ -n "$project" ] || continue
+          _ua_alert_event checked "docker.compose:$project"
+          if [ "$running" -lt "$total" ]; then
+            _ua_alert_event issue "docker.compose:$project" "compose:$project" critical "Compose 项目未全部就绪: $project ($running/$total)"
+            echo "- Compose 项目未全部就绪: $project ($running/$total)"
+            found=1
+          fi
+        done <<< "$projects"
       fi
     else
+      _ua_alert_event issue docker.daemon docker:daemon critical "Docker 服务未运行或不可访问"
+      _ua_alert_event unknown docker.container
+      _ua_alert_event unknown docker.compose
+      _ua_alert_event unknown probe:docker.inventory
       echo "- Docker 服务未运行或不可访问"
-      echo "  建议: 使用 systemctl status docker 查看原因，必要时执行 systemctl restart docker。"
+      echo "  建议: 使用 systemctl status docker 查看原因。"
       found=1
     fi
+  else
+    _ua_alert_event unknown docker
+    _ua_alert_event unknown probe:docker.inventory
   fi
 
   if has_cmd systemctl; then
-    local _monitor_svcs
+    local _monitor_svcs unit_list active_rc
     _monitor_svcs="${UA_MONITOR_SERVICES:-caddy}"
-    # shellcheck disable=SC2086
     for svc in $_monitor_svcs; do
-      list_has_word "$svc" "$UA_IGNORE_SERVICES" && continue
-      if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q . &&
-        ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-        echo "- 服务未运行: $svc"
-        echo "  建议: 需要该服务时执行 systemctl start $svc；不再使用可执行 ua ignore service $svc。"
-        found=1
+      if list_has_word "$svc" "$UA_IGNORE_SERVICES"; then
+        _ua_alert_event ignored '' "service:$svc"
+        continue
       fi
+      if ! unit_list="$(systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null)" || [ -z "$unit_list" ]; then
+        _ua_alert_event unknown "service:$svc"
+        continue
+      fi
+      active_rc=0
+      systemctl is-active --quiet "$svc" 2>/dev/null || active_rc=$?
+      case "$active_rc" in
+        0) _ua_alert_event checked "service:$svc" ;;
+        3)
+          _ua_alert_event checked "service:$svc"
+          _ua_alert_event issue "service:$svc" "service:$svc" critical "服务未运行: $svc"
+          echo "- 服务未运行: $svc"
+          found=1
+          ;;
+        *) _ua_alert_event unknown "service:$svc" ;;
+      esac
     done
+  else
+    _ua_alert_event unknown service
   fi
 
+
   if has_cmd rclone; then
-    if [ "${UA_STATUS_SKIP_RCLONE:-0}" = "1" ]; then
+    if [ "${UA_STATUS_SKIP_RCLONE:-0}" = 1 ]; then
+      _ua_alert_event unknown rclone
       echo "- rclone remote 检测已跳过（UA_STATUS_SKIP_RCLONE=1）"
     else
-      local _rclone_count
-      _rclone_count="$(rclone listremotes 2>/dev/null | wc -l)"
-      if [ "$_rclone_count" -gt 0 ]; then
-        echo -e "${gl_huang}检测 ${_rclone_count} 个 rclone remote，每个最多等待 ${check_timeout}s，请稍候...${gl_bai}"
-      fi
-      failed_remotes=""
-      while IFS= read -r remote; do
-        [ -z "$remote" ] && continue
-        list_has_word "$remote" "$UA_IGNORE_RCLONE_REMOTES" && continue
-        if has_cmd timeout; then
-          output="$(timeout "$check_timeout" rclone lsd "${remote}:" 2>&1 >/dev/null)"
-          rc=$?
-          [ "$rc" -eq 124 ] && status="timeout" || status="fail"
-        else
-          output="$(rclone lsd "${remote}:" 2>&1 >/dev/null)"
-          rc=$?
-          status="fail"
-        fi
-        if [ "$rc" -ne 0 ]; then
-          failed_remotes="${failed_remotes}${remote}(${status}) "
-        fi
-      done < <(rclone listremotes 2>/dev/null | sed 's/:$//')
-      if [ -n "$failed_remotes" ]; then
-        echo "- rclone remote 连接异常: $failed_remotes"
-        echo "  连接测试超时: ${check_timeout}s/remote"
-        echo "  建议: 执行 ua rclone 检测配置；确认不用的 remote 可执行 ua ignore rclone <名称>。"
-        found=1
+      local _rclone_list
+      if ! _rclone_list="$(rclone listremotes 2>/dev/null)"; then
+        _ua_alert_event unknown rclone
+        echo "- rclone remote 列表不可读取，不能判断恢复。"
+      else
+        while IFS= read -r remote; do
+          remote="${remote%:}"
+          [ -n "$remote" ] || continue
+          if list_has_word "$remote" "$UA_IGNORE_RCLONE_REMOTES"; then
+            _ua_alert_event ignored '' "rclone:$remote"
+            continue
+          fi
+          if ! has_cmd timeout; then
+            _ua_alert_event unknown "rclone:$remote"
+            echo "- 缺少 timeout，已跳过远程连接探测: $remote"
+            continue
+          fi
+          rc=0
+          timeout "$check_timeout" rclone lsd "${remote}:" >/dev/null 2>&1 || rc=$?
+          _ua_alert_event checked "rclone:$remote"
+          if [ "$rc" -ne 0 ]; then
+            _ua_alert_event issue "rclone:$remote" "rclone:$remote" warning "rclone remote 连接失败或超时: $remote"
+            echo "- rclone remote 连接异常: $remote"
+            found=1
+          fi
+        done <<< "$_rclone_list"
       fi
     fi
+  else
+    _ua_alert_event unknown rclone
   fi
 
   if has_cmd openssl; then
@@ -7220,7 +8728,9 @@ ua_abnormal_summary() {
       [ -d "$cert_dir" ] || continue
       while IFS= read -r crt_file; do
         [ -z "$crt_file" ] || [ ! -f "$crt_file" ] && continue
+        _ua_alert_event checked "certificate:$crt_file"
         if ! openssl x509 -checkend 604800 -noout -in "$crt_file" >/dev/null 2>&1; then
+          _ua_alert_event issue "certificate:$crt_file" "certificate:$crt_file" warning "证书即将过期或不可解析: $(basename "$crt_file" .crt)"
           expiring_certs="${expiring_certs}$(basename "$crt_file" .crt) "
         fi
       done < <(find "$cert_dir" -type f -name "*.crt" 2>/dev/null)
@@ -7237,86 +8747,590 @@ ua_abnormal_summary() {
   return 0
 }
 
-ua_send_notification() {
-  local title="$1"
-  local body="$2"
-  local full_text sent_any=0
+ua_health_program() {
+  cat <<'PY_UA_HEALTH'
+"""Read-only diagnostics and private, acknowledged notification state. No work on import."""
+import copy
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
 
-  full_text="【${title}】
-主机: $(hostname 2>/dev/null || echo 'unknown')
-时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
-------------------------
-${body}"
 
-  if [ -n "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -n "${UA_NOTIFY_TG_CHAT_ID:-}" ]; then
-    if curl -fsSL --max-time 15 -X POST "https://api.telegram.org/bot${UA_NOTIFY_TG_BOT_TOKEN}/sendMessage" \
-      --data-urlencode "chat_id=${UA_NOTIFY_TG_CHAT_ID}" \
-      --data-urlencode "text=${full_text}" >/dev/null 2>&1; then
-      echo -e "${gl_lv}✓ Telegram 告警消息推送成功。${gl_bai}"
-      sent_any=1
+class HealthError(RuntimeError):
+    pass
+
+
+def query(args):
+    """Only callers' fixed read-only probes; never invoke a shell or emit raw stderr."""
+    environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C")
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=8, env=environment)
+        return result.returncode, result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return 125, ""
+
+
+def safe_path(path):
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise HealthError("状态路径必须是规范绝对路径。")
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise HealthError("状态路径或父目录不能是符号链接。")
+    return path
+
+
+def private_file(path):
+    path = safe_path(path)
+    if path.exists():
+        info = path.stat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_nlink != 1):
+            raise HealthError("状态文件必须由当前用户拥有、权限为 600，且不是链接或特殊文件。")
+    return path
+
+
+def prepare_state(directory):
+    directory = safe_path(directory)
+    if not directory.exists():
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = directory.stat()
+    if not directory.is_dir() or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise HealthError("告警状态目录必须由当前用户拥有，且权限不大于 700；未修改已有目录。")
+    private_file(directory / "state.json")
+    private_file(directory / ".notify.lock")
+    descriptor = os.open(directory / ".notify.lock", os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    os.close(descriptor)
+
+
+def write_json(path, data):
+    path = private_file(path)
+    descriptor, temporary = tempfile.mkstemp(prefix=".ua-notify-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(data, stream, ensure_ascii=False, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def load_state(directory):
+    directory = safe_path(directory)
+    info = directory.stat()
+    if not directory.is_dir() or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise HealthError("告警状态目录权限不安全，未读取或修改状态。")
+    path = private_file(Path(directory) / "state.json")
+    if not path.exists():
+        return {"version": 1, "channels": {}}
+    try:
+        state = json.loads(path.read_text())
+        if type(state.get("version")) is not int or state["version"] != 1 or not isinstance(state.get("channels"), dict):
+            raise ValueError()
+        for identifier, channel in state["channels"].items():
+            if not re.fullmatch(r"[0-9a-f]{64}", identifier) or not isinstance(channel, dict):
+                raise ValueError()
+            if channel.get("kind") not in ("telegram", "webhook") or not isinstance(channel.get("active"), dict):
+                raise ValueError()
+            for key, issue in channel["active"].items():
+                validate_issue(key, issue)
+                for field in ("last_sent", "first_seen"):
+                    if type(issue.get(field)) not in (int, float) or not math.isfinite(issue[field]) or issue[field] < 0:
+                        raise ValueError()
+        return state
+    except (ValueError, TypeError, AttributeError, KeyError):
+        raise HealthError("告警状态损坏或版本不支持；已保留原文件，未重置去重状态。") from None
+
+
+def validate_issue(key, issue):
+    if (not isinstance(key, str) or not 1 <= len(key) <= 1024 or not isinstance(issue, dict)
+            or issue.get("severity") not in ("warning", "critical")
+            or not isinstance(issue.get("scope"), str) or not issue["scope"]
+            or not isinstance(issue.get("message"), str) or not 1 <= len(issue["message"]) <= 8192):
+        raise HealthError("告警对象格式无效，未更新通知状态。")
+
+
+def observations(path):
+    result = {"issues": {}, "checked": set(), "unknown": set(), "ignored": set()}
+    for line in Path(path).read_text().splitlines():
+        event = json.loads(line)
+        kind = event.get("type")
+        if kind in ("checked", "unknown") and isinstance(event.get("scope"), str) and event["scope"]:
+            result[kind].add(event["scope"])
+        elif kind == "ignored" and isinstance(event.get("key"), str):
+            result["ignored"].add(event["key"])
+        elif kind == "issue":
+            key = event.get("key")
+            issue = {k: event.get(k) for k in ("scope", "severity", "message")}
+            validate_issue(key, issue)
+            if key in result["issues"]:
+                raise HealthError("巡检产生重复告警标识，未更新通知状态。")
+            result["issues"][key] = issue
+        else:
+            raise HealthError("巡检事件无效，不能推断恢复。")
+    if not result["checked"] and not result["unknown"]:
+        raise HealthError("没有有效巡检结果，不能推断恢复。")
+    return result
+
+
+def scope_checked(scope, observed):
+    return scope in observed["checked"] and not any(
+        scope == value or scope.startswith(value + ".") or scope.startswith(value + ":")
+        for value in observed["unknown"])
+
+
+def configured_channels(environment):
+    channels = []
+    token, chat = environment.get("UA_HEALTH_TG_TOKEN", ""), environment.get("UA_HEALTH_TG_CHAT", "")
+    if bool(token) != bool(chat):
+        raise HealthError("Telegram 配置不完整，未更新通知状态。")
+    if token:
+        channels.append({"kind": "telegram", "id": fingerprint(["telegram", token, chat])})
+    url, kind = environment.get("UA_HEALTH_WEBHOOK", ""), environment.get("UA_HEALTH_WEBHOOK_KIND", "")
+    if url:
+        if kind not in ("wecom", "feishu", "dingtalk", "discord", "bark"):
+            raise HealthError("Webhook 类型无法识别，未更新通知状态。")
+        channels.append({"kind": "webhook", "id": fingerprint(["webhook", kind, url])})
+    if not channels:
+        raise HealthError("尚未配置有效的告警渠道，未更新通知状态。")
+    return channels
+
+
+def notification_plan(state, observed, channels, cooldown, now):
+    if type(cooldown) is not int or not 0 <= cooldown <= 604800 or not math.isfinite(now) or now < 0:
+        raise HealthError("冷却时间须为 0–604800 秒；当前时间必须有效。")
+    result = {"channels": {}, "unknown_scopes": sorted(observed["unknown"])}
+    for channel in channels:
+        previous = state["channels"].get(channel["id"], {"kind": channel["kind"], "active": {}})
+        active = copy.deepcopy(previous["active"])
+        send_keys, recover_keys, lines = [], [], []
+        for key, current in sorted(observed["issues"].items()):
+            if key in observed["ignored"] or not scope_checked(current["scope"], observed):
+                continue
+            old = active.get(key)
+            changed = old is not None and old["severity"] != current["severity"]
+            due = old is None or changed or now < old["last_sent"] or now - old["last_sent"] >= cooldown
+            if not due:
+                continue
+            reason = "新故障" if old is None else "级别变化" if changed else "持续异常提醒"
+            lines.append("[" + reason + "][" + current["severity"] + "] " + current["message"])
+            active[key] = {**current, "first_seen": min(old["first_seen"], now) if old else now, "last_sent": now}
+            send_keys.append(key)
+        for key, old in sorted(previous["active"].items()):
+            if not scope_checked(old["scope"], observed):
+                result["unknown_scopes"].append(old["scope"])
+            if key in observed["ignored"]:
+                continue
+            if key not in observed["issues"] and scope_checked(old["scope"], observed):
+                lines.append("[已恢复] " + old["message"] + "（此前告警，当前该项检查正常）")
+                active.pop(key, None)
+                recover_keys.append(key)
+        if not lines:
+            continue
+        title = "UA Box 状态恢复通知" if not send_keys else "UA Box 状态巡检异常告警"
+        if send_keys and recover_keys:
+            title = "UA Box 状态变化通知（异常及恢复）"
+        result["channels"][channel["kind"]] = {
+            "id": channel["id"], "kind": channel["kind"], "expected": fingerprint(previous),
+            "active": active, "send_keys": send_keys, "recover_keys": recover_keys,
+            "title": title, "body": "\n".join(lines), "planned_at": now}
+    result["unknown_scopes"] = sorted(set(result["unknown_scopes"]))
+    return result
+
+
+def plan_delivery(directory, events_path, plan_path, cooldown, environment, now=None):
+    cooldown = int(cooldown)
+    if not 0 <= cooldown <= 604800:
+        raise HealthError("冷却时间须为 0–604800 秒。")
+    state = load_state(directory)
+    observed = observations(events_path)
+    channels = configured_channels(environment)
+    # Explicitly ignored objects are retired silently, never described as recovered.
+    changed = False
+    for channel in state["channels"].values():
+        for key in observed["ignored"]:
+            if key in channel["active"]:
+                del channel["active"][key]
+                changed = True
+    if changed:
+        write_json(Path(directory) / "state.json", state)
+    plan = notification_plan(state, observed, channels, int(cooldown), time.time() if now is None else now)
+    write_json(plan_path, plan)
+    return plan
+
+
+def commit_delivery(directory, plan_path, kind, now=None):
+    plan = json.loads(Path(plan_path).read_text())["channels"][kind]
+    state = load_state(directory)
+    previous = state["channels"].get(plan["id"], {"kind": kind, "active": {}})
+    if fingerprint(previous) != plan["expected"]:
+        raise HealthError("通知状态已变化，拒绝提交过期计划。")
+    active = plan["active"]
+    for key in plan["send_keys"]:
+        active[key]["last_sent"] = time.time() if now is None else now
+    state["channels"][plan["id"]] = {"kind": kind, "active": active}
+    write_json(Path(directory) / "state.json", state)
+
+
+def static_config(path):
+    """Never source a shell configuration or evaluate expansion/substitution."""
+    values, dynamic = {}, False
+    for raw in Path(path).read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Z_][A-Z0-9_]*)=(.*)", line)
+        if not match:
+            dynamic = True
+            continue
+        try:
+            tokens = shlex.split(match[2], comments=True)
+        except ValueError:
+            dynamic = True
+            continue
+        # Dynamic shell values are not used to choose paths or claim capabilities.
+        if len(tokens) != 1 or re.search(r"[$`]|[;&<>|]", match[2]):
+            dynamic = True
+            continue
+        values[match[1]] = tokens[0]
+    return values, dynamic
+
+
+def doctor(home, config, log_dir, backup_dir, state_dir):
+    checks, capabilities = [], {}
+    def record(identifier, status, message):
+        checks.append({"id": identifier, "status": status, "message": message})
+    def dependency(name, required=False):
+        found = shutil.which(name) is not None
+        record("dependency." + name, "PASS" if found else "FAIL" if required else "SKIP",
+               name + (" 可用" if found else " 未安装；相关功能不可用"))
+        return found
+    record("platform", "PASS" if sys.platform.startswith("linux") else "FAIL", "平台为 Linux" if sys.platform.startswith("linux") else "需要 Linux")
+    record("python", "PASS" if sys.version_info >= (3, 9) else "FAIL", "Python " + ".".join(map(str, sys.version_info[:3])) + "；恢复功能要求 ≥3.9")
+    if dependency("bash", True):
+        code, output = query(["bash", "--noprofile", "--norc", "-c", 'printf "%s" "${BASH_VERSINFO[0]}"'])
+        record("bash.version", "PASS" if code == 0 and output.isdigit() and int(output) >= 4 else "FAIL", "Bash 主版本要求 ≥4")
+    for name in ("readlink", "awk", "sed", "grep", "tar", "mktemp", "stat"):
+        dependency(name, True)
+    downloader = bool(shutil.which("curl") or shutil.which("wget"))
+    record("download", "PASS" if downloader else "WARN", "下载工具可用" if downloader else "缺少 curl/wget；不会自动安装")
+    values = {}
+    config_path = Path(config)
+    if not config_path.exists():
+        record("config", "WARN", "配置文件不存在；只读诊断不会创建默认配置")
+    elif not config_path.is_file() or config_path.is_symlink():
+        record("config", "FAIL", "配置必须为普通文件；未执行配置")
+    else:
+        try:
+            mode = stat.S_IMODE(config_path.stat().st_mode)
+            owner_matches = config_path.stat().st_uid == os.geteuid()
+            record("config.owner", "PASS" if owner_matches else "FAIL" if os.geteuid() == 0 else "WARN", "配置属主应与执行用户一致；未修改属主")
+            record("config.permissions", "FAIL" if mode & 0o022 else "WARN" if mode & 0o077 else "PASS",
+                   "配置权限 " + oct(mode) + "；建议 600，禁止其他用户写入")
+            if config_path.stat().st_size > 1048576:
+                raise ValueError()
+            code, _ = query(["bash", "--noprofile", "--norc", "-n", str(config_path)])
+            record("config.syntax", "PASS" if code == 0 else "FAIL", "仅检查 Bash 语法，不执行配置")
+            values, dynamic = static_config(config_path)
+            record("config.static", "WARN" if dynamic else "PASS", "配置含动态语句，相关值无法静态确认；未执行" if dynamic else "配置可静态读取；不显示配置值或凭据")
+        except (OSError, ValueError, UnicodeError):
+            record("config.read", "FAIL", "无法安全读取配置；未输出内容")
+    for key, default in (("logs", log_dir), ("backups", backup_dir), ("notification-state", state_dir)):
+        value = values.get({"logs": "UA_BOX_LOG_DIR", "backups": "UA_BOX_BACKUP_DIR", "notification-state": "UA_NOTIFY_STATE_DIR"}[key], default)
+        path = Path(value)
+        try:
+            safe_path(path)
+            nearest = path
+            while not nearest.exists():
+                nearest = nearest.parent
+            valid = nearest.is_dir() and os.access(nearest, os.W_OK | os.X_OK)
+            record("path." + key, "PASS" if valid else "WARN", key + (" 目录或最近父目录具备访问权限（未写入验证）" if valid else " 路径不可用；未创建或修改"))
+            if key == "notification-state" and path.exists():
+                info = path.stat()
+                private = info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o077
+                record("notification.permissions", "PASS" if private else "FAIL", "状态目录应由当前用户拥有，权限不大于 700")
+                try:
+                    load_state(path)
+                    private_file(path / ".notify.lock")
+                    record("notification.state", "PASS", "已有告警状态可读取；未修改")
+                except (HealthError, OSError):
+                    record("notification.state", "FAIL", "告警状态不可安全读取，不能可靠去重；未修改")
+        except (OSError, HealthError):
+            record("path." + key, "FAIL", key + " 路径不安全或不可访问；未修改")
+    try:
+        disk = Path(home)
+        while not disk.exists():
+            disk = disk.parent
+        free = shutil.disk_usage(disk).free
+        record("disk.free", "FAIL" if free < 128 * 1024**2 else "WARN" if free < 512 * 1024**2 else "PASS", "项目所在文件系统可用空间约 " + str(free // 1024**2) + " MiB（仅查询）")
+    except OSError:
+        record("disk.free", "WARN", "可用空间无法读取")
+    docker_found = dependency("docker")
+    capabilities["docker_readable"] = False
+    capabilities["local_docker_recovery"] = False
+    capabilities["compose_port_edit"] = False
+    if docker_found:
+        code, _ = query(["docker", "version", "--format", "{{.Server.Version}}"])
+        capabilities["docker_readable"] = code == 0
+        record("docker.daemon", "PASS" if code == 0 else "WARN", "Docker daemon 可只读访问" if code == 0 else "Docker daemon 不可访问或探测超时；未尝试启动")
+        endpoint = os.environ.get("DOCKER_HOST") if not os.environ.get("DOCKER_CONTEXT") else None
+        if not endpoint:
+            args = ["docker", "context", "inspect"]
+            if os.environ.get("DOCKER_CONTEXT"):
+                args.append(os.environ["DOCKER_CONTEXT"])
+            code, output = query(args)
+            try:
+                endpoint = json.loads(output)[0]["Endpoints"]["docker"]["Host"] if code == 0 else None
+            except (ValueError, KeyError, IndexError, TypeError):
+                endpoint = None
+        local = bool(endpoint and endpoint.startswith("unix://"))
+        capabilities["local_docker_recovery"] = local and capabilities["docker_readable"]
+        record("docker.endpoint", "PASS" if local else "WARN", "本机 Unix Socket，满足自动恢复的连接前提" if local else "远程或未知连接，不支持自动恢复；不显示连接地址")
+        code, _ = query(["docker", "compose", "version", "--short"])
+        if code == 0:
+            help_code, help_text = query(["docker", "compose", "config", "--help"])
+            capabilities["compose_port_edit"] = help_code == 0 and "--format" in help_text
+            record("docker.compose", "PASS" if capabilities["compose_port_edit"] else "WARN", "Compose 插件支持配置格式输出" if capabilities["compose_port_edit"] else "Compose 缺少可确认的配置格式输出能力")
+        else:
+            record("docker.compose", "WARN", "Compose 插件不可用；自动 Compose 端口切换不可用")
+        dependency("dockerd")
+    for name in ("rclone", "bbolt", "systemctl", "systemd-escape", "systemd-analyze"):
+        dependency(name)
+    fuse = bool(shutil.which("fusermount3") or shutil.which("fusermount")) and os.access("/dev/fuse", os.R_OK | os.W_OK)
+    capabilities["rclone_mount_prerequisites"] = bool(shutil.which("rclone") and shutil.which("systemd-escape") and shutil.which("systemd-analyze") and fuse)
+    record("rclone.fuse", "PASS" if fuse else "SKIP", "FUSE 工具及设备权限可用；未执行挂载" if fuse else "FUSE 工具或设备权限不足；挂载前需处理")
+    capabilities["notification_prerequisites"] = bool(shutil.which("curl") and shutil.which("flock") and sys.version_info >= (3, 9))
+    record("notification.dependencies", "PASS" if capabilities["notification_prerequisites"] else "WARN", "告警需要 Python ≥3.9、curl 和 flock；未发送测试消息")
+    token, chat = values.get("UA_NOTIFY_TG_BOT_TOKEN", ""), values.get("UA_NOTIFY_TG_CHAT_ID", "")
+    webhook = values.get("UA_NOTIFY_WEBHOOK_URL", "")
+    capabilities["notification_configured"] = bool(token and chat or webhook)
+    if bool(token) != bool(chat):
+        record("notification.configuration", "WARN", "Telegram 参数不完整；不显示凭据")
+    else:
+        record("notification.configuration", "PASS" if capabilities["notification_configured"] else "SKIP",
+               "静态配置中存在通知渠道；未验证远端送达" if capabilities["notification_configured"] else "未发现可静态确认的通知渠道")
+    cooldown = values.get("UA_NOTIFY_COOLDOWN_SECONDS", "3600")
+    record("notification.cooldown", "PASS" if cooldown.isdigit() and 0 <= int(cooldown) <= 604800 else "FAIL", "冷却时间必须为 0–604800 秒；默认 3600 秒")
+    code = 2 if any(check["status"] == "FAIL" for check in checks) else 1 if any(check["status"] == "WARN" for check in checks) else 0
+    return {"read_only": True, "checks": checks, "capabilities": capabilities, "exit_code": code}
+
+
+def main(args=None):
+    args = sys.argv[1:] if args is None else args
+    try:
+        command, *args = args
+        if command == "doctor":
+            paths, options = args[:5], args[5:]
+            if options not in ([], ["--json"]):
+                raise HealthError("用法: ua doctor [--json]")
+            try:
+                report = doctor(*paths)
+            except (OSError, ValueError, HealthError):
+                report = {"read_only": True, "checks": [{"id": "diagnostic", "status": "FAIL", "message": "部分路径或配置无法安全读取；未修改"}],
+                          "capabilities": {}, "exit_code": 2}
+            if options:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            else:
+                print("UA Box 只读诊断（不执行配置、不安装、不修复、不启动服务）")
+                for check in report["checks"]:
+                    print("[" + check["status"] + "] " + check["id"] + ": " + check["message"])
+                print("退出码: 0=检查通过，1=存在提醒，2=存在错误；能力检查不等同于业务验收。")
+            return report["exit_code"]
+        if command == "state-init":
+            prepare_state(*args)
+        elif command == "state-plan":
+            plan_delivery(*args, environment=os.environ)
+        elif command == "state-commit":
+            commit_delivery(*args)
+        elif command == "plan-field":
+            plan = json.loads(Path(args[0]).read_text())
+            value = plan["channels"].get(args[1])
+            if value is None:
+                return 3
+            print(value[args[2]])
+        elif command == "plan-summary":
+            plan = json.loads(Path(args[0]).read_text())
+            print("计划通知渠道数: " + str(len(plan["channels"])))
+            if plan["unknown_scopes"]:
+                print("部分检查未完成或已跳过；这些对象不会被判定恢复。")
+            if not plan["channels"]:
+                print("没有需要发送的状态变化：正常或仍在冷却期。")
+        else:
+            raise HealthError("未知健康检查命令。")
+    except HealthError as error:
+        print("诊断/告警处理失败：" + str(error), file=sys.stderr)
+        return 2
+    except (OSError, ValueError, TypeError, KeyError):
+        # Raw probe/config/state errors may contain credentials; never echo their contents.
+        print("诊断/告警处理失败：参数、探测结果或私有状态不可用；原状态未被重置。", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY_UA_HEALTH
+}
+
+ua_health_operation() {
+  has_cmd python3 || { echo "需要 Python 3，只读诊断及告警不会自动安装依赖。" >&2; return 2; }
+  python3 -B -c "$(ua_health_program)" "$@"
+}
+
+ua_doctor() {
+  if ! has_cmd python3; then
+    if [ "${1:-}" = --json ]; then
+      printf '%s\n' '{"read_only":true,"checks":[{"id":"python","status":"FAIL","message":"缺少 Python 3；未自动安装"}],"capabilities":{},"exit_code":2}'
     else
-      echo -e "${gl_hong}✗ Telegram 告警消息推送失败，请检查 Bot Token / Chat ID 或网络。${gl_bai}"
+      echo "[FAIL] 缺少 Python 3；只读诊断不会安装依赖。"
     fi
+    return 2
   fi
+  ua_health_operation doctor "$UA_BOX_HOME" "$UA_BOX_CONFIG" "$UA_BOX_LOG_DIR" "$UA_BOX_BACKUP_DIR" "${UA_NOTIFY_STATE_DIR:-$UA_BOX_HOME/state/notify}" "$@"
+}
 
-  if [ -n "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
-    local escaped_json
-    escaped_json="$(printf '%s' "$full_text" | awk '
-      BEGIN { ORS="" }
-      {
-        gsub(/\\/, "\\\\")
-        gsub(/"/, "\\\"")
-        gsub(/\t/, "\\t")
-        gsub(/\r/, "")
-        if (NR > 1) printf "\\n"
-        printf "%s", $0
+ua_notify_serialized() {
+  (
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  umask 077
+  has_cmd python3 && has_cmd curl && has_cmd flock || { echo "告警去重需要 Python 3、curl 和 flock；未自动安装。" >&2; exit 1; }
+  local state_dir="${UA_NOTIFY_STATE_DIR:-$UA_BOX_HOME/state/notify}" notify_fd lock_rc
+  local events summary plan channel title body field_rc webhook_kind="" failed=0
+  ua_health_operation state-init "$state_dir" || exit 1
+  exec {notify_fd}>> "$state_dir/.notify.lock" || exit 1
+  if flock -n "$notify_fd"; then
+    :
+  else
+    lock_rc=$?
+    [ "$lock_rc" -eq 1 ] && { echo "已有巡检正在运行，本次跳过。"; exit 0; }
+    echo "告警锁不可用，未执行通知。" >&2; exit 1
+  fi
+  events="$(mktemp "$UA_BOX_TMP_DIR/alert-events.XXXXXX")" || exit 1
+  summary="$(mktemp "$UA_BOX_TMP_DIR/alert-summary.XXXXXX")" || exit 1
+  plan="$(mktemp "$UA_BOX_TMP_DIR/alert-plan.XXXXXX")" || exit 1
+  local UA_ALERT_EVENTS_FILE="$events" _UA_ALERT_RECORD_FAILED=0
+  if ! ua_abnormal_summary > "$summary" 2>&1 || [ "$_UA_ALERT_RECORD_FAILED" -ne 0 ]; then
+    echo "巡检或事件记录失败，未更新告警状态。" >&2
+    exit 1
+  fi
+  [ -z "${UA_NOTIFY_WEBHOOK_URL:-}" ] || webhook_kind="$(ua_webhook_kind)" || { echo "Webhook 类型无法识别，未更新状态。" >&2; exit 1; }
+  UA_HEALTH_TG_TOKEN="${UA_NOTIFY_TG_BOT_TOKEN:-}" UA_HEALTH_TG_CHAT="${UA_NOTIFY_TG_CHAT_ID:-}" \
+    UA_HEALTH_WEBHOOK="${UA_NOTIFY_WEBHOOK_URL:-}" UA_HEALTH_WEBHOOK_KIND="$webhook_kind" \
+    ua_health_operation state-plan "$state_dir" "$events" "$plan" "${UA_NOTIFY_COOLDOWN_SECONDS:-3600}" || exit 1
+  ua_health_operation plan-summary "$plan" || exit 1
+  for channel in telegram webhook; do
+    field_rc=0
+    title="$(ua_health_operation plan-field "$plan" "$channel" title)" || field_rc=$?
+    if [ "$field_rc" -ne 0 ]; then
+      [ "$field_rc" -eq 3 ] || failed=1
+      continue
+    fi
+    body="$(ua_health_operation plan-field "$plan" "$channel" body)" || { failed=1; continue; }
+    if ua_send_notification "$title" "$body" "$channel"; then
+      ua_health_operation state-commit "$state_dir" "$plan" "$channel" || {
+        echo "平台已确认，但告警状态保存失败；下次可能重复通知。" >&2; failed=1;
       }
-    ')"
-    local payload="{\"msgtype\":\"text\",\"text\":{\"content\":\"${escaped_json}\"},\"content\":\"${escaped_json}\",\"title\":\"${title}\",\"body\":\"${escaped_json}\"}"
-    if curl -fsSL --max-time 15 -X POST "$UA_NOTIFY_WEBHOOK_URL" \
-      -H "Content-Type: application/json" \
-      -d "$payload" >/dev/null 2>&1; then
-      echo -e "${gl_lv}✓ Webhook 告警消息推送成功。${gl_bai}"
-      sent_any=1
     else
-      echo -e "${gl_hong}✗ Webhook 告警消息推送失败，请检查 Webhook URL。${gl_bai}"
+      echo "$channel 未确认送达，保留待重试状态。" >&2
+      failed=1
     fi
-  fi
+  done
+  [ "$failed" -eq 0 ]
+  )
+}
 
-  if [ "$sent_any" -eq 0 ]; then
-    if [ -z "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -z "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
-      echo -e "${gl_huang}提示: 尚未配置 Telegram Bot 或 Webhook 告警渠道（可通过 ua notify 配置）。${gl_bai}"
-    fi
+ua_notification_post() {
+  local kind="$1" url="$2" payload="$3" response status
+  response="$(mktemp "$UA_BOX_TMP_DIR/notify.XXXXXX")" || return 1
+  if ! status="$(curl -sS --max-time 15 --output "$response" --write-out '%{http_code}' \
+    -X POST "$url" -H 'Content-Type: application/json' -d "$payload" 2>/dev/null)"; then
+    rm -f -- "$response"
     return 1
   fi
-  log_action "notification sent: $title"
+  if run_recovery_operation notify-verify "$kind" "$status" "$response" >/dev/null 2>&1; then
+    rm -f -- "$response"
+    return 0
+  fi
+  rm -f -- "$response"
+  return 1
+}
+
+ua_webhook_kind() {
+  case "${UA_NOTIFY_WEBHOOK_TYPE:-auto}" in
+    wecom|feishu|dingtalk|discord|bark) printf '%s\n' "$UA_NOTIFY_WEBHOOK_TYPE"; return 0 ;;
+    auto|"") ;;
+    *) return 1 ;;
+  esac
+  case "$UA_NOTIFY_WEBHOOK_URL" in
+    https://qyapi.weixin.qq.com/*) echo wecom ;;
+    https://open.feishu.cn/*|https://open.larksuite.com/*) echo feishu ;;
+    https://oapi.dingtalk.com/*) echo dingtalk ;;
+    https://discord.com/*|https://discordapp.com/*) echo discord ;;
+    https://api.day.app/*) echo bark ;;
+    *) return 1 ;;
+  esac
+}
+
+ua_send_notification() {
+  local title="$1" body="$2" channel="${3:-all}" full_text payload kind sent_any=0 failed=0
+  case "$channel" in all|telegram|webhook) ;; *) return 1 ;; esac
+  has_cmd python3 || { echo "需要 python3 生成及验证通知。" >&2; return 1; }
+  full_text="【${title}】
+主机: $(hostname 2>/dev/null || echo unknown)
+时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
+${body}"
+  if [ "$channel" != webhook ] && [ -n "${UA_NOTIFY_TG_BOT_TOKEN:-}" ] && [ -n "${UA_NOTIFY_TG_CHAT_ID:-}" ]; then
+    payload="$(python3 -c 'import json,sys; print(json.dumps({"chat_id":sys.argv[1],"text":sys.argv[2]}))' "$UA_NOTIFY_TG_CHAT_ID" "$full_text")" || return 1
+    if ua_notification_post telegram "https://api.telegram.org/bot${UA_NOTIFY_TG_BOT_TOKEN}/sendMessage" "$payload"; then
+      echo "Telegram 已确认接收。"; sent_any=1
+    else
+      echo "Telegram 发送或平台确认失败。" >&2; failed=1
+    fi
+  fi
+  if [ "$channel" != telegram ] && [ -n "${UA_NOTIFY_WEBHOOK_URL:-}" ]; then
+    if kind="$(ua_webhook_kind)" && payload="$(run_recovery_operation notify-payload "$kind" "$title" "$full_text")" &&
+       ua_notification_post "$kind" "$UA_NOTIFY_WEBHOOK_URL" "$payload"; then
+      echo "Webhook 平台已确认接收。"; sent_any=1
+    else
+      echo "Webhook 类型未知、发送失败或平台未确认；请核对渠道配置。" >&2; failed=1
+    fi
+  fi
+  [ "$sent_any" -eq 1 ] || { echo "没有通知渠道确认成功。" >&2; return 1; }
+  [ "$failed" -eq 0 ] || return 1
+  log_action "notification delivery acknowledged" || echo "通知已确认，但审计日志写入失败。" >&2
   return 0
 }
 
 ua_status_notify() {
   local force_test="${1:-}"
-  if [ "$force_test" = "--test" ] || [ "$force_test" = "test" ]; then
-    ua_send_notification "UA Box 告警通道测试" "这是一条来自 UA Box v${UA_BOX_VERSION} 的测试通知，您的告警推送配置工作正常！"
+  if [ "$force_test" = "--test" ] || [ "$force_test" = test ]; then
+    ua_send_notification "UA Box 告警通道测试" "这是一条测试通知；测试不会改变去重或恢复状态。"
     return $?
   fi
-
-  local summary_file="$UA_BOX_TMP_DIR/ua-abnormal-notify.$$"
-  _UA_LAST_ABNORMAL_FOUND=0
-  ua_abnormal_summary > "$summary_file" 2>&1
-
-  # 去除 ANSI 颜色控制符与首行标题
-  local clean_summary
-  clean_summary="$(sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$summary_file" | grep -v '^异常汇总$' | grep -v '^检测 .* 个 rclone remote')"
-  rm -f "$summary_file"
-
-  if printf '%s\n' "$clean_summary" | grep -q "暂无明显异常"; then
-    echo "巡检完成：当前系统无明显异常，无需发送告警。"
-    return 0
-  fi
-
-  echo "检测到系统异常，正在触发告警推送..."
-  printf '%s\n' "$clean_summary"
-  ua_send_notification "UA Box 状态巡检异常告警" "$clean_summary"
+  ua_notify_serialized
 }
 
 ua_notify_menu() {
@@ -7351,6 +9365,7 @@ ua_notify_menu() {
     echo -e "${gl_kjlan}4.  ${gl_bai}立即执行一次异常巡检并推送 (ua status --notify)"
     echo -e "${gl_kjlan}5.  ${gl_bai}开启 Cron 定时自动巡检告警 (每 30 分钟)"
     echo -e "${gl_kjlan}6.  ${gl_bai}关闭 Cron 定时自动巡检告警"
+    echo "7.  设置重复告警冷却时间（当前 ${UA_NOTIFY_COOLDOWN_SECONDS:-3600} 秒，恢复立即通知）"
     echo -e "${gl_kjlan}0.  ${gl_bai}返回"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
     read -r -e -p "请输入你的选择: " choice || break
@@ -7360,15 +9375,19 @@ ua_notify_menu() {
         local token chat_id
         read -r -e -p "请输入 Telegram Bot Token (留空清除): " token
         read -r -e -p "请输入 Telegram Chat ID (留空清除): " chat_id
-        config_set_var "UA_NOTIFY_TG_BOT_TOKEN" "$token"
-        config_set_var "UA_NOTIFY_TG_CHAT_ID" "$chat_id"
+        config_set_var "UA_NOTIFY_TG_BOT_TOKEN" "$token" || { pause; continue; }
+        config_set_var "UA_NOTIFY_TG_CHAT_ID" "$chat_id" || { pause; continue; }
         echo -e "${gl_lv}Telegram 告警配置已保存。${gl_bai}"
         pause
         ;;
       2)
-        local wh_url
+        local wh_url wh_type
         read -r -e -p "请输入 Webhook URL (留空清除): " wh_url
-        config_set_var "UA_NOTIFY_WEBHOOK_URL" "$wh_url"
+        read -r -e -p "渠道类型 auto/wecom/feishu/dingtalk/discord/bark，回车自动识别: " wh_type || { pause; continue; }
+        wh_type="${wh_type:-auto}"
+        case "$wh_type" in auto|wecom|feishu|dingtalk|discord|bark) ;; *) echo "未知类型。"; pause; continue ;; esac
+        config_set_var "UA_NOTIFY_WEBHOOK_TYPE" "$wh_type" || { pause; continue; }
+        config_set_var "UA_NOTIFY_WEBHOOK_URL" "$wh_url" || { pause; continue; }
         echo -e "${gl_lv}Webhook 告警配置已保存。${gl_bai}"
         pause
         ;;
@@ -7394,6 +9413,17 @@ ua_notify_menu() {
         crontab -l 2>/dev/null | grep -v "status --notify" | crontab - 2>/dev/null || true
         log_action "disable cron status --notify"
         echo -e "${gl_huang}已关闭定时自动巡检告警。${gl_bai}"
+        pause
+        ;;
+      7)
+        local cooldown
+        read -r -e -p "冷却秒数 0–604800（0 表示每次提醒，回车取消）: " cooldown || break
+        [ -n "$cooldown" ] || continue
+        if [[ "$cooldown" =~ ^[0-9]{1,6}$ ]] && ((10#$cooldown <= 604800)); then
+          config_set_var UA_NOTIFY_COOLDOWN_SECONDS "$((10#$cooldown))"
+        else
+          echo "冷却时间无效。"
+        fi
         pause
         ;;
       0) break ;;
@@ -7455,15 +9485,15 @@ ua_export_bundle() {
     echo "  - /$it"
   done
 
-  if tar --exclude='*.bak*' -czf "$archive_path" -C / "${items[@]}" 2>/dev/null; then
-    prune_old_backups "$UA_BOX_BACKUP_DIR" "ua-migration-*.tar.gz" "${UA_MAX_BACKUPS:-10}"
-    log_action "export migration bundle $archive_path"
-    local size_str
-    size_str="$(du -h "$archive_path" 2>/dev/null | awk '{print $1}')"
-    echo -e "${gl_lv}✓ 导出成功！归档文件: ${archive_path} (${size_str:-未知大小})${gl_bai}"
+  local absolute_items=()
+  for candidate in "${items[@]}"; do absolute_items+=("/$candidate"); done
+  archive_name="ua-migration-${host_tag}-$(date '+%Y%m%d-%H%M%S')-$$-${RANDOM}.tar.gz"
+  archive_path="$UA_BOX_BACKUP_DIR/$archive_name"
+  if run_recovery_operation export "$archive_path" "${absolute_items[@]}"; then
+    log_action "export migration bundle verified $archive_path"
+    echo -e "${gl_lv}✓ 数据库与归档独立验证通过: $archive_path${gl_bai}"
   else
-    echo -e "${gl_hong}✗ 打包归档失败！${gl_bai}"
-    rm -f "$archive_path"
+    echo -e "${gl_hong}备份未通过验证，未报告备份成功。请先停止所有数据写入者。${gl_bai}"
     return 1
   fi
 
@@ -7499,6 +9529,14 @@ ua_export_bundle() {
       fi
     fi
   fi
+}
+
+restore_migration_archive() {
+  local rclone_cfg="/root/.config/rclone/rclone.conf"
+  if has_cmd rclone; then
+    rclone_cfg="$(rclone_config_file_path)" || return 1
+  fi
+  run_recovery_operation restore "$1" "$2" "$UA_BOX_CONFIG" "$rclone_cfg" "$UA_BOX_BACKUP_DIR"
 }
 
 ua_import_bundle() {
@@ -7545,25 +9583,16 @@ ua_import_bundle() {
     return 1
   fi
 
-  if ! tar -tzf "$archive_path" >/dev/null 2>&1; then
-    echo -e "${gl_hong}错误: 归档文件损坏或不是有效的 tar.gz 格式！${gl_bai}"
-    return 1
-  fi
-
-  echo -e "${gl_kjlan}归档包含以下顶层目录/文件：${gl_bai}"
-  tar -tzf "$archive_path" 2>/dev/null | awk -F/ '{print "  - /" $1 ($2 ? "/" $2 : "")}' | sort -u | head -n 20
-
-  if confirm_danger "解压并覆盖恢复面板配置与数据目录" "$archive_path"; then
-    if tar -xzf "$archive_path" -C /; then
-      # 重新加载配置与 systemd
-      # shellcheck disable=SC1090
-      [ -f "$UA_BOX_CONFIG" ] && . "$UA_BOX_CONFIG"
-      has_cmd systemctl && systemctl daemon-reload 2>/dev/null || true
+  echo "正在检查归档路径、文件类型与配置内容..."
+  restore_migration_archive "$archive_path" check || return 1
+  if confirm_danger "覆盖恢复面板配置与数据；请先停止相关服务以保证数据一致性" "$archive_path"; then
+    if restore_migration_archive "$archive_path" apply; then
+      # 不立即 source 归档配置，下一次运行时加载已校验的赋值数据。
+      if has_cmd systemctl; then systemctl daemon-reload 2>/dev/null || true; fi
       log_action "import migration bundle $archive_path"
       echo -e "${gl_lv}✓ 面板配置与数据已成功恢复！${gl_bai}"
-      echo "提示: 若恢复了 Docker Compose 面板目录，可进入「ua docker -> 8」或「ua panel」一键启动对应服务。"
+      echo "请按需重新启动面板服务；配置在下次运行 UA Box 时生效。"
     else
-      echo -e "${gl_hong}✗ 解压恢复过程中发生错误。${gl_bai}"
       return 1
     fi
   fi
@@ -7680,7 +9709,7 @@ ua_ignore_add() {
     next="$(list_add_words "$current" "$normalized")"
     current="$next"
   done
-  config_set_var "$var" "$current"
+  config_set_var "$var" "$current" || return 1
   log_action "ignore add $kind $*"
   echo "已加入忽略列表: $label -> $*"
 }
@@ -7705,7 +9734,7 @@ ua_ignore_remove() {
   done
   # shellcheck disable=SC2086
   next="$(list_remove_words "$current" $items)"
-  config_set_var "$var" "$next"
+  config_set_var "$var" "$next" || return 1
   log_action "ignore remove $kind $*"
   echo "已取消忽略: $label -> $*"
 }
@@ -7812,7 +9841,7 @@ ua_ignore_menu() {
     echo -e "${gl_kjlan}7.   ${gl_bai}取消忽略 rclone remote"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) ua_ignore_current; pause ;;
@@ -7834,6 +9863,7 @@ ua_settings_menu() {
     echo -e "${gl_kjlan}UA Box 设置${gl_bai}"
     echo -e "${gl_kjlan}-----------------------[ 状态与日志 ]------------------------${gl_bai}"
     echo -e "  ${gl_kjlan}1.  ${gl_bai}查看状态检查"
+    echo -e "  ${gl_kjlan}12. ${gl_bai}只读诊断 (ua doctor)"
     echo -e "  ${gl_kjlan}2.  ${gl_bai}查看最近运行日志"
     echo -e "  ${gl_kjlan}3.  ${gl_bai}清空运行日志"
     echo -e "${gl_kjlan}-----------------------[ 配置与备份 ]------------------------${gl_bai}"
@@ -7849,7 +9879,7 @@ ua_settings_menu() {
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
     echo -e "  ${gl_hong}0.  ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) ua_status; pause ;;
@@ -7888,6 +9918,7 @@ ua_settings_menu() {
       9) update_self; pause ;;
       10) ua_notify_menu ;;
       11) ua_migration_menu ;;
+      12) ua_doctor; pause ;;
       0) break ;;
       *) echo "无效输入"; pause ;;
     esac
@@ -7923,11 +9954,14 @@ ${UA_BOX_NAME} v${UA_BOX_VERSION}
   ua work                打开工作区模块
   ua rclone              打开 rclone 管理
   ua test                打开测试脚本菜单
+  ua doctor [--json]     只读诊断依赖、配置权限及功能前提；不会安装或修复
   ua status              显示状态检查
   ua status --notify     执行异常巡检并在发现异常时推送告警
   ua notify              打开状态巡检告警推送配置菜单
   ua export [remote:dir] 一键打包导出面板配置与数据（可选直接上传 rclone）
-  ua import [file.tar.gz] 从迁移归档包恢复面板配置与数据
+  ua import [file.tar.gz] 从已验证的版本 2 归档恢复完整目录
+  ua verify-backup <归档> 独立验证文件与数据库备份
+  ua recover <记录.json> 核对实际身份后继续恢复
   ua ignore              打开异常忽略管理
   ua ignore current      将当前异常项加入忽略列表
   ua ignore rclone <name> 忽略指定 rclone remote 异常
@@ -7965,7 +9999,7 @@ main_menu() {
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
     echo -e "  ${gl_hong}0.  ${gl_bai}退出脚本"
     echo -e "${gl_kjlan}------------------------------------------------------------${gl_bai}"
-    read -r -e -p "请输入你的选择: " choice
+    read -r -e -p "请输入你的选择: " choice || break
 
     case "$choice" in
       1) system_info ;;
@@ -8055,6 +10089,10 @@ case "${1:-}" in
   test|bench|测试)
     test_scripts_menu
     ;;
+  doctor)
+    shift
+    ua_doctor "$@"
+    ;;
   status|状态)
     shift
     ua_status "$@"
@@ -8072,6 +10110,14 @@ case "${1:-}" in
   export|导出|迁移导出)
     shift
     ua_export_bundle "$@"
+    ;;
+  recover)
+    shift
+    ua_recover "$@"
+    ;;
+  verify-backup)
+    shift
+    ua_verify_backup "$@"
     ;;
   import|导入|迁移恢复)
     shift

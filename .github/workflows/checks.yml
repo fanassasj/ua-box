@@ -1,0 +1,26 @@
+name: Regression checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n ua-box
+          bash -n install.sh
+          bash -n install-local.sh
+      - name: ShellCheck errors
+        run: shellcheck --severity=error ua-box install.sh install-local.sh
+      - name: Install pinned bbolt checker for isolated fixtures
+        env:
+          GOBIN: ${{ runner.temp }}/ua-bbolt-bin
+        run: |
+          go install go.etcd.io/bbolt/cmd/bbolt@v1.4.3
+          echo "$GOBIN" >> "$GITHUB_PATH"
+      - name: Isolated regression tests
+        run: python3 -m unittest discover -s tests -v
