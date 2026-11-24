@@ -22,6 +22,25 @@ class FakeDocker:
         self.fail_policy = None
         self.after_policy_update = None
         self.daemon_events = []
+        self.offline_checks = []
+
+    def offline_guard(self, roots, exclude=()):
+        """Verify this isolated daemon's mount users; never inspect the host's /proc.
+
+        Native processes are outside the fake daemon. Signal-test workers have
+        exited before recovery, so the remaining fixture writers are containers.
+        As in the real guard, any running user of an overlapping mount blocks it.
+        """
+        from pathlib import Path
+        roots = [Path(root) for root in roots]
+        self.offline_checks.append(tuple(map(str, roots)))
+        for container in self.containers.values():
+            if container['Id'] in exclude or not container['State'].get('Running'):
+                continue
+            for mount in container.get('Mounts', []):
+                source = Path(mount['Source'])
+                if any(source == root or source in root.parents or root in source.parents for root in roots):
+                    raise RuntimeError('simulated mount still in use: ' + container['Id'])
 
     def lookup(self, name):
         for identifier, container in self.containers.items():

@@ -198,6 +198,36 @@ class ContainerRecoveryFaults(unittest.TestCase):
         self.assertTrue(self.fake.lookup('peer-id')['State']['Running'])
         self.assertFalse(self.fake.new_ids)
 
+    def test_unreadable_host_process_blocks_real_guard_without_losing_original_data(self):
+        self.fake.fail_create = True
+        # Keep the update in its fixture world, then exercise the REAL guard
+        # during rollback with the same /proc permission failure seen in CI.
+        self.fake.after_rename = lambda container: setattr(self.mod, 'offline_guard', self.real_offline_guard)
+        original_iterdir = self.mod.Path.iterdir
+        def process_view(path):
+            if path == Path('/proc'):
+                return iter([Path('/proc/1')])
+            if path == Path('/proc/1/fd'):
+                raise PermissionError(errno.EACCES, 'isolated permission fault')
+            return original_iterdir(path)
+        output = io.StringIO()
+        with mock.patch.object(self.mod.Path, 'iterdir', autospec=True, side_effect=process_view), \
+             mock.patch.object(self.mod.shutil, 'which', side_effect=lambda name: '/fake/docker' if name == 'docker' else None), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            with self.assertRaises(RuntimeError):
+                self.update()
+        record = json.loads(self.journal().read_text())
+        self.assertEqual(record['state'], 'recovery_incomplete')
+        self.assertTrue(any(error['step'] == 'data_rollback' and '无法确认进程停写状态' in error['error'] for error in record['errors']))
+        self.assertFalse(self.fake.lookup(self.old['Id'])['State']['Running'])
+        self.assertEqual(self.fake.lookup(self.old['Id'])['HostConfig']['RestartPolicy'], self.mod.NO_RESTART)
+        self.assertNotIn(('start', self.old['Id']), self.calls)
+        self.assertNotIn('已验证旧容器', output.getvalue())
+        data = json.loads(Path(record['data_journal']).read_text())
+        for entry in data['entries']:
+            self.assertEqual(self.mod.identity(entry['slot']), entry['old_id'])
+            self.assertEqual(self.mod.inventory(Path(entry['slot'])), entry['before'])
+
     def test_second_update_keeps_original_registry_reference_and_data_protection(self):
         self.update()
         self.update()
@@ -216,6 +246,36 @@ class ContainerRecoveryFaults(unittest.TestCase):
         self.assertFalse(self.fake.lookup(self.old['Id'])['State']['Running'])
         self.assertNotIn(('start', self.old['Id']), self.calls)
         self.assertEqual(json.loads(self.journal().read_text())['state'], 'recovered')
+
+
+class SimulatedOfflineGuardTests(unittest.TestCase):
+    def setUp(self):
+        base.ContainerTests.setUp(self)
+
+    def test_guard_tracks_actual_stop_and_start_state(self):
+        with self.assertRaisesRegex(RuntimeError, 'simulated mount still in use'):
+            self.fake.offline_guard([self.data])
+        self.fake('stop', self.old['Id'])
+        self.fake.offline_guard([self.data])
+        self.fake('start', self.old['Id'])
+        with self.assertRaisesRegex(RuntimeError, 'simulated mount still in use'):
+            self.fake.offline_guard([self.data])
+        self.assertEqual(len(self.fake.offline_checks), 3)
+
+    def test_running_peer_and_nested_mount_block_even_when_old_is_excluded(self):
+        peer = copy.deepcopy(self.old)
+        peer['Id'], peer['Name'] = 'peer-id', '/peer'
+        peer['Mounts'][0]['Source'] = str(self.data / 'nested')
+        self.fake.containers[peer['Id']] = peer
+        with self.assertRaisesRegex(RuntimeError, 'peer-id'):
+            self.fake.offline_guard([self.data], exclude=(self.old['Id'],))
+
+    def test_guard_matches_real_policy_for_readonly_mount_and_unrelated_path(self):
+        # The production guard conservatively rejects any live mount user.
+        self.fake.lookup(self.old['Id'])['Mounts'][0]['RW'] = False
+        with self.assertRaises(RuntimeError):
+            self.fake.offline_guard([self.data])
+        self.fake.offline_guard([self.data.with_name(self.data.name + '-unrelated')])
 
 
 class DirectoryAndDatabaseFaults(unittest.TestCase):
@@ -562,13 +622,39 @@ with case.mod.signals():case.update()
         fake = base.FakeDocker(record['old'])
         fake.containers = saved['containers']
         module.docker, module.Engine = fake, fake.engine()
+        # A freshly loaded module defaults to the host /proc guard. Reconnect
+        # the simulated daemon's safety check too; CI must not scan host PIDs.
+        module.offline_guard = fake.offline_guard
         module.wait_ready = lambda identifier, timeout: None
+        original = fake.lookup(record['old']['Id'])
+        self.assertEqual(record['state'], 'replacing')
+        self.assertEqual(original['Name'], '/' + record['backup_name'])
+        self.assertFalse(original['State']['Running'])
+        self.assertEqual(module.restart_policy(original), module.NO_RESTART)
+        self.assertFalse(record.get('new_id'))
+        data = json.loads(Path(record['data_journal']).read_text())
+        for entry in data['entries']:
+            self.assertEqual(module.identity(entry['target']), entry['new_id'])
+            self.assertEqual(module.identity(entry['slot']), entry['old_id'])
+            self.assertEqual(module.inventory(Path(entry['slot'])), entry['before'])
         module.recover_container(saved['journal'])
         module.recover_container(saved['journal'])
         observed = fake.lookup(record['old']['Id'])
         self.assertEqual(observed['Name'], '/app')
         self.assertTrue(observed['State']['Running'])
-        self.assertEqual(json.loads(Path(saved['journal']).read_text())['state'], 'recovered')
+        self.assertEqual(module.restart_policy(observed), module.restart_policy(record['old']))
+        final = json.loads(Path(saved['journal']).read_text())
+        self.assertEqual(final['state'], 'recovered')
+        self.assertEqual(final['errors'], [])
+        self.assertTrue(fake.offline_checks)
+        for entry in data['entries']:
+            self.assertEqual(module.identity(entry['target']), entry['old_id'])
+            self.assertEqual(module.inventory(Path(entry['target'])), entry['before'])
+            self.assertTrue(Path(entry['slot']).exists())
+        self.assertEqual(json.loads(Path(record['data_journal']).read_text())['state'], 'rolled_back')
+        self.assertTrue(list(Path(saved['journal']).parent.glob('container-app-*.json')))
+        self.assertEqual(fake.daemon_restart(), {record['old']['Id']})
+        self.assertEqual(fake.resource_conflicts(), [])
 
     def test_real_sigint_and_sigterm_during_copy_do_not_touch_original(self):
         for signum in (signal.SIGINT, signal.SIGTERM):
